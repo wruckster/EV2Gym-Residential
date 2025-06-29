@@ -2,12 +2,14 @@ pandas
 numpy
 matplotlib
 networkx
-gymnasium
+gymnasium>=0.28.1
 scipy
 gurobipy
 pyyaml
-torch
+torch>=2.0.0  # Required for Tianshou
 stable_baselines3
 sb3-contrib
 wandb
 pandapower
+tianshou>=1.0.0
+tensorboard>=2.11.0
