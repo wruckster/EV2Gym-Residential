@@ -1,0 +1,137 @@
+# This yml file configures the residential V2G simulation
+
+##############################################################################
+# Simulation Parameters
+##############################################################################
+timescale: 15  # minutes per step
+simulation_length: 192  # 1 week (2 days * 24 hours * 60 minutes / 15 minutes) = 192 steps
+
+##############################################################################
+# Date and Time
+##############################################################################
+# Year, month, day
+year: 2023  # 2015-2023
+month: 1    # 1-12
+day: 1     # 1-31
+# Whether to get a random date every time the environment is reset
+random_day: True  # True or False
+random_hour: True  # True or False
+
+# Simulation Starting Time
+# Hour and minute do not change after the environment has been reset
+hour: 0  # 0-23
+minute: 0  # Simulation starting minute (0-59)
+
+# Simulate weekdays, weekends, or both
+simulation_days: weekdays  # weekdays, weekends, or both
+
+# EV Spawn Behavior
+scenario: private  # public, private, or workplace
+spawn_multiplier: 2  # Lower for residential (1-3)
+heterogeneous_ev_specs: False  # Set to True to use multiple EV models
+
+##############################################################################
+# Prices
+##############################################################################
+discharge_price_factor: 1.0  # how many times more abs(expensive/cheaper) it is to discharge than to charge
+
+##############################################################################
+# Charging Network
+##############################################################################
+v2g_enabled: True  # Enable Vehicle-to-Grid functionality
+number_of_charging_stations: 1  # Single home charger
+number_of_transformers: 1
+number_of_ports_per_cs: 1  # One port per charging station
+# Provide path if you want to load a specific charging topology,
+# else write None for a randomized one with the above parameters
+charging_network_topology: None
+
+##############################################################################
+# Power Setpoints Settings
+##############################################################################
+# How much the power setpoints can vary in percentage compared to the nominal power
+# The higher the number the easier it is to meet the power setpoints, the opposite for negative numbers
+power_setpoint_flexibility: 10  # (in percentage +/- %)
+
+##############################################################################
+# Transformer Configuration
+##############################################################################
+transformer:
+  max_power: 14  # in kW (reduced from 100kW for residential setting)
+
+
+demand_response:
+  include: True
+  events_per_day: 1  # One event per day targeting the evening ramp
+  event_capacity_percentage_mean: 40  # Significant reduction to help with the ramp
+  event_capacity_percentage_std: 5    # Small variation in reduction amount
+  event_length_minutes_min: 120       # 2-hour event to cover the steepest part of the ramp
+  event_length_minutes_max: 180       # Up to 3 hours for flexibility
+  event_start_hour_mean: 17           # 5 PM - start of evening peak
+  event_start_hour_std: 1             # Small variation in start time
+  notification_of_event_minutes: 240  # 4 hours notice to pre-charge EVs
+
+##############################################################################
+# EV Specifications
+##############################################################################
+ev:
+  battery_capacity: 64.0  # in kWh (e.g., Tesla Model 3 SR+)
+  max_ac_charge_power: 11.0  # in kW (7.4kW for 32A single-phase)
+  min_ac_charge_power: 1.4  # in kW (6A at 230V)
+  max_dc_charge_power: 0.0  # DC charging not typical for residential
+  max_discharge_power: -11.0  # in kW (V2G capability)
+  min_discharge_power: -11.0  # in kW (full discharge capability)
+  ev_phases: 1  # Single-phase for residential
+  charge_efficiency: 0.95  # 95% efficiency
+  discharge_efficiency: 0.90  # 90% efficiency (slightly lower for discharge)
+  transition_soc: 0.8  # 80% - start tapering charge near full
+  min_battery_capacity: 10.0  # in kWh (safety buffer)
+  min_time_of_stay: 180  # in minutes (3 hours typical home charging)
+  min_emergency_battery_capacity: 25  # in kWh (safety buffer)
+  desired_capacity: 0.9  # 90% target SOC for charging
+
+##############################################################################
+# Charging Network
+##############################################################################
+v2g_enabled: True # True or False
+number_of_charging_stations: 1
+number_of_transformers: 1
+number_of_ports_per_cs: 1
+# Provide path if you want to load a specific charging topology,
+# else write None for a randomized one with the above parameters
+charging_network_topology: None #./config_files/charging_topology_10.json
+
+##############################################################################
+# Charging Station Specifications
+##############################################################################
+charging_station:
+  min_charge_current: 6  # Amperes (minimum current for Level 2 charging)
+  max_charge_current: 45  # Amperes (11 kW @ 240V)
+  min_discharge_current: 0  # Amperes (actual value <=0)
+  max_discharge_current: -45  # Amperes (11 kW @ 240V, negative for discharge)
+  voltage: 240  # Single-phase voltage for residential
+  phases: 1  # Most residential chargers are single-phase
+  efficiency: 0.95  # Charging station efficiency (0-1)
+
+##############################################################################
+# PV solar Power
+##############################################################################
+solar_power:
+  include: true  # Enable solar power generation
+  solar_power_capacity_multiplier_mean: 1  # 1 is default, higher means more solar power
+  forecast_mean: 90  # in percentage of load at time t%
+  forecast_std: 5    # in percentage of load at time t%
+
+##############################################################################
+# Inflexible Loads (Home Appliances)
+##############################################################################
+inflexible_loads: # Offices, homes
+  include: True # True or False
+  inflexible_loads_capacity_multiplier_mean: 1 # 1 is default, the higher the number the more inflexible loads
+  forecast_mean: 90 # in percentage of load at time t%
+  forecast_std: 5 # in percentage of load at time t%
+
+##############################################################################
+# Random Seed
+##############################################################################
+tr_seed: 42  # Random seed for reproducibility (-1 for random)
