@@ -19,6 +19,13 @@ def evalreplay(config_file,
 
     verbose = False
 
+    # First, load the config file to get the number of charging stations and transformers
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    number_of_charging_stations = config.get('number_of_charging_stations', 1)
+    number_of_transformers = config.get('number_of_transformers', 1)
+
     env = ev2gym_env.EV2Gym(config_file=config_file,
                                load_from_replay_path=None,
                                generate_rnd_game=True,
@@ -55,7 +62,7 @@ def evalreplay(config_file,
     opt_actions = math_model.get_actions()
 
     scenario = config_file.split("/")[-1].split(".")[0]
-    group_name = f'{number_of_charging_stations}cs_{n_transformers}tr_{scenario}'
+    group_name = f'{number_of_charging_stations}cs_{number_of_transformers}tr_{scenario}'
 
     # Simulate in the gym environment and get the rewards
     # save replay in the replay folder for evaluating pther algorithms

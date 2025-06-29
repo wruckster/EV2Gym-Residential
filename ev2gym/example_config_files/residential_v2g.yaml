@@ -4,7 +4,7 @@
 # Simulation Parameters
 ##############################################################################
 timescale: 15  # minutes per step
-simulation_length: 192  # 1 week (2 days * 24 hours * 60 minutes / 15 minutes) = 192 steps
+simulation_length: 96  # 1 week (2 days * 24 hours * 60 minutes / 15 minutes) = 192 steps
 
 ##############################################################################
 # Date and Time
@@ -57,13 +57,13 @@ power_setpoint_flexibility: 10  # (in percentage +/- %)
 # Transformer Configuration
 ##############################################################################
 transformer:
-  max_power: 14  # in kW (reduced from 100kW for residential setting)
+  max_power: 22  # in kW (reduced from 100kW for residential setting)
 
 
 demand_response:
   include: True
   events_per_day: 1  # One event per day targeting the evening ramp
-  event_capacity_percentage_mean: 40  # Significant reduction to help with the ramp
+  event_capacity_percentage_mean: 30  # Significant reduction to help with the ramp
   event_capacity_percentage_std: 5    # Small variation in reduction amount
   event_length_minutes_min: 120       # 2-hour event to cover the steepest part of the ramp
   event_length_minutes_max: 180       # Up to 3 hours for flexibility
@@ -76,19 +76,19 @@ demand_response:
 ##############################################################################
 ev:
   battery_capacity: 64.0  # in kWh (e.g., Tesla Model 3 SR+)
-  max_ac_charge_power: 11.0  # in kW (7.4kW for 32A single-phase)
-  min_ac_charge_power: 1.4  # in kW (6A at 230V)
+  max_ac_charge_power: 7.0  # in kW (7.4kW for 32A single-phase)
+  min_ac_charge_power: 1.0  # in kW (6A at 230V)
   max_dc_charge_power: 0.0  # DC charging not typical for residential
-  max_discharge_power: -11.0  # in kW (V2G capability)
-  min_discharge_power: -11.0  # in kW (full discharge capability)
+  max_discharge_power: -7.0  # in kW (V2G capability)
+  min_discharge_power: -1.0  # in kW (full discharge capability)
   ev_phases: 1  # Single-phase for residential
   charge_efficiency: 0.95  # 95% efficiency
   discharge_efficiency: 0.90  # 90% efficiency (slightly lower for discharge)
   transition_soc: 0.8  # 80% - start tapering charge near full
   min_battery_capacity: 10.0  # in kWh (safety buffer)
   min_time_of_stay: 180  # in minutes (3 hours typical home charging)
-  min_emergency_battery_capacity: 25  # in kWh (safety buffer)
-  desired_capacity: 0.9  # 90% target SOC for charging
+  min_emergency_battery_capacity: 15  # in kWh (safety buffer)
+  desired_capacity: 0.8  # 80% target SOC for charging
 
 ##############################################################################
 # Charging Network
