@@ -9,28 +9,40 @@ import torch.nn as nn
 
 
 class Actor(nn.Module):
-    """Actor network with a Tianshou-compatible forward method."""
+    """Actor network for continuous actions with learnable std dev."""
 
     def __init__(self, state_shape, action_shape):
         super().__init__()
+        self.action_dim = np.prod(action_shape)
         self.model = nn.Sequential(
             nn.Linear(np.prod(state_shape), 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, np.prod(action_shape)),
         )
+        self.mean_layer = nn.Linear(128, self.action_dim)
+        self.log_std_layer = nn.Linear(128, self.action_dim)
 
     def forward(self, obs, state=None, info={}):
-        """Accepts obs, state, and info, returns logits and state."""
+        """
+        Accepts obs, returns a tuple of (mean, std) for the action distribution
+        and the recurrent state (which is None for this feed-forward network).
+        """
         if isinstance(obs, dict):
             obs = obs['obs']
         if not isinstance(obs, torch.Tensor):
-            # Tianshou's batching should handle device placement
             obs = torch.tensor(obs, dtype=torch.float32)
 
-        logits = self.model(obs)
-        return logits, state
+        features = self.model(obs)
+        mean = self.mean_layer(features)
+        
+        # We learn the log of the standard deviation for stability
+        log_std = self.log_std_layer(features)
+        # Clamp the log_std to prevent it from becoming too large or too small
+        log_std = torch.clamp(log_std, -20, 2)
+        std = torch.exp(log_std)
+
+        return (mean, std), state
 
 
 class Critic(nn.Module):

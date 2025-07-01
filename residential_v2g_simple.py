@@ -77,11 +77,9 @@ def run_residential_v2g(save_replay=True):
         'reward': [],
         'total_energy_charged_kwh': [],
         'total_energy_discharged_kwh': [],
-        'cumulative_cost': []
+        'current_cost': [],
+        'cumulative_cost': 0
     }
-    
-    # Initialize cumulative cost
-    cumulative_cost = 0
     
     # Run simulation
     state, _ = env.reset()
@@ -103,36 +101,27 @@ def run_residential_v2g(save_replay=True):
         # Step environment
         state, reward, done, _, info = env.step(actions)
         
-        current_price = env.charge_prices[0, env.current_step-1] if hasattr(env, 'charge_prices') and env.current_step > 0 else 0
-        
-        # Get EV and charger states with proper defaults
-        ev = env.charging_stations[0].evs_connected[0] if env.charging_stations[0].evs_connected else None
+        # Get EV and charger states
+        ev = env.charging_stations[0].evs_connected[0] if env.charging_stations[0].evs_connected[0] else None
         charger = env.charging_stations[0]
         
+        # Calculate metrics
+        current_price = env.price_import[env.current_step-1] if hasattr(env, 'price_import') else 0
         power_kw = charger.current_power_output if hasattr(charger, 'current_power_output') else 0
-        soc = ev.get_soc() if ev and hasattr(ev, 'get_soc') else 0
+        soc = ev.get_soc() if ev else 0
         
-        # Calculate cost for this timestep (negative for discharging, positive for charging)
-        # Convert power from kW to kWh using timestep (15 minutes = 0.25 hours)
-        energy_kwh = power_kw * (timestep_minutes / 60)
-        timestep_cost = energy_kwh * current_price if current_price else 0
-        cumulative_cost += timestep_cost
-        
-        # Update metrics - ensure all arrays have the same length
+        # Update metrics
         metrics['timestep'].append(env.current_step)
         metrics['datetime'].append(current_time)
         metrics['soc'].append(soc)
         metrics['power_kw'].append(power_kw)
         metrics['price'].append(current_price)
-        metrics['action'].append(actions[0] if actions and len(actions) > 0 else 0)
+        metrics['action'].append(actions[0] if actions else 0)
         metrics['reward'].append(reward)
-        metrics['total_energy_charged_kwh'].append(
-            charger.total_energy_charged if hasattr(charger, 'total_energy_charged') else 0
-        )
-        metrics['total_energy_discharged_kwh'].append(
-            charger.total_energy_discharged if hasattr(charger, 'total_energy_discharged') else 0
-        )
-        metrics['cumulative_cost'].append(cumulative_cost)
+        
+        if hasattr(charger, 'total_energy_charged'):
+            metrics['total_energy_charged_kwh'].append(charger.total_energy_charged)
+            metrics['total_energy_discharged_kwh'].append(charger.total_energy_discharged)
         
         # Log progress
         if env.current_step % 4 == 0:  # Every hour
@@ -150,36 +139,21 @@ def run_residential_v2g(save_replay=True):
                 'soc': soc,
                 'power_kw': power_kw,
                 'price': current_price,
-                'action': actions[0] if actions and len(actions) > 0 else 0,
+                'action': actions[0] if actions else 0,
                 'reward': reward
             }
             log_step(step_data, output_dir)
     
-    # Generate and save final plots
-    if hasattr(env, 'save_plots') and not env.save_plots:
-        env.save_plots = True
     
-    # Only call render if we have a valid environment state
-    if hasattr(env, 'render'):
-        env.render()  # This will handle the plotting if save_plots is True
-    
-    # Ensure all metric arrays have the same length before creating DataFrame
-    min_length = min(len(metrics[key]) for key in metrics)
-    if min_length > 0:  # Only proceed if we have data
-        metrics = {key: values[:min_length] for key, values in metrics.items()}
-        metrics_df = pd.DataFrame(metrics)
-        metrics_df.to_csv(f"{output_dir}/simulation_metrics.csv", index=False)
+    # Save metrics to CSV
+    metrics_df = pd.DataFrame(metrics)
+    metrics_df.to_csv(f"{output_dir}/simulation_metrics.csv", index=False)
     
     print("\n=== Simulation Complete ===")
-    if metrics['soc']:  # Check if we have any SOC data
-        print(f"Final SoC: {metrics['soc'][-1]*100:.1f}%")
-    if metrics['total_energy_charged_kwh']:
-        print(f"Total Energy Charged: {metrics['total_energy_charged_kwh'][-1]:.2f} kWh")
-    if metrics['total_energy_discharged_kwh']:
-        print(f"Total Energy Discharged: {metrics['total_energy_discharged_kwh'][-1]:.2f} kWh")
-    if metrics['cumulative_cost']:
-        print(f"Total Cost: {metrics['cumulative_cost'][-1]:.2f} $")
+    print(f"Final SoC: {metrics['soc'][-1]*100:.1f}%")
+    print(f"Total Energy Charged: {metrics['total_energy_charged_kwh'][-1]:.2f} kWh")
+    print(f"Total Energy Discharged: {metrics['total_energy_discharged_kwh'][-1]:.2f} kWh")
     print(f"Results saved to: {output_dir}")
 
 if __name__ == "__main__":
-    run_residential_v2g(save_replay=True)  # Set to False to disable replay saving
+    run_residential_v2g(save_replay=False)  # Set to False to disable replay saving

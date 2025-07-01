@@ -27,7 +27,7 @@ from tianshou.utils import TensorboardLogger
 from ev2gym.models.ev2gym_env import EV2Gym
 from ev2gym.rl_agent import state, reward, cost, action_wrappers, noise_wrappers
 from ev2gym.rl_agent.networks import PolicyNet
-# from ev2gym.visuals import evaluator_plot # Placeholder for future integration
+from ev2gym.visuals import evaluator_plot
 
 # --- Utility Functions ---
 def get_component(module: Any, component_name: str) -> Optional[Callable]:
@@ -122,7 +122,9 @@ def main(config_path: str):
 
     dist_fn = None
     if isinstance(env.action_space, gym.spaces.Box):
-        dist_fn = torch.distributions.Normal
+        def dist_fn_wrapper(x):
+            return torch.distributions.Normal(loc=x[0], scale=x[1])
+        dist_fn = dist_fn_wrapper
 
     policy = PPOPolicy(
         actor=net.actor,
@@ -175,6 +177,92 @@ def main(config_path: str):
         final_policy_path = os.path.join(run_dir, "final_policy.pth")
         torch.save(policy.state_dict(), final_policy_path)
         logging.info(f"Final policy saved to {final_policy_path}")
+
+        # --- 10. Post-Training Evaluation and Plotting ---
+        logging.info("Starting post-training evaluation and plotting...")
+        try:
+            # Create a dedicated environment for evaluation with replay saving enabled
+            eval_replay_path = os.path.join(run_dir, "replay_files")
+            os.makedirs(eval_replay_path, exist_ok=True)
+
+            eval_env = EV2Gym(
+                config_file=env_params.get('config_file'),
+                state_function=state_fn,
+                reward_function=reward_fn,
+                cost_function=cost_fn,
+                save_replay=True,
+                replay_save_path=eval_replay_path,
+                verbose=False,
+                save_plots=False
+            )
+            if action_wrapper_cls:
+                eval_env = action_wrapper_cls(eval_env)
+
+            # Load the best policy
+            best_policy_path = os.path.join(run_dir, "best_policy.pth")
+            if os.path.exists(best_policy_path):
+                policy.load_state_dict(torch.load(best_policy_path, map_location=device))
+                logging.info(f"Loaded best policy from {best_policy_path}")
+            else:
+                logging.warning("No best policy found to load for evaluation.")
+
+            # Run one full episode
+            eval_collector = Collector(policy, eval_env)
+            collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
+            logging.info(f"Evaluation complete: {collect_result}")
+            eval_env.close()  # Ensure replay file is saved
+
+            # Generate and save plots
+            # Wait a moment for the file to be written to disk
+            import time
+            time.sleep(1)
+            
+            replay_files = sorted([f for f in os.listdir(eval_replay_path) if f.endswith('.pkl')], 
+                                key=lambda x: os.path.getmtime(os.path.join(eval_replay_path, x)))
+            
+            if not replay_files:
+                # Try to find replay files in the parent directory as a fallback
+                replay_files = sorted([f for f in os.listdir('.') if f.endswith('.pkl')],
+                                    key=lambda x: os.path.getmtime(x))
+                if replay_files:
+                    latest_replay_file = replay_files[-1]  # Most recent file
+                    logging.info(f"Found replay file in working directory: {latest_replay_file}")
+                else:
+                    logging.warning("No replay files found. Checking directory contents:")
+                    logging.warning(f"Contents of {eval_replay_path}: {os.listdir(eval_replay_path) if os.path.exists(eval_replay_path) else 'Directory not found'}")
+                    logging.warning(f"Current working directory contents: {os.listdir('.')}")
+            else:
+                latest_replay_file = os.path.join(eval_replay_path, replay_files[-1])
+
+            if replay_files:
+                if not latest_replay_file.startswith(eval_replay_path):
+                    # If we found the file in the working directory, update the path
+                    latest_replay_file = os.path.abspath(latest_replay_file)
+                else:
+                    latest_replay_file = os.path.join(eval_replay_path, replay_files[-1])
+                
+                logging.info(f"Generating plots from replay file: {latest_replay_file}")
+                plot_save_path = os.path.join(run_dir, "evaluation_plots.png")
+                
+                try:
+                    evaluator_plot.plot_from_replay(
+                        [latest_replay_file],
+                        save_path=plot_save_path,
+                        labels=['PPO']
+                    )
+                    logging.info(f"Evaluation plots saved to {plot_save_path}")
+                except Exception as e:
+                    logging.error(f"Error generating plots: {str(e)}", exc_info=True)
+                    # Try to load and log the replay file to help with debugging
+                    try:
+                        with open(latest_replay_file, 'rb') as f:
+                            import pickle
+                            data = pickle.load(f)
+                            logging.info(f"Replay file keys: {list(data.keys()) if hasattr(data, 'keys') else 'Not a dictionary'}")
+                    except Exception as load_error:
+                        logging.error(f"Failed to load replay file: {str(load_error)}")
+        except Exception as e:
+            logging.error("An error occurred during evaluation and plotting:", exc_info=True)
 
         train_envs.close()
         test_envs.close()
