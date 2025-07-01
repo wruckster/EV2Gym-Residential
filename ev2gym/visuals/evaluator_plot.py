@@ -166,7 +166,6 @@ def plot_total_power_V2G(results_path, save_path=None, algorithm_names=None):
     plt.grid(True, which='major', axis='both')
     ax.spines['right'].set_visible(False)
     ax.spines['top'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
     
     ax.spines['left'].set_linewidth(2)
     # ax.spines['bottom'].set_linewidth(2)           
@@ -716,8 +715,8 @@ def plot_prices(results_path, save_path=None, algorithm_names=None):
 
 if __name__ == "__main__":
 
-    plot_total_power_V2G(results_path='E:/GitHub\ev2gym/results/eval_5cs_1tr_V2G_MPC_5_algos_1_exp_2024_03_03_727260/plot_results_dict.pkl',
-                     save_path='E:\GitHub\ev2gym\results\eval_5cs_1tr_V2G_MPC_5_algos_1_exp_2024_03_03_727260',
+    plot_total_power_V2G(results_path=r'E:/GitHub/ev2gym/results/eval_5cs_1tr_V2G_MPC_5_algos_1_exp_2024_03_03_727260/plot_results_dict.pkl',
+                     save_path=r'E:/GitHub/ev2gym/results/eval_5cs_1tr_V2G_MPC_5_algos_1_exp_2024_03_03_727260',
                      algorithm_names=['Charge As Fast As Possible', 'OCCF V2G', 'OCCF G2V', 'eMPC V2G', 'eMPC G2V'])
     # plot_comparable_EV_SoC(results_path='plot_results_dict.pkl')
     pass

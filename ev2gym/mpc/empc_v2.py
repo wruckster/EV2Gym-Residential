@@ -187,8 +187,19 @@ class eMPC_V2G_v2(MPC):
             model.params.TimeLimit = self.time_limit
 
             model.optimize()
-
             self.total_exec_time += model.Runtime
+
+            # Insert the infeasibility check here
+            if model.status == GRB.INFEASIBLE:
+                print("Model is infeasible. Computing IIS...")
+                model.computeIIS()
+                model.write("model.ilp")
+                print("IIS written to model.ilp")
+                # Print which constraints are causing the issue
+                for c in model.getConstrs():
+                    if c.IISConstr:
+                        print(f"Constraint {c.constrName} is in the IIS")
+                raise Exception("Infeasible model - check model.ilp for details")          
 
             if model.status == GRB.Status.INF_OR_UNBD or \
                     model.status == GRB.Status.INFEASIBLE:

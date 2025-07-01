@@ -1,0 +1,50 @@
+
+# 1. Experiment-level settings
+experiment:
+  run_name: 'ppo_residential_v2g' # A descriptive name for this run
+  results_dir: 'results'            # Root directory for all outputs
+  seed: 42
+  device: 'auto'                    # 'auto', 'cuda', or 'cpu'
+
+# 2. Environment settings
+environment:
+  config_file: 'ev2gym/example_config_files/residential_v2g.yaml'
+  action_wrapper: 'Rescale_RepairLayer' # From ev2gym.rl_agent.action_wrappers
+  noise_wrapper: ''                     # Optional: from ev2gym.rl_agent.noise_wrappers
+
+# 3. RL agent and algorithm settings
+rl:
+  # --- Modular components to use ---
+  state_function: 'V2G_profit_max'      # From ev2gym.rl_agent.state
+  reward_function: 'profit_maximization' # From ev2gym.rl_agent.reward
+  cost_function: ''                     # Optional: from ev2gym.rl_agent.cost
+
+  # --- Tianshou OnpolicyTrainer arguments ---
+  # See Tianshou docs for OnpolicyTrainer for all available options
+  trainer_args:
+    max_epoch: 100
+    step_per_epoch: 5000
+    step_per_collect: 2048
+    repeat_per_collect: 4
+    episode_per_test: 10
+    batch_size: 256
+    show_progress: True
+
+  # --- Other RL settings ---
+  training_num: 8  # Number of parallel environments for training
+  test_num: 4      # Number of parallel environments for testing
+  buffer_size: 20480
+
+  # --- PPO-specific arguments ---
+  ppo:
+    policy_args:
+      # See Tianshou docs for PPOPolicy for all available options
+      discount_factor: 0.99
+      gae_lambda: 0.95
+      vf_coef: 0.5
+      ent_coef: 0.01
+      max_grad_norm: 0.5
+      reward_normalization: True
+      action_scaling: False # Set to False, as Rescale_RepairLayer handles scaling
+      action_bound_method: 'clip'
+    lr: 0.0003
