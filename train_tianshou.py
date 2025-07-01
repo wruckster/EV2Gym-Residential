@@ -210,6 +210,26 @@ def main(config_path: str):
             eval_collector = Collector(policy, eval_env)
             collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
             logging.info(f"Evaluation complete: {collect_result}")
+
+            # --- Debugging replay saving ---
+            try:
+                unwrapped_env = eval_env.unwrapped
+                logging.info(f"Unwrapped env type: {type(unwrapped_env)}")
+                if hasattr(unwrapped_env, 'save_replay') and unwrapped_env.save_replay:
+                    logging.info("`save_replay` is True on unwrapped env.")
+                    if hasattr(unwrapped_env, 'replay') and unwrapped_env.replay:
+                        logging.info("Unwrapped env has `replay` attribute. Manually triggering save.")
+                        save_path = unwrapped_env.replay_save_path
+                        unwrapped_env.replay.save(save_path)
+                        logging.info(f"Manual save to {save_path} attempted.")
+                    else:
+                        logging.warning("Unwrapped env does not have a `replay` attribute or it is None.")
+                else:
+                    logging.warning("`save_replay` is False or missing on unwrapped env.")
+            except Exception as e:
+                logging.error(f"Error during manual replay save attempt: {e}", exc_info=True)
+            # --- End Debugging ---
+
             eval_env.close()  # Ensure replay file is saved
 
             # Generate and save plots
