@@ -70,7 +70,15 @@ class EV2Gym(gym.Env):
 
         self.simulation_length = self.config['simulation_length']
 
-        self.replay_path = replay_save_path
+        self.replay_save_path = replay_save_path
+        self.replay = None
+
+        if self.save_replay:
+            self.replay = EvCityReplay(self)
+
+        if load_from_replay_path is not None:
+            with open(load_from_replay_path, 'rb') as file:
+                self.replay = pickle.load(file)
 
         cs = self.config['number_of_charging_stations']
 
@@ -233,7 +241,7 @@ class EV2Gym(gym.Env):
 
         # Make folders for results
         if self.save_replay:
-            os.makedirs(self.replay_path, exist_ok=True)
+            os.makedirs(self.replay_save_path, exist_ok=True)
 
         if self.render_mode:
             # Initialize the rendering of the simulation
