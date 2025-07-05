@@ -5,12 +5,19 @@ experiment:
   results_dir: 'results'            # Root directory for all outputs
   seed: 42
   device: 'auto'                    # 'auto', 'cuda', or 'cpu'
+  
+  # Evaluation mode settings
+  evaluation:
+    enabled: False                   # Set to true to only run evaluation, no training
+    replay_dir: 'results/ppo_residential_v2g_20250706_080700/replay_files'           # Directory to look for replay files
+    plot_save_name: 'evaluation_plots.png'  # Name for the output plot file
 
 # 2. Environment settings
 environment:
   config_file: 'ev2gym/example_config_files/residential_v2g.yaml'
   action_wrapper: 'Rescale_RepairLayer' # From ev2gym.rl_agent.action_wrappers
   noise_wrapper: ''                     # Optional: from ev2gym.rl_agent.noise_wrappers
+  is_verbose: False
 
 # 3. RL agent and algorithm settings
 rl:

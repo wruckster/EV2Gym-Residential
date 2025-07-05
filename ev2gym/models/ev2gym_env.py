@@ -425,7 +425,10 @@ class EV2Gym(gym.Env):
         assert not self.done, "Episode is done, please reset the environment"
 
         if self.verbose:
-            print("-"*80)
+            print(f"Step: {self.current_step}/{self.simulation_length}")
+
+        # Reset power usage for this timestep to zero before processing charging stations
+        self.current_power_usage[self.current_step] = 0.0
 
         total_costs = 0
         total_invalid_action_punishment = 0
@@ -454,7 +457,11 @@ class EV2Gym(gym.Env):
             for u in user_satisfaction:
                 user_satisfaction_list.append(u)
 
+            if self.verbose:
+                print(f"DEBUG: CS {cs.id} power output: {cs.current_power_output}")
             self.current_power_usage[self.current_step] += cs.current_power_output
+            if self.verbose:
+                print(f"DEBUG_AFTER_ADD: Power usage at step {self.current_step} is now {self.current_power_usage[self.current_step]}")
 
             # Update transformer variables for this timestep
             self.transformers[cs.connected_transformer].step(
@@ -534,19 +541,31 @@ class EV2Gym(gym.Env):
         self.render()
 
         # Record solar power for the current step if within simulation bounds
-        if self.current_step < self.simulation_length:
-            self.tr_solar_power[:, self.current_step] = [tr.solar_power[self.current_step] for tr in self.transformers]
+        step_index = self.current_step - 1
+        if step_index < self.simulation_length:
+            self.tr_solar_power[:, step_index] = [tr.solar_power[step_index] for tr in self.transformers]
 
         # Record port energy levels for the current step for plotting
-        if self.current_step < self.simulation_length:
+        if step_index < self.simulation_length:
             for i, cs in enumerate(self.charging_stations):
                 for j in range(self.number_of_ports_per_cs):
                     if j < cs.n_ports and cs.evs_connected[j] is not None:
-                        self.port_energy_level[j, i, self.current_step] = cs.evs_connected[j].current_capacity
+                        self.port_energy_level[j, i, step_index] = cs.evs_connected[j].get_soc()
                     else:
-                        self.port_energy_level[j, i, self.current_step] = 0
+                        self.port_energy_level[j, i, step_index] = 0
+
+            # --- DEBUGGING PRINTS ---
+            if self.verbose and step_index % 10 == 0: # Print every 10 steps
+                print(f"--- Step {step_index} Data ---")
+                print(f"Power Usage: {self.current_power_usage[step_index]}")
+                print(f"PV Generation: {np.sum(self.tr_solar_power[:, step_index])}")
+                soc_mean = np.mean(self.port_energy_level[:, :, step_index][self.port_energy_level[:, :, step_index] > 0]) if np.any(self.port_energy_level[:, :, step_index] > 0) else 0
+                print(f"Mean SoC: {soc_mean}")
+                print("---------------------")
 
         return self._check_termination(reward, info)
+
+
 
     def render(self):
         '''Renders the simulation'''
@@ -599,12 +618,12 @@ class EV2Gym(gym.Env):
                                       self.current_step] = ev.actual_current
 
                     self.port_energy_level[port, cs.id,
-                                           self.current_step] = ev.current_capacity/ev.battery_capacity
+                                           self.current_step] = ev.get_soc()
 
             for ev in departing_evs:
                 if not self.lightweight_plots:
                     self.port_energy_level[ev.id, ev.location, self.current_step] = \
-                        ev.current_capacity/ev.battery_capacity
+                        ev.get_soc()
                     self.port_current[ev.id, ev.location,
                                       self.current_step] = ev.actual_current
 

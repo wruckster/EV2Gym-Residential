@@ -743,10 +743,12 @@ def plot_from_replay(replay_files, save_path=None, labels=None):
 
             # 1. Power Usage and Grid Interaction
             ax1 = axes[0, 0]
-            if hasattr(replay, 'ev_load_potential'):
-                ax1.plot(replay.ev_load_potential, label=f'{labels[idx]} Power Usage', color=color_list[idx])
+            if hasattr(replay, 'current_power_usage'):
+                current_power_usage = replay.current_power_usage
+                ax1.plot(current_power_usage, label=f'{labels[idx]} Power Usage', color=color_list[idx])
             if hasattr(replay, 'power_setpoints'):
-                ax1.plot(replay.power_setpoints, label='Power Setpoint', linestyle='--', color='black')
+                power_setpoints = replay.power_setpoints
+                ax1.plot(power_setpoints, label='Power Setpoint', linestyle='--', color='black')
             if hasattr(replay, 'tr_solar_power'):
                 total_solar = np.sum(replay.tr_solar_power, axis=0)
                 ax1.plot(total_solar, label='PV Generation', linestyle=':', color='orange')
@@ -758,8 +760,8 @@ def plot_from_replay(replay_files, save_path=None, labels=None):
 
             # 2. Power Tracking Error
             ax2 = axes[0, 1]
-            if hasattr(replay, 'power_setpoints') and hasattr(replay, 'ev_load_potential'):
-                tracking_error = np.abs(replay.power_setpoints - replay.ev_load_potential)
+            if hasattr(replay, 'power_setpoints') and hasattr(replay, 'current_power_usage'):
+                tracking_error = np.abs(replay.power_setpoints - replay.current_power_usage)
                 ax2.plot(tracking_error, label=labels[idx], color=color_list[idx])
             ax2.set_title('Power Tracking Error')
             ax2.set_xlabel('Time Step')
@@ -809,8 +811,8 @@ def plot_from_replay(replay_files, save_path=None, labels=None):
 
             # 6. Energy Breakdown
             ax6 = axes[2, 1]
-            if hasattr(replay, 'ev_load_potential') and hasattr(replay, 'tr_solar_power'):
-                total_load = replay.ev_load_potential
+            if hasattr(replay, 'current_power_usage') and hasattr(replay, 'tr_solar_power'):
+                total_load = replay.current_power_usage
                 total_solar = np.sum(replay.tr_solar_power, axis=0)
                 grid_power = np.maximum(0, total_load - total_solar)
                 ax6.stackplot(range(len(total_load)), [total_solar, grid_power], 

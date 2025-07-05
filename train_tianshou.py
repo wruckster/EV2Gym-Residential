@@ -49,8 +49,49 @@ def load_yaml_config(config_path: str) -> dict:
 
 def main(config_path: str):
     """Main training function driven by a YAML config."""
-    # --- 1. Load Configuration ---
+    # Load configuration
     config = load_yaml_config(config_path)
+
+    # Check if we're in evaluation-only mode
+    if config.get('experiment', {}).get('evaluation', {}).get('enabled', False):
+        eval_config = config['experiment']['evaluation']
+        replay_dir = eval_config.get('replay_dir', 'results')
+        plot_save_name = eval_config.get('plot_save_name', 'evaluation_plots.png')
+        
+        # Find the most recent replay file
+        try:
+            replay_files = []
+            for root, _, files in os.walk(replay_dir):
+                for file in files:
+                    if file.endswith('.pkl'):
+                        replay_files.append(os.path.join(root, file))
+            
+            if not replay_files:
+                logging.error(f"No replay files found in {replay_dir}")
+                return
+                
+            # Sort by modification time (newest first)
+            replay_files.sort(key=os.path.getmtime, reverse=True)
+            latest_replay = replay_files[0]
+            
+            logging.info(f"Running in evaluation-only mode")
+            logging.info(f"Using replay file: {latest_replay}")
+            
+            # Generate and save plots
+            plot_save_path = os.path.join(os.path.dirname(latest_replay), plot_save_name)
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=plot_save_path,
+                labels=['Evaluation']
+            )
+            logging.info(f"Evaluation plots saved to {plot_save_path}")
+            return
+            
+        except Exception as e:
+            logging.error(f"Error during evaluation: {str(e)}", exc_info=True)
+            return
+
+    # --- 1. Load Configuration ---
     exp_params = config.get('experiment', {})
     env_params = config.get('environment', {})
     rl_params = config.get('rl', {})
@@ -79,6 +120,7 @@ def main(config_path: str):
     cost_fn = get_component(cost, rl_params.get('cost_function'))
     action_wrapper_cls = get_component(action_wrappers, env_params.get('action_wrapper'))
     noise_wrapper_cls = get_component(noise_wrappers, env_params.get('noise_wrapper'))
+    verbosity = env_params['is_verbose']
     logging.info(f"-> State: {rl_params.get('state_function', 'Default')}, Reward: {rl_params.get('reward_function', 'Default')}, Action Wrapper: {env_params.get('action_wrapper', 'None')}")
 
     # --- 4. Create Vectorized Environments ---
@@ -95,7 +137,7 @@ def main(config_path: str):
                 state_function=state_fn,
                 reward_function=reward_fn,
                 cost_function=cost_fn,
-                verbose=False,
+                verbose=verbosity,
                 save_plots=False, # Plots handled by this script
                 replay_save_path=replay_dir
             )
@@ -203,7 +245,8 @@ def main(config_path: str):
                 save_replay=True,
                 replay_save_path=eval_replay_path,
                 verbose=False,
-                save_plots=False
+                save_plots=False,
+                lightweight_plots=False  # Ensure detailed statistics are collected
             )
             if action_wrapper_cls:
                 eval_env = action_wrapper_cls(eval_env)
@@ -218,30 +261,15 @@ def main(config_path: str):
 
             # Run one full episode
             eval_collector = Collector(policy, eval_env)
+            logging.info("Starting evaluation episode...")
             collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
             logging.info(f"Evaluation complete: {collect_result}")
-
-            # --- Debugging replay saving ---
-            try:
-                unwrapped_env = eval_env.unwrapped
-                logging.info(f"Unwrapped env type: {type(unwrapped_env)}")
-                if hasattr(unwrapped_env, 'save_replay') and unwrapped_env.save_replay:
-                    logging.info("`save_replay` is True on unwrapped env.")
-                    if hasattr(unwrapped_env, 'replay') and unwrapped_env.replay is not None:
-                        logging.info("Unwrapped env has `replay` attribute. Manually triggering save.")
-                        try:
-                            # Use the environment's method to save the replay
-                            save_path = unwrapped_env._save_sim_replay()
-                            logging.info(f"Successfully saved replay to: {save_path}")
-                        except Exception as e:
-                            logging.error(f"Error during manual replay save attempt: {e}")
-                            import traceback
-                            logging.error(traceback.format_exc())
-                    else:
-                        logging.warning("Unwrapped env does not have a `replay` attribute or it is None.")
-            except Exception as e:
-                logging.error(f"Error during manual replay save attempt: {e}", exc_info=True)
-            # --- End Debugging ---
+            
+            # Log episode details
+            unwrapped_env = eval_env.unwrapped
+            logging.info(f"Episode completed at step {unwrapped_env.current_step}/{unwrapped_env.simulation_length}")
+            logging.info(f"Total EVs spawned: {unwrapped_env.total_evs_spawned}")
+            logging.info(f"Episode done: {unwrapped_env.done}")
 
             eval_env.close()  # Ensure replay file is saved
 
