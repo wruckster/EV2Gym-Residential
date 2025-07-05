@@ -49,6 +49,10 @@ class EV2Gym(gym.Env):
                  ):
 
         super(EV2Gym, self).__init__()
+        # Initialize replay attribute immediately to prevent any and all race conditions.
+        self.replay = None
+        # Initialize stats dictionary immediately to prevent any and all race conditions.
+        self.stats = {}
 
         if verbose:
             print(f'Initializing EV2Gym environment...')
@@ -68,17 +72,13 @@ class EV2Gym(gym.Env):
         # Whether to render the simulation in real-time or not
         self.render_mode = render_mode
 
+        self.reward_history = []
+        self.total_evs_parked = []
+
         self.simulation_length = self.config['simulation_length']
 
-        self.replay_save_path = replay_save_path
-        self.replay = None
-
-        if self.save_replay:
-            self.replay = EvCityReplay(self)
-
-        if load_from_replay_path is not None:
-            with open(load_from_replay_path, 'rb') as file:
-                self.replay = pickle.load(file)
+        # for backward compatibility
+        self.replay_path = replay_save_path
 
         cs = self.config['number_of_charging_stations']
 
@@ -127,6 +127,11 @@ class EV2Gym(gym.Env):
             self.simulation_length = int(self.config['simulation_length'])
             # Simulation time
 
+            # Initialize time-series arrays for plotting and analysis
+            self.port_energy_level = np.zeros(
+                (self.number_of_ports_per_cs, self.cs, self.simulation_length)
+            )
+
             if self.config['random_day']:
                 if "random_hour" in self.config:
                     if self.config["random_hour"]:
@@ -159,7 +164,7 @@ class EV2Gym(gym.Env):
                                                   self.config['day'],
                                                   self.config['hour'],
                                                   self.config['minute'])
-            self.replay = None
+            self.sim_starting_date = self.sim_date
             self.sim_name = f'sim_' + \
                 f'{datetime.datetime.now().strftime("%Y_%m_%d_%f")}'
 
@@ -168,9 +173,7 @@ class EV2Gym(gym.Env):
         # Whether to simulate the grid or not (Future feature...)
         self.simulate_grid = False
 
-        self.stats = None
-        # if self.cs > 100:
-        # self.lightweight_plots = True
+        # Set the simulation starting date
         self.sim_starting_date = self.sim_date
 
         # Read the config.charging_network_topology json file and read the topology
@@ -212,6 +215,12 @@ class EV2Gym(gym.Env):
         for cs in self.charging_stations:
             cs.reset()
 
+        # Initialize replay-related attributes
+        self.replay_save_path = replay_save_path
+        max_ports = max(cs.n_ports for cs in self.charging_stations)
+        self.tr_solar_power = np.zeros((len(self.transformers), self.simulation_length))
+        self.port_energy_level = np.zeros((max_ports, len(self.charging_stations), self.simulation_length))
+
         # Calculate the total number of ports in the simulation
         self.number_of_ports = np.array(
             [cs.n_ports for cs in self.charging_stations]).sum()
@@ -234,7 +243,11 @@ class EV2Gym(gym.Env):
         self.current_power_usage = np.zeros(self.simulation_length)
         self.charge_power_potential = np.zeros(self.simulation_length)
 
+        # --- FINAL INITIALIZATION ---
+        # Initialize statistics and replay object now that all dependencies are loaded
         self.init_statistic_variables()
+        if self.save_replay and self.replay is None:
+            self.replay = EvCityReplay(self)
 
         # Variable showing whether the simulation is done or not
         self.done = False
@@ -503,77 +516,37 @@ class EV2Gym(gym.Env):
         else:
             cost = None
 
+        info = {
+            'cost': cost,
+            'total_power_usage': self.current_power_usage[self.current_step - 1],
+            'power_setpoint': self.power_setpoints[self.current_step - 1] if self.power_setpoints is not None else 0,
+            'pv_generation': np.sum([tr.solar_power[self.current_step - 1] for tr in self.transformers]),
+            'ev_soc': np.mean(self.port_energy_level[:, :, self.current_step - 1][self.port_energy_level[:, :, self.current_step - 1] > 0]) if np.any(self.port_energy_level[:, :, self.current_step - 1] > 0) else 0,
+            'num_evs_parked': self.current_evs_parked,
+        }
+
+        self.reward_history.append(reward)
+        self.total_evs_parked.append(len(self.EVs))
+
         if visualize:
             visualize_step(self)
 
         self.render()
 
-        return self._check_termination(reward, cost)
+        # Record solar power for the current step if within simulation bounds
+        if self.current_step < self.simulation_length:
+            self.tr_solar_power[:, self.current_step] = [tr.solar_power[self.current_step] for tr in self.transformers]
 
-    def _check_termination(self, reward, cost):
-        '''Checks if the episode is done or any constraint is violated'''
-        truncated = False
-        action_mask = np.zeros(self.number_of_ports)
-        # action mask is 1 if an EV is connected to the port
-        for i, cs in enumerate(self.charging_stations):
-            for j in range(cs.n_ports):
-                if cs.evs_connected[j] is not None:
-                    action_mask[i*cs.n_ports + j] = 1
+        # Record port energy levels for the current step for plotting
+        if self.current_step < self.simulation_length:
+            for i, cs in enumerate(self.charging_stations):
+                for j in range(self.number_of_ports_per_cs):
+                    if j < cs.n_ports and cs.evs_connected[j] is not None:
+                        self.port_energy_level[j, i, self.current_step] = cs.evs_connected[j].current_capacity
+                    else:
+                        self.port_energy_level[j, i, self.current_step] = 0
 
-        # Check if the episode is done or any constraint is violated
-        if self.current_step >= self.simulation_length or \
-            (any(tr.is_overloaded() > 0 for tr in self.transformers)
-             and not self.generate_rnd_game):
-            """Terminate if:
-                - The simulation length is reached
-                - Any user satisfaction score is below the threshold
-                - Any charging station is overloaded
-                Dont terminate when overloading if :
-                - generate_rnd_game is True
-                Carefull: if generate_rnd_game is True,
-                the simulation might end up in infeasible problem
-                """
-
-            self.done = True
-            self.stats = get_statistics(self)
-
-            self.stats['action_mask'] = action_mask
-            self.cost = cost
-
-            if self.verbose:
-                print_statistics(self)
-
-                if any(tr.is_overloaded() for tr in self.transformers):
-                    print(
-                        f"Transformer overloaded, {self.current_step} timesteps\n")
-                else:
-                    print(
-                        f"Episode finished after {self.current_step} timesteps\n")
-
-            if self.save_replay:
-                self._save_sim_replay()
-
-            if self.save_plots:
-                # save the env as a pickle file
-                with open(f"./results/{self.sim_name}/env.pkl", 'wb') as f:
-                    self.renderer = None
-                    pickle.dump(self, f)
-                ev_city_plot(self)
-
-            if self.cost_function is not None:
-                return self._get_observation(), reward, True, truncated, self.stats
-            else:
-                return self._get_observation(), reward, True, truncated, self.stats
-        else:
-            stats = {
-                'cost': cost,
-                'action_mask': action_mask,
-            }
-
-            if self.cost_function is not None:
-                return self._get_observation(), reward, False, truncated, stats
-            else:
-                return self._get_observation(), reward, False, truncated, stats
+        return self._check_termination(reward, info)
 
     def render(self):
         '''Renders the simulation'''
@@ -628,7 +601,7 @@ class EV2Gym(gym.Env):
                     self.port_energy_level[port, cs.id,
                                            self.current_step] = ev.current_capacity/ev.battery_capacity
 
-            for ev in self.departing_evs:
+            for ev in departing_evs:
                 if not self.lightweight_plots:
                     self.port_energy_level[ev.id, ev.location, self.current_step] = \
                         ev.current_capacity/ev.battery_capacity
@@ -641,8 +614,89 @@ class EV2Gym(gym.Env):
             datetime.timedelta(minutes=self.timescale)
 
     def _get_observation(self):
+        obs = self.state_function(self)
+        if np.isnan(obs).any():
+            print("!!! WARNING: NaN detected in observation !!!")
+            print(obs)
+        return obs
 
-        return self.state_function(self)
+    def _calculate_reward(self, total_costs, user_satisfaction_list, invalid_action_punishment):
+        '''Calculates the reward for the current step'''
+
+        reward = self.reward_function(
+            self, total_costs, user_satisfaction_list, invalid_action_punishment)
+        if np.isnan(reward):
+            print("!!! WARNING: NaN detected in reward !!!")
+            print(f"Reward: {reward}")
+        self.total_reward += reward
+
+        return reward
+
+    def _check_termination(self, reward, info):
+        '''Checks if the episode is done or any constraint is violated'''
+        truncated = False
+        action_mask = np.zeros(self.number_of_ports)
+        # action mask is 1 if an EV is connected to the port
+        for i, cs in enumerate(self.charging_stations):
+            for j in range(cs.n_ports):
+                if cs.evs_connected[j] is not None:
+                    action_mask[i*cs.n_ports + j] = 1
+
+        # Check if the episode is done or any constraint is violated
+        if self.current_step >= self.simulation_length or \
+            (any(tr.is_overloaded() > 0 for tr in self.transformers)
+             and not self.generate_rnd_game):
+            """Terminate if:
+                - The simulation length is reached
+                - Any user satisfaction score is below the threshold
+                - Any charging station is overloaded
+                Dont terminate when overloading if :
+                - generate_rnd_game is True
+                Carefull: if generate_rnd_game is True,
+                the simulation might end up in infeasible problem
+                """
+
+            self.done = True
+            self.stats = get_statistics(self)
+
+            self.stats['action_mask'] = action_mask
+            self.cost = info['cost']
+            self.stats.update(info)
+
+            if self.verbose:
+                print_statistics(self)
+
+                if any(tr.is_overloaded() for tr in self.transformers):
+                    print(
+                        f"Transformer overloaded, {self.current_step} timesteps\n")
+                else:
+                    print(
+                        f"Episode finished after {self.current_step} timesteps\n")
+
+            if self.save_replay:
+                self._save_sim_replay()
+
+            if self.save_plots:
+                # save the env as a pickle file
+                with open(f"./results/{self.sim_name}/env.pkl", 'wb') as f:
+                    self.renderer = None
+                    pickle.dump(self, f)
+                ev_city_plot(self)
+
+            if self.cost_function is not None:
+                return self._get_observation(), reward, True, truncated, self.stats
+            else:
+                return self._get_observation(), reward, True, truncated, self.stats
+        else:
+            stats = {
+                'action_mask': action_mask,
+            }
+            stats.update(info)
+
+            if self.cost_function is not None:
+                return self._get_observation(), reward, False, truncated, stats
+            else:
+                return self._get_observation(), reward, False, truncated, stats
 
     def set_cost_function(self, cost_function):
         '''
@@ -655,12 +709,3 @@ class EV2Gym(gym.Env):
         This function sets the reward function of the environment
         '''
         self.reward_function = reward_function
-
-    def _calculate_reward(self, total_costs, user_satisfaction_list, invalid_action_punishment):
-        '''Calculates the reward for the current step'''
-
-        reward = self.reward_function(
-            self, total_costs, user_satisfaction_list, invalid_action_punishment)
-        self.total_reward += reward
-
-        return reward

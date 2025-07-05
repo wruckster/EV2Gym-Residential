@@ -83,6 +83,11 @@ def main(config_path: str):
 
     # --- 4. Create Vectorized Environments ---
     logging.info("Creating vectorized environments...")
+    
+    # Create replay directory for saving replay files
+    replay_dir = os.path.join(run_dir, "replay_files")
+    os.makedirs(replay_dir, exist_ok=True)
+    
     def make_env(seed_offset: int = 0):
         def _init():
             env = EV2Gym(
@@ -91,7 +96,8 @@ def main(config_path: str):
                 reward_function=reward_fn,
                 cost_function=cost_fn,
                 verbose=False,
-                save_plots=False # Plots handled by this script
+                save_plots=False, # Plots handled by this script
+                replay_save_path=replay_dir
             )
             if action_wrapper_cls:
                 env = action_wrapper_cls(env)
@@ -126,13 +132,17 @@ def main(config_path: str):
             return torch.distributions.Normal(loc=x[0], scale=x[1])
         dist_fn = dist_fn_wrapper
 
+    # Get policy args from config
+    policy_args = ppo_params.get('policy_args', {}).copy()
+
     policy = PPOPolicy(
         actor=net.actor,
         critic=net.critic,
         optim=optim,
         dist_fn=dist_fn,
         action_space=env.action_space,
-        **ppo_params.get('policy_args', {})
+        # All PPO parameters come from config
+        **policy_args
     )
     logging.info("PPO policy created successfully.")
 
@@ -217,15 +227,18 @@ def main(config_path: str):
                 logging.info(f"Unwrapped env type: {type(unwrapped_env)}")
                 if hasattr(unwrapped_env, 'save_replay') and unwrapped_env.save_replay:
                     logging.info("`save_replay` is True on unwrapped env.")
-                    if hasattr(unwrapped_env, 'replay') and unwrapped_env.replay:
+                    if hasattr(unwrapped_env, 'replay') and unwrapped_env.replay is not None:
                         logging.info("Unwrapped env has `replay` attribute. Manually triggering save.")
-                        save_path = unwrapped_env.replay_save_path
-                        unwrapped_env.replay.save(save_path)
-                        logging.info(f"Manual save to {save_path} attempted.")
+                        try:
+                            # Use the environment's method to save the replay
+                            save_path = unwrapped_env._save_sim_replay()
+                            logging.info(f"Successfully saved replay to: {save_path}")
+                        except Exception as e:
+                            logging.error(f"Error during manual replay save attempt: {e}")
+                            import traceback
+                            logging.error(traceback.format_exc())
                     else:
                         logging.warning("Unwrapped env does not have a `replay` attribute or it is None.")
-                else:
-                    logging.warning("`save_replay` is False or missing on unwrapped env.")
             except Exception as e:
                 logging.error(f"Error during manual replay save attempt: {e}", exc_info=True)
             # --- End Debugging ---

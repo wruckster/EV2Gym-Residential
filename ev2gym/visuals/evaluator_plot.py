@@ -713,6 +713,132 @@ def plot_prices(results_path, save_path=None, algorithm_names=None):
                 dpi=60, bbox_inches='tight')
     plt.show()
 
+def plot_from_replay(replay_files, save_path=None, labels=None):
+    """
+    Generate a detailed dashboard from replay files for training evaluation.
+    
+    Args:
+        replay_files: List of replay file paths or single replay file path
+        save_path: Path to save the generated plot
+        labels: List of labels for each replay file (optional)
+    """
+    import pickle
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+
+    if isinstance(replay_files, str):
+        replay_files = [replay_files]
+    
+    if labels is None:
+        labels = [f"Run {i+1}" for i in range(len(replay_files))]
+
+    fig, axes = plt.subplots(3, 2, figsize=(18, 15))
+    fig.suptitle('Training Evaluation Dashboard', fontsize=16)
+
+    for idx, replay_file in enumerate(replay_files):
+        try:
+            with open(replay_file, 'rb') as f:
+                replay = pickle.load(f)
+
+            # 1. Power Usage and Grid Interaction
+            ax1 = axes[0, 0]
+            if hasattr(replay, 'ev_load_potential'):
+                ax1.plot(replay.ev_load_potential, label=f'{labels[idx]} Power Usage', color=color_list[idx])
+            if hasattr(replay, 'power_setpoints'):
+                ax1.plot(replay.power_setpoints, label='Power Setpoint', linestyle='--', color='black')
+            if hasattr(replay, 'tr_solar_power'):
+                total_solar = np.sum(replay.tr_solar_power, axis=0)
+                ax1.plot(total_solar, label='PV Generation', linestyle=':', color='orange')
+            ax1.set_title('Power Usage and Grid Interaction')
+            ax1.set_xlabel('Time Step')
+            ax1.set_ylabel('Power (kW)')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+
+            # 2. Power Tracking Error
+            ax2 = axes[0, 1]
+            if hasattr(replay, 'power_setpoints') and hasattr(replay, 'ev_load_potential'):
+                tracking_error = np.abs(replay.power_setpoints - replay.ev_load_potential)
+                ax2.plot(tracking_error, label=labels[idx], color=color_list[idx])
+            ax2.set_title('Power Tracking Error')
+            ax2.set_xlabel('Time Step')
+            ax2.set_ylabel('Error (kW)')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+
+            # 3. Number of EVs Parked
+            ax3 = axes[1, 0]
+            if hasattr(replay, 'total_evs_parked') and replay.total_evs_parked is not None:
+                ax3.plot(replay.total_evs_parked, label=labels[idx], color=color_list[idx])
+            ax3.set_title('Number of EVs Parked')
+            ax3.set_xlabel('Time Step')
+            ax3.set_ylabel('Number of EVs')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+
+            # 4. Cumulative Reward
+            ax4 = axes[1, 1]
+            if hasattr(replay, 'reward_history') and replay.reward_history is not None:
+                cumulative_reward = np.cumsum(replay.reward_history)
+                ax4.plot(cumulative_reward, label=labels[idx], color=color_list[idx])
+            ax4.set_title('Cumulative Reward')
+            ax4.set_xlabel('Time Step')
+            ax4.set_ylabel('Reward')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+
+            # 5. Aggregate EV Battery SoC
+            ax5 = axes[2, 0]
+            if hasattr(replay, 'port_energy_level') and replay.port_energy_level is not None:
+                # Filter out zero values (empty ports) and calculate mean SoC
+                soc_data = replay.port_energy_level
+                mean_soc = []
+                for t in range(soc_data.shape[2]):
+                    soc_at_t = soc_data[:, :, t][soc_data[:, :, t] > 0]
+                    if soc_at_t.size > 0:
+                        mean_soc.append(np.mean(soc_at_t))
+                    else:
+                        mean_soc.append(0)
+                ax5.plot(mean_soc, label=labels[idx], color=color_list[idx])
+            ax5.set_title('Average EV Battery SoC')
+            ax5.set_xlabel('Time Step')
+            ax5.set_ylabel('SoC (%)')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+
+            # 6. Energy Breakdown
+            ax6 = axes[2, 1]
+            if hasattr(replay, 'ev_load_potential') and hasattr(replay, 'tr_solar_power'):
+                total_load = replay.ev_load_potential
+                total_solar = np.sum(replay.tr_solar_power, axis=0)
+                grid_power = np.maximum(0, total_load - total_solar)
+                ax6.stackplot(range(len(total_load)), [total_solar, grid_power], 
+                              labels=['PV Generation', 'Grid Power'], 
+                              colors=['orange', 'lightblue'], alpha=0.7)
+            ax6.set_title('Energy Generation and Consumption')
+            ax6.set_xlabel('Time Step')
+            ax6.set_ylabel('Power (kW)')
+            ax6.legend()
+            ax6.grid(True, alpha=0.3)
+
+        except Exception as e:
+            print(f"Error processing replay file {replay_file}: {e}")
+            import traceback
+            print(traceback.format_exc())
+            continue
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}")
+    else:
+        plt.show()
+
+    plt.close()
+
+
 if __name__ == "__main__":
 
     plot_total_power_V2G(results_path=r'E:/GitHub/ev2gym/results/eval_5cs_1tr_V2G_MPC_5_algos_1_exp_2024_03_03_727260/plot_results_dict.pkl',

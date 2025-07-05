@@ -21,7 +21,7 @@ class EvCityReplay():
 
         self.stats = env.stats
 
-        self.replay_path = env.replay_path + 'replay_' + env.sim_name + '.pkl'
+        self.replay_path = os.path.join(env.replay_path, f'replay_{env.sim_name}.pkl')
         self.sim_name = env.sim_name + '_replay'
         self.sim_length = env.simulation_length
         self.n_cs = env.cs
@@ -33,6 +33,18 @@ class EvCityReplay():
         self.scenario = env.scenario
         self.heterogeneous_specs = env.heterogeneous_specs
         self.ev_load_potential = env.current_power_usage
+
+        # Add time-series data for plotting
+        if hasattr(env, 'total_evs_parked'):
+            self.total_evs_parked = env.total_evs_parked
+        if hasattr(env, 'reward_history'):
+            self.reward_history = env.reward_history
+
+        # Add data for detailed plotting
+        if hasattr(env, 'tr_solar_power'):
+            self.tr_solar_power = env.tr_solar_power
+        if hasattr(env, 'port_energy_level'):
+            self.port_energy_level = env.port_energy_level
 
         self.transformers = env.transformers
         self.charging_stations = env.charging_stations
