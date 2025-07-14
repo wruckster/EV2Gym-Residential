@@ -3,27 +3,27 @@
 ##############################################################################
 # Simulation Parameters
 ##############################################################################
-timescale: 15  # minutes per step
-simulation_length: 96  # 1 week (2 days * 24 hours * 60 minutes / 15 minutes) = 192 steps
+timescale: 5  # minutes per step
+simulation_length: 8064  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 ##############################################################################
 # Date and Time
 ##############################################################################
 # Year, month, day
-year: 2019  # 2015-2023
-month: 1    # 1-12
-day: 1     # 1-31
+year: 2023  # 2015-2023
+month: 3    # 1-12
+day: 24     # 1-31
 # Whether to get a random date every time the environment is reset
-random_day: True  # True or False
-random_hour: True  # True or False
+random_day: False  # True or False
+random_hour: False  # True or False
 
 # Simulation Starting Time
 # Hour and minute do not change after the environment has been reset
-hour: 0  # 0-23
+hour: 12  # 0-23
 minute: 0  # Simulation starting minute (0-59)
 
 # Simulate weekdays, weekends, or both
-simulation_days: weekdays  # weekdays, weekends, or both
+simulation_days: both  # weekdays, weekends, or both
 
 # EV Spawn Behavior
 scenario: private  # public, private, or workplace
@@ -114,22 +114,29 @@ charging_station:
   efficiency: 0.95  # Charging station efficiency (0-1)
 
 ##############################################################################
-# PV solar Power
-##############################################################################
-solar_power:
-  include: true  # Enable solar power generation
-  solar_power_capacity_multiplier_mean: 1  # 1 is default, higher means more solar power
-  forecast_mean: 90  # in percentage of load at time t%
-  forecast_std: 5    # in percentage of load at time t%
-
-##############################################################################
 # Inflexible Loads (Home Appliances)
 ##############################################################################
 inflexible_loads: # Offices, homes
   include: True # True or False
+  data_files:                                    # one or more CSVs in nsw_dataset/households/
+    - ev2gym/data/nsw_dataset/households/SuRF-property_32.csv
+  #   # - ev2gym/data/nsw_dataset/households/SuRF-property_99.csv
+  scale_mean: 1.0   
+  scale_to_max_power: false # If true, scales the load to match transformer max power
   inflexible_loads_capacity_multiplier_mean: 1 # 1 is default, the higher the number the more inflexible loads
-  forecast_mean: 90 # in percentage of load at time t%
+  forecast_mean: 70 # in percentage of load at time t%
   forecast_std: 5 # in percentage of load at time t%
+
+##############################################################################
+# PV solar Power
+##############################################################################
+solar_power:
+  include: true  # Enable solar power generation
+  data_from_household_csv: true                 # piggy-back on the same files
+  scale_to_max_power: false # If true, scales the generation to match transformer max power
+  solar_power_capacity_multiplier_mean: 1  # 1 is default, higher means more solar power
+  forecast_mean: 80  # in percentage of load at time t%
+  forecast_std: 5    # in percentage of load at time t%
 
 ##############################################################################
 # Random Seed

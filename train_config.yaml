@@ -9,7 +9,7 @@ experiment:
   # Evaluation mode settings
   evaluation:
     enabled: False                   # Set to true to only run evaluation, no training
-    replay_dir: 'results/ppo_residential_v2g_20250706_080700/replay_files'           # Directory to look for replay files
+    replay_dir: 'results/ppo_residential_v2g_20250714_075201/replay_files'           # Directory to look for replay files
     plot_save_name: 'evaluation_plots.png'  # Name for the output plot file
 
 # 2. Environment settings

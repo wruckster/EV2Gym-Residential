@@ -56,6 +56,7 @@ def eval():
     # agent = ChargeAsFastAsPossible()
     # agent = RandomAgent(verbose=False)
     # agent = ChargeAsFastAsPossibleToDesiredCapacity()
+    agent = RoundRobin(env, verbose=True)  # Using RoundRobin as a simple default agent
     rewards = []
 
     for t in range(env.simulation_length):

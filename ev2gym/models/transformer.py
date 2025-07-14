@@ -187,13 +187,22 @@ class Transformer():
 
     def normalize_pv_generation(self, env) -> None:
         '''
-        Normalize the solar_power using the configuration file and teh max_power of the transformer
+        Normalize the solar_power using the configuration file.
         '''
         if env.config['solar_power']['include']:
             mult = env.config['solar_power']['solar_power_capacity_multiplier_mean']
             mult = env.tr_rng.normal(mult, 0.1)
-            self.solar_power = -self.solar_power * \
-                mult * max(self.max_power)
+
+            # Solar power is negated as it's generation.
+            self.solar_power = -self.solar_power * mult
+
+            # Conditionally scale to max power if the flag is true
+            if env.config['solar_power'].get('scale_to_max_power', True):
+                min_solar_power = abs(self.solar_power.min())
+                # Add a small epsilon to avoid division by zero
+                if min_solar_power > 1e-7:
+                    self.solar_power = self.solar_power * (max(self.max_power) / min_solar_power)
+
 
     def generate_pv_generation_forecast(self, env) -> None:
         '''
@@ -219,10 +228,16 @@ class Transformer():
             mult = env.config['inflexible_loads']['inflexible_loads_capacity_multiplier_mean']
             mult = env.tr_rng.normal(mult, 0.1)
 
-            # scale up the data to match the max_power of the transformers
-            self.inflexible_load = self.inflexible_load * \
-                mult * (max(self.max_power) /
-                        self.inflexible_load.max()+0.0000001)
+            self.inflexible_load = self.inflexible_load * mult
+
+            # Conditionally scale up the data to match the max_power of the transformers
+            if env.config['inflexible_loads'].get('scale_to_max_power', True):
+                max_load = self.inflexible_load.max()
+                # Add a small epsilon to avoid division by zero
+                if max_load > 1e-7:
+                    self.inflexible_load = self.inflexible_load * \
+                        (max(self.max_power) / max_load)
+
             # for each step
             for j in range(env.simulation_length):
                 if self.inflexible_load[j] > self.max_power[j]:

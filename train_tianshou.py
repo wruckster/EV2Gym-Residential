@@ -82,9 +82,31 @@ def main(config_path: str):
             evaluator_plot.plot_from_replay(
                 [latest_replay],
                 save_path=plot_save_path,
-                labels=['Evaluation']
+                labels=["Evaluation"],
+                plot_type="main",
             )
-            logging.info(f"Evaluation plots saved to {plot_save_path}")
+
+            # Prices plot
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_prices.png"),
+                plot_type="prices",
+            )
+
+            # Solar plot
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_solar.png"),
+                plot_type="solar",
+            )
+
+            # Details plot
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_details.png"),
+                plot_type="details",
+            )
+
             return
             
         except Exception as e:
@@ -273,55 +295,51 @@ def main(config_path: str):
 
             eval_env.close()  # Ensure replay file is saved
 
-            # Generate and save plots
-            # Wait a moment for the file to be written to disk
-            import time
-            time.sleep(1)
-            
-            replay_files = sorted([f for f in os.listdir(eval_replay_path) if f.endswith('.pkl')], 
-                                key=lambda x: os.path.getmtime(os.path.join(eval_replay_path, x)))
-            
-            if not replay_files:
-                # Try to find replay files in the parent directory as a fallback
-                replay_files = sorted([f for f in os.listdir('.') if f.endswith('.pkl')],
-                                    key=lambda x: os.path.getmtime(x))
-                if replay_files:
-                    latest_replay_file = replay_files[-1]  # Most recent file
-                    logging.info(f"Found replay file in working directory: {latest_replay_file}")
-                else:
-                    logging.warning("No replay files found. Checking directory contents:")
-                    logging.warning(f"Contents of {eval_replay_path}: {os.listdir(eval_replay_path) if os.path.exists(eval_replay_path) else 'Directory not found'}")
-                    logging.warning(f"Current working directory contents: {os.listdir('.')}")
+            # Generate plots from the replay files
+            if os.path.exists(eval_replay_path):
+                replay_files = sorted([f for f in os.listdir(eval_replay_path) if f.endswith('.pkl')], 
+                                    key=lambda x: os.path.getmtime(os.path.join(eval_replay_path, x)))
             else:
-                latest_replay_file = os.path.join(eval_replay_path, replay_files[-1])
+                replay_files = []
 
             if replay_files:
-                if not latest_replay_file.startswith(eval_replay_path):
-                    # If we found the file in the working directory, update the path
-                    latest_replay_file = os.path.abspath(latest_replay_file)
-                else:
-                    latest_replay_file = os.path.join(eval_replay_path, replay_files[-1])
-                
-                logging.info(f"Generating plots from replay file: {latest_replay_file}")
-                plot_save_path = os.path.join(run_dir, "evaluation_plots.png")
-                
-                try:
-                    evaluator_plot.plot_from_replay(
-                        [latest_replay_file],
-                        save_path=plot_save_path,
-                        labels=['PPO']
-                    )
-                    logging.info(f"Evaluation plots saved to {plot_save_path}")
-                except Exception as e:
-                    logging.error(f"Error generating plots: {str(e)}", exc_info=True)
-                    # Try to load and log the replay file to help with debugging
-                    try:
-                        with open(latest_replay_file, 'rb') as f:
-                            import pickle
-                            data = pickle.load(f)
-                            logging.info(f"Replay file keys: {list(data.keys()) if hasattr(data, 'keys') else 'Not a dictionary'}")
-                    except Exception as load_error:
-                        logging.error(f"Failed to load replay file: {str(load_error)}")
+                print(f"[Main] Found {len(replay_files)} replay files. Generating plots...")
+                # Main plot
+                evaluator_plot.plot_from_replay(
+                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                    save_path=os.path.join(run_dir, "evaluation_plots.png"),
+                    labels=["Evaluation"],
+                    plot_type="main",
+                )
+
+                # Prices plot
+                evaluator_plot.plot_from_replay(
+                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                    save_path=os.path.join(run_dir, "evaluation_prices.png"),
+                    plot_type="prices",
+                )
+
+                # Solar plot
+                evaluator_plot.plot_from_replay(
+                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                    save_path=os.path.join(run_dir, "evaluation_solar.png"),
+                    plot_type="solar",
+                )
+
+                # Details plot
+                evaluator_plot.plot_from_replay(
+                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                    save_path=os.path.join(run_dir, "evaluation_details.png"),
+                    plot_type="details",
+                )
+
+                # EV-city rich multi-panel plot
+                evaluator_plot.plot_from_replay(
+                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                    save_path=os.path.join(run_dir, "evaluation_city.png"),
+                    plot_type="city",
+                )
+
         except Exception as e:
             logging.error("An error occurred during evaluation and plotting:", exc_info=True)
 
