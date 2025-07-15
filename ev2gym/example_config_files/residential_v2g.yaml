@@ -3,8 +3,8 @@
 ##############################################################################
 # Simulation Parameters
 ##############################################################################
-timescale: 5  # minutes per step
-simulation_length: 8064  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+timescale: 15  # minutes per step
+simulation_length: 200  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 ##############################################################################
 # Date and Time
@@ -24,6 +24,47 @@ minute: 0  # Simulation starting minute (0-59)
 
 # Simulate weekdays, weekends, or both
 simulation_days: both  # weekdays, weekends, or both
+
+##############################################################################
+# New user_profiles section that extends existing functionality
+##############################################################################
+user_profiles:
+  office_worker:
+    profile_name: office_worker
+    vehicle_count: 1
+    default_station: 0  # Home station ID
+    work_station: 1     # Work station ID
+    commute:
+      distance_km: 20
+      consumption_kwh_per_km: 0.18
+    schedule:
+      weekday:
+        morning_commute:
+          start_time: "07:00"
+          end_time: "08:00"
+          location: away
+          prob_short_trip: 0.0
+        work_hours:
+          start_time: "08:00"
+          end_time: "17:30"
+          location: work
+          prob_short_trip: 0.2
+          short_trip_duration: [15, 120]  # minutes
+      weekend:
+        morning:
+          start_time: "07:00"
+          end_time: "12:00"
+          location: home
+          prob_short_trip: 0.3
+          short_trip_duration: [30, 480]  # minutes
+        evening:
+          start_time: "12:00"
+          end_time: "22:00"
+          location: home
+          prob_short_trip: 0.5
+          short_trip_duration: [30, 120]  # minutes
+
+
 
 # EV Spawn Behavior
 scenario: private  # public, private, or workplace
@@ -94,7 +135,7 @@ ev:
 # Charging Network
 ##############################################################################
 v2g_enabled: True # True or False
-number_of_charging_stations: 1
+number_of_charging_stations: 2
 number_of_transformers: 1
 number_of_ports_per_cs: 1
 # Provide path if you want to load a specific charging topology,

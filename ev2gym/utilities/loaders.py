@@ -22,6 +22,7 @@ from ev2gym.models.ev.charger import EV_Charger
 from ev2gym.models.ev.vehicle import EV
 from ev2gym.models.transformer import Transformer
 
+from ev2gym.profiles.schedule_generator import generate_ev_profiles
 from ev2gym.utilities.utils import EV_spawner, generate_power_setpoints, EV_spawner_GF
 
 
@@ -403,21 +404,28 @@ def load_ev_profiles(env) -> List[EV]:
     Returns:
         - ev_profiles: a list of ev_profile objects'''
 
-    if env.load_from_replay_path is None:
-
-        if env.scenario == 'GF':
-            ev_profiles = EV_spawner_GF(env)
-            while len(ev_profiles) == 0:
-                ev_profiles = EV_spawner_GF(env)
-            return ev_profiles
-
-        ev_profiles = EV_spawner(env)
-        while len(ev_profiles) == 0:
-            ev_profiles = EV_spawner(env)
-
-        return ev_profiles
-    else:
+    # 1. If replay provided, just use it.
+    if env.load_from_replay_path is not None:
         return env.replay.EVs
+
+    # 2. Check for user-defined profiles (new schedule system)
+    ev_profiles = generate_ev_profiles(env)
+    if len(ev_profiles) > 0:
+        return ev_profiles
+
+    # 3. Fallback to legacy random spawners
+    if env.scenario == 'GF':
+        ev_profiles = EV_spawner_GF(env)
+        while len(ev_profiles) == 0:
+            ev_profiles = EV_spawner_GF(env)
+        return ev_profiles
+
+    ev_profiles = EV_spawner(env)
+    while len(ev_profiles) == 0:
+        ev_profiles = EV_spawner(env)
+
+    return ev_profiles
+
 
 def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
     '''Loads the electricity prices of the simulation
