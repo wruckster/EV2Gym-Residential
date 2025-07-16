@@ -35,6 +35,12 @@ class EvCityReplay():
         self.current_power_usage = env.current_power_usage
 
         # Add time-series data for plotting
+        if hasattr(env, 'tracking_error'):
+            self.tracking_error = env.tracking_error
+        if hasattr(env, 'ev_count'):
+            self.ev_count = env.ev_count
+        if hasattr(env, 'cumulative_cost'):
+            self.cumulative_cost = env.cumulative_cost
         if hasattr(env, 'total_evs_parked'):
             self.total_evs_parked = env.total_evs_parked
         if hasattr(env, 'reward_history'):
@@ -186,16 +192,17 @@ class EvCityReplay():
                                    t_arr] = ev.battery_capacity_at_arrival
             self.ev_arrival[port, cs_id, t_arr] = 1
             if original_t_dep < self.sim_length:
-                self.t_dep[port, cs_id, t_dep] = 1            
+                safe_t_dep = min(t_dep, self.sim_length - 1)
+                self.t_dep[port, cs_id, safe_t_dep] = 1            
                 if ev.prev_capacity < ev.battery_capacity:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.prev_capacity #-5
+                    self.max_energy_at_departure[port, cs_id, safe_t_dep] = ev.prev_capacity #-5
                 else:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.battery_capacity
+                    self.max_energy_at_departure[port, cs_id, safe_t_dep] = ev.battery_capacity
             else:
                 self.t_dep[port, cs_id, t_dep-1] = 1                            
                 self.max_energy_at_departure[port, cs_id, t_dep-1] = ev.prev_capacity
             
-            self.ev_des_energy[port, cs_id, t_dep] = ev.desired_capacity
+            self.ev_des_energy[port, cs_id, min(t_dep, self.sim_length - 1)] = ev.desired_capacity
 
         # print(f'u: {self.u}')
         # print(f'ev_arrival: {self.ev_arrival}')

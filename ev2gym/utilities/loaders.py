@@ -9,12 +9,103 @@ import datetime
 import importlib.resources
 import pathlib
 from importlib.resources.abc import Traversable
+import yaml
+import os
+import importlib
+from typing import Any, Dict, List, Tuple, Union
+import inspect
 
 def get_resource_path(package, resource):
     """Helper function to get resource path using importlib.resources"""
     # All data files are in ev2gym.data, ignore the subpackage structure
     with importlib.resources.path('ev2gym.data', resource) as p:
         return str(p)
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Loads a YAML configuration file."""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def get_component(module_name: str, component_config: Union[Dict[str, Any], str], env=None) -> Any:
+    """
+    Dynamically imports a class or function from a given module.
+
+    Args:
+        module_name (str): The name of the module (e.g., 'reward', 'cost').
+        component_config (Union[Dict[str, Any], str]): Either a dictionary containing the component's
+                                                      name and arguments, or a string with just the component name.
+        env: Optional environment to pass to the component if it's a function or requires it.
+
+    Returns:
+        The component (class, function, or instance) or None if not found.
+    """
+    if isinstance(component_config, str):
+        # Handle case where component_config is just the component name as a string
+        name = component_config
+        args = {}
+    else:
+        # Handle case where component_config is a dictionary
+        name = component_config.get('name', '') if isinstance(component_config, dict) else ''
+        args = component_config.get('args', {}) if isinstance(component_config, dict) else {}
+    
+    if not name:  # If no component name is provided, return None
+        return None
+
+    module = importlib.import_module(f'ev2gym.rl_agent.{module_name}')
+    component = getattr(module, name)
+
+    # Special handling for profit_maximization reward function
+    if module_name == 'reward' and name == 'profit_maximization':
+        if env is None:
+            raise ValueError("The 'profit_maximization' reward function requires the 'env' argument.")
+        # Return a lambda that captures the env and has the correct signature for the reward function
+        return lambda total_costs, user_satisfaction_list, *args: component(env, total_costs, user_satisfaction_list, *args)
+
+    # If it's a class, instantiate it with the environment if provided
+    if inspect.isclass(component):
+        # For components that need the environment (like wrappers or state functions)
+        if env is not None:
+            try:
+                # Try to instantiate with env as a positional argument
+                return component(env, **args)
+            except TypeError:
+                # Fallback to keyword arguments if the first way fails
+                return component(**args)
+        else:
+            return component(**args)
+
+    # If it's a function, return it to be called later
+    if callable(component):
+        return component
+
+    return component
+
+def get_paths(config: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Creates and returns a dictionary of necessary paths for the experiment.
+
+    Args:
+        config (Dict[str, Any]): The main configuration dictionary.
+
+    Returns:
+        A dictionary containing paths for results, models, and logs.
+    """
+    base_dir = config['logging'].get('results_dir', 'results')
+    run_name = config['logging'].get('run_name', 'default_run')
+    
+    run_dir = os.path.join(base_dir, run_name)
+    model_dir = os.path.join(run_dir, 'models')
+    log_dir = os.path.join(run_dir, 'logs')
+
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    return {
+        'run_dir': run_dir,
+        'model_dir': model_dir,
+        'log_dir': log_dir,
+    }
+
 import json
 from typing import List, Tuple
 

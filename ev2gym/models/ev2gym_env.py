@@ -574,12 +574,24 @@ class EV2Gym(gym.Env):
 
     def _save_sim_replay(self):
         '''Saves the simulation data in a pickle file'''
-        replay = EvCityReplay(self)
-        print(f"Saving replay file at {replay.replay_path}")
-        with open(replay.replay_path, 'wb') as f:
-            pickle.dump(replay, f)
+        if not self.save_replay:
+            return
 
-        return replay.replay_path
+        # Ensure the directory exists
+        os.makedirs(self.replay_path, exist_ok=True)
+
+        # Use os.path.join for robust path construction
+        filename = f"replay_{self.sim_name}.pkl"
+        filepath = os.path.join(self.replay_path, filename)
+
+        try:
+            with open(filepath, "wb") as f:
+                replay = EvCityReplay(self)
+                pickle.dump(replay, f)
+        except Exception as e:
+            print(f"Error saving replay file: {e}")
+
+        return filepath
 
     def set_save_plots(self, save_plots):
         if save_plots:

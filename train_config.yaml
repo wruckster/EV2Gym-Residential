@@ -26,11 +26,19 @@ rl:
   reward_function: 'profit_maximization' # From ev2gym.rl_agent.reward
   cost_function: ''                     # Optional: from ev2gym.rl_agent.cost
 
+  # --- Network architecture ---
+  actor_args:
+    max_action: 1.0  # Maximum action value (for action scaling)
+    hidden_sizes: [256, 256]  # Hidden layer sizes for actor network
+    
+  critic_args:
+    hidden_sizes: [256, 256]  # Hidden layer sizes for critic network
+
   # --- Tianshou OnpolicyTrainer arguments ---
   # See Tianshou docs for OnpolicyTrainer for all available options
   trainer_args:
-    max_epoch: 100
-    step_per_epoch: 10000
+    max_epoch: 5
+    step_per_epoch: 1000
     step_per_collect: 2048
     repeat_per_collect: 4
     episode_per_test: 10
@@ -38,20 +46,21 @@ rl:
     show_progress: True
 
   # --- Other RL settings ---
-  training_num: 8  # Number of parallel environments for training
-  test_num: 2      # Number of parallel environments for testing
+  training_num: 2  # Number of parallel environments for training
+  test_num: 1      # Number of parallel environments for testing
   buffer_size: 200_000
 
   # --- PPO-specific arguments ---
   ppo:
     policy_args:
       # See Tianshou docs for PPOPolicy for all available options
+      eps_clip: 0.2
       discount_factor: 0.99
       gae_lambda: 0.95
       vf_coef: 0.5
       ent_coef: 0.01
       max_grad_norm: 0.5
       reward_normalization: True
-      action_scaling: False # Set to False, as Rescale_RepairLayer handles scaling
+      action_scaling: True  # Now safe to enable with max_action defined
       action_bound_method: 'clip'
     lr: 0.0003

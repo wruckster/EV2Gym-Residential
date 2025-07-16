@@ -4,7 +4,7 @@
 # Simulation Parameters
 ##############################################################################
 timescale: 15  # minutes per step
-simulation_length: 200  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+simulation_length: 600  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 ##############################################################################
 # Date and Time
@@ -19,7 +19,7 @@ random_hour: False  # True or False
 
 # Simulation Starting Time
 # Hour and minute do not change after the environment has been reset
-hour: 12  # 0-23
+hour: 6  # 0-23
 minute: 0  # Simulation starting minute (0-59)
 
 # Simulate weekdays, weekends, or both

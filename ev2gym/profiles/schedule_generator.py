@@ -88,13 +88,14 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
 
         current_dt = start_datetime
         step = 0
+
+        # First, collect all non-home blocks for the entire simulation period.
+        non_home_blocks: List[Tuple[int, int, int, float]] = []
+
         while step < sim_len:
             weekday = current_dt.weekday()  # 0=Mon
             weekday_key = "weekday" if weekday < 5 else "weekend"
             day_sched: Dict[str, dict] = p_cfg["schedule"].get(weekday_key, {})
-
-            # Build list of (start,end,location) intervals for this day.
-            day_blocks: List[Tuple[int, int, int, float]] = []
 
             # Helper to convert HH:MM to step offset within day.
             def _hm_to_offset(hm: str) -> int:
@@ -105,68 +106,90 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 start_ofs = _hm_to_offset(blk_cfg["start_time"])
                 end_ofs = _hm_to_offset(blk_cfg["end_time"])
                 loc_str = blk_cfg["location"]
-                if loc_str == "home":
-                    loc = home_station
-                    energy = 0.0  # no driving before this block
-                elif loc_str == "work":
-                    loc = work_station
-                    energy = commute_kwh  # just drove from home → work
-                else:  # away (short/random trip)
-                    loc = home_station  # treat as returning to home after trip
-                    # Random duration already in schedule; compute distance via time * avg speed stub
-                    energy = (short_trip_cfg.get("avg_distance_km", commute_dist / 2)) * kwh_per_km
 
-                # Compute absolute sim steps.
+                energy = 0.0
+                if loc_str == "work":
+                    loc = work_station
+                    energy = commute_kwh
+                elif loc_str == "away":
+                    # For 'away' blocks, we don't have a fixed location, but we can treat it
+                    # as a trip that consumes energy. The vehicle is not available.
+                    # We will model this by just having a gap in presence.
+                    energy = (short_trip_cfg.get("avg_distance_km", commute_dist / 2)) * kwh_per_km
+                    loc = -1 # Sentinel for 'away'
+                else: # home
+                    continue # Skip home blocks, we will fill them in later
+
                 abs_start = step + start_ofs
                 abs_end = step + end_ofs
                 if abs_start >= sim_len:
                     break
                 abs_end = min(abs_end, sim_len)
                 if abs_end > abs_start:
-                    presence_blocks.append(PresenceBlock(abs_start, abs_end, loc, energy))
+                    non_home_blocks.append((abs_start, abs_end, loc, energy))
 
-            # Advance to next day.
             step += (24 * 60) // timestep_minutes
             current_dt += _dt.timedelta(days=1)
 
-        # Convert presence blocks to EVs.
-        for blk in presence_blocks:
-            # Arrival battery capacity: random 40-80% minus trip energy, but at least min capacity.
-            ev_spec = env.config["ev"]
-            batt_kwh = float(ev_spec["battery_capacity"])
-            min_capacity = float(ev_spec.get("min_battery_capacity", 10))
-            soc_arrival = rng.uniform(0.4, 0.8)
-            cap_arrival = max(min_capacity, soc_arrival * batt_kwh - blk.energy_consumed)
-            cap_arrival = max(min_capacity, cap_arrival)
+        # Sort the blocks by start time to handle them chronologically.
+        non_home_blocks.sort(key=lambda x: x[0])
 
-            desired_capacity = float(ev_spec.get("desired_capacity", 0.8)) * batt_kwh
-            ev_profile = EV(
-                id=ev_id_counter,
-                location=blk.location,
-                battery_capacity_at_arrival=cap_arrival,
-                time_of_arrival=blk.start_step,
-                time_of_departure=blk.end_step,
-                desired_capacity=desired_capacity,
-                battery_capacity=batt_kwh,
-                min_battery_capacity=min_capacity,
-                min_emergency_battery_capacity=float(ev_spec.get("min_emergency_battery_capacity", 15)),
-                max_ac_charge_power=float(ev_spec["max_ac_charge_power"]),
-                min_ac_charge_power=float(ev_spec["min_ac_charge_power"]),
-                max_dc_charge_power=float(ev_spec["max_dc_charge_power"]),
-                max_discharge_power=float(ev_spec["max_discharge_power"]),
-                min_discharge_power=float(ev_spec["min_discharge_power"]),
-                ev_phases=int(ev_spec["ev_phases"]),
-                transition_soc=float(ev_spec["transition_soc"]),
-                charge_efficiency=ev_spec["charge_efficiency"],
-                discharge_efficiency=ev_spec["discharge_efficiency"],
-                timescale=env.timescale,
-            )
-            all_ev_profiles.append(ev_profile)
-            ev_id_counter += 1
-            if ev_id_counter >= v_count:
-                break  # one vehicle per profile for now
+        # Now, create the final presence schedule, filling gaps with 'home' blocks.
+        last_end_step = 0
+        for start, end, loc, energy in non_home_blocks:
+            # If there's a gap before this block, it's a 'home' block.
+            if start > last_end_step:
+                presence_blocks.append(PresenceBlock(last_end_step, start, home_station, 0.0))
+            
+            # Add the actual 'work' or 'away' block if it's not 'away'.
+            if loc != -1:
+                presence_blocks.append(PresenceBlock(start, end, loc, energy))
+            
+            last_end_step = end
+
+        # Add a final home block if the simulation doesn't end with a non-home block.
+        if last_end_step < sim_len:
+            presence_blocks.append(PresenceBlock(last_end_step, sim_len, home_station, 0.0))
+
+
+        # Convert presence blocks to EVs. Now, create `v_count` vehicles.
+        for i in range(v_count):
+            # Associate a unique EV ID for each vehicle in the profile
+            vehicle_ev_id = f"{profile_key}_{i}"
+            for blk in presence_blocks:
+                # Arrival battery capacity: random 40-80% minus trip energy, but at least min capacity.
+                ev_spec = env.config["ev"]
+                batt_kwh = float(ev_spec["battery_capacity"])
+                min_capacity = float(ev_spec.get("min_battery_capacity", 10))
+                soc_arrival = rng.uniform(0.4, 0.8)
+                cap_arrival = max(min_capacity, soc_arrival * batt_kwh - blk.energy_consumed)
+                cap_arrival = max(min_capacity, cap_arrival)
+
+                desired_capacity = float(ev_spec.get("desired_capacity", 0.8)) * batt_kwh
+                ev_profile = EV(
+                    id=f"{vehicle_ev_id}_{blk.start_step}", # Unique ID per presence block
+                    location=blk.location,
+                    battery_capacity_at_arrival=cap_arrival,
+                    time_of_arrival=blk.start_step,
+                    time_of_departure=blk.end_step,
+                    desired_capacity=desired_capacity,
+                    battery_capacity=batt_kwh,
+                    min_battery_capacity=min_capacity,
+                    min_emergency_battery_capacity=float(ev_spec.get("min_emergency_battery_capacity", 15)),
+                    max_ac_charge_power=float(ev_spec["max_ac_charge_power"]),
+                    min_ac_charge_power=float(ev_spec["min_ac_charge_power"]),
+                    max_dc_charge_power=float(ev_spec["max_dc_charge_power"]),
+                    max_discharge_power=float(ev_spec["max_discharge_power"]),
+                    min_discharge_power=float(ev_spec["min_discharge_power"]),
+                    ev_phases=int(ev_spec["ev_phases"]),
+                    transition_soc=float(ev_spec["transition_soc"]),
+                    charge_efficiency=ev_spec["charge_efficiency"],
+                    discharge_efficiency=ev_spec["discharge_efficiency"],
+                    timescale=env.timescale,
+                )
+                all_ev_profiles.append(ev_profile)
+                ev_id_counter += 1
 
     # Sort by arrival time as required by env logic.
     all_ev_profiles.sort(key=lambda ev: ev.time_of_arrival)
     return all_ev_profiles
-```
