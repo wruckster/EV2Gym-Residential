@@ -63,11 +63,16 @@ class EV():
                  charge_efficiency=1, # can be a list of charge efficiencies for different current levels
                  discharge_efficiency=1, # can be a list of discharge efficiencies for different current levels
                  timescale=5,
+                 metadata=None,  # Added metadata parameter for storing location type and plug-in status
+                 location_state=0,  # Default to home charging station
                  ):
 
         self.id = id
         self.location = location
         self.timescale = timescale
+        
+        # Store metadata for enhanced scheduling and plug-in status tracking
+        self.metadata = metadata if metadata is not None else {}
 
         # EV simulation characteristics
         self.time_of_arrival = time_of_arrival
@@ -90,6 +95,10 @@ class EV():
 
         self.charge_efficiency = charge_efficiency
         self.discharge_efficiency = discharge_efficiency
+
+        # Track location state (0=home, 1=work, 2=commuting)
+        self.location_state = 0 if location_state == 0 else (1 if location_state == 1 else 2)
+        self._schedule_transitions = []  # List of (timestep, new_state) tuples
 
         # EV status
         self.current_capacity = battery_capacity_at_arrival  # kWh
@@ -288,7 +297,6 @@ class EV():
             charge_efficiency = self.charge_efficiency.get(np.round(amps), 1)/100
         else:
             charge_efficiency = self.charge_efficiency
-        
         
         assert charge_efficiency > 0, f'charge_efficiency: {charge_efficiency}'
         
@@ -519,3 +527,19 @@ class EV():
         self.cyclic_loss = d_cyc
 
         return d_cal, d_cyc
+
+    def add_schedule_transition(self, timestep: int, new_state: int):
+        """Add a scheduled location state transition.
+        
+        Args:
+            timestep: When the transition should occur
+            new_state: New location state (0=home, 1=work, 2=commuting)
+        """
+        self._schedule_transitions.append((timestep, new_state))
+        self._schedule_transitions.sort()  # Keep sorted by timestep
+
+    def update_location_state(self, current_step: int):
+        """Update location state based on schedule transitions."""
+        while self._schedule_transitions and self._schedule_transitions[0][0] <= current_step:
+            _, new_state = self._schedule_transitions.pop(0)
+            self.location_state = new_state

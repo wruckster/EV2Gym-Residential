@@ -123,13 +123,13 @@ class EV_Charger:
             - profit: the total profit + costs of charging and discharging in the current timestep
             - user_satisfaction: a list of user satisfaction values for each EV connected to the EV charger in the current timestep
         '''
-        profit = 0
-        user_satisfaction = []
-        self.current_power_output = 0
         self.current_total_amps = 0
         self.current_charge_price = charge_price
         self.current_discharge_price = discharge_price
-        self.current_signal = []
+        self.current_signal = [0] * self.n_ports  # Initialize with correct size
+        profit = 0
+        user_satisfaction = []
+        self.current_power_output = 0
 
         assert (len(actions) == self.n_ports)
         # if no EV is connected, set action to 0
@@ -153,51 +153,39 @@ class EV_Charger:
 
         # Update EVs connected to the EV charger and get profits/costs
         for i, action in enumerate(normalized_actions):
-            actual_energy = 0
-            action = round(action, 5)
-            assert (action >= -1 and action <= 1,
-                    f'Action {action} is not in range [-1,1]')
-
+            actual_energy, actual_amps = 0, 0
             amps = 0
-            if action == 0 and self.evs_connected[i] is not None:
 
-                actual_energy, actual_amps = self.evs_connected[i].step(
-                    amps, self.voltage)
+            if self.evs_connected[i] is None:
+                continue
 
-            elif action > 0:
+            if action > 0:
                 amps = action * self.max_charge_current
-                if amps < self.min_charge_current-0.01:
+                if amps < self.min_charge_current - 0.01:
                     amps = 0
-
-                actual_energy, actual_amps = self.evs_connected[i].step(
-                    amps,
-                    self.voltage,
-                    phases=self.phases,
-                    type=self.charger_type)
-
-                profit += abs(actual_energy) * charge_price
-                self.total_energy_charged += abs(actual_energy)
-                self.current_power_output += actual_energy * 60/self.timescale
-                self.current_total_amps += actual_amps
-
             elif action < 0:
                 amps = action * abs(self.max_discharge_current)
-                if amps > self.min_discharge_current-0.01:
+                if amps > self.min_discharge_current - 0.01:
                     amps = self.min_discharge_current
 
-                actual_energy, actual_amps = self.evs_connected[i].step(
-                    amps,
-                    self.voltage,
-                    phases=self.phases,
-                    type=self.charger_type)
+            actual_energy, actual_amps = self.evs_connected[i].step(
+                amps,
+                self.voltage,
+                phases=self.phases,
+                type=self.charger_type)
 
+            if amps > 0:  # Charging
+                profit += abs(actual_energy) * charge_price
+                self.total_energy_charged += abs(actual_energy)
+            elif amps < 0:  # Discharging
                 profit += abs(actual_energy) * discharge_price
                 self.total_energy_discharged += abs(actual_energy)
-                self.current_power_output += actual_energy * 60/self.timescale
-                self.current_total_amps += actual_amps
+
+            self.current_power_output += actual_energy * 60 / self.timescale
+            self.current_total_amps += actual_amps
 
             # print(f'CS {self.id} port {i} action {action} amps {amps} energy {actual_energy} total_amps {self.current_total_amps}')
-            self.current_signal.append(amps)
+            self.current_signal[i] = amps  # Update signal for the current port
 
             if self.current_total_amps - 0.0001 > self.max_charge_current:
                 raise Exception(
@@ -270,7 +258,7 @@ class EV_Charger:
         assert (self.n_evs_connected < self.n_ports)
 
         index = self.evs_connected.index(None)
-        ev.id = index
+        # Do not modify ev.id - it should be unique and assigned by the environment
         self.evs_connected[index] = ev
         self.n_evs_connected += 1
         

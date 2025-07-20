@@ -62,6 +62,16 @@ def get_statistics(env) -> Dict:
         energy_user_satisfaction[i] = (e_actual / e_max) * 100
         total_steps_min_emergency_battery_capacity_violation += ev.min_emergency_battery_capacity_metric
 
+    # Add safety checks for empty arrays
+    if len(energy_user_satisfaction) == 0:
+        mean_energy_user_satisfaction = 0.0
+        std_energy_user_satisfaction = 0.0
+        min_energy_user_satisfaction = 0.0
+    else:
+        mean_energy_user_satisfaction = np.mean(energy_user_satisfaction)
+        std_energy_user_satisfaction = np.std(energy_user_satisfaction)
+        min_energy_user_satisfaction = np.min(energy_user_satisfaction)
+
     stats = {'total_ev_served': total_ev_served,
              'total_profits': total_profits,
              'total_energy_charged': total_energy_charged,
@@ -70,9 +80,9 @@ def get_statistics(env) -> Dict:
              'power_tracker_violation': power_tracker_violation,
              'tracking_error': tracking_error,
              'energy_tracking_error': energy_tracking_error,
-             'energy_user_satisfaction': np.mean(energy_user_satisfaction),
-             'std_energy_user_satisfaction': np.std(energy_user_satisfaction),
-             'min_energy_user_satisfaction': np.min(energy_user_satisfaction),
+             'energy_user_satisfaction': mean_energy_user_satisfaction,
+             'std_energy_user_satisfaction': std_energy_user_satisfaction,
+             'min_energy_user_satisfaction': min_energy_user_satisfaction,
              'total_steps_min_emergency_battery_capacity_violation': total_steps_min_emergency_battery_capacity_violation,
              'total_transformer_overload': total_transformer_overload,
              'battery_degradation': battery_degradation,

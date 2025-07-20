@@ -5,6 +5,7 @@ The environment an also be used for standalone simulations without the gym envir
 '''
 
 import gymnasium as gym
+import pandas as pd
 from gymnasium import spaces
 import numpy as np
 import datetime
@@ -19,7 +20,7 @@ import json
 from ev2gym.models.utils.replay import EvCityReplay
 from ev2gym.visuals.plots import ev_city_plot, visualize_step
 from ev2gym.utilities.utils import get_statistics, print_statistics, calculate_charge_power_potential
-from ev2gym.utilities.loaders import load_ev_spawn_scenarios, load_power_setpoints, load_transformers, load_ev_charger_profiles, load_ev_profiles, load_electricity_prices
+from ev2gym.utilities.loaders import load_ev_spawn_scenarios, load_power_setpoints, load_transformers, load_ev_charger_profiles, load_ev_profiles, load_electricity_prices, _load_household_profiles
 from ev2gym.visuals.render import Renderer
 
 from ev2gym.rl_agent.reward import SquaredTrackingErrorReward
@@ -53,6 +54,8 @@ class EV2Gym(gym.Env):
         self.replay = None
         # Initialize stats dictionary immediately to prevent any and all race conditions.
         self.stats = {}
+        # Initialize EV location data dictionary for tracking plug-in status
+        self.ev_location_data = {}
 
         if verbose:
             print(f'Initializing EV2Gym environment...')
@@ -76,6 +79,8 @@ class EV2Gym(gym.Env):
         self.total_evs_parked = []
 
         self.simulation_length = self.config['simulation_length']
+
+        self.timestamps = []
 
         # for backward compatibility
         self.replay_path = replay_save_path
@@ -126,6 +131,16 @@ class EV2Gym(gym.Env):
             self.scenario = self.config['scenario']
             self.simulation_length = int(self.config['simulation_length'])
             # Simulation time
+
+            # household_df = _load_household_profiles(self)
+            # if household_df is not None:
+            #     # If the index is datetime, use it; otherwise, use the 'interval_start' column
+            #     if isinstance(household_df.index, pd.DatetimeIndex):
+            #         self.simulation_datetimes = household_df.index.to_list()
+            #     elif 'interval_start' in household_df.columns:
+            #         self.simulation_datetimes = pd.to_datetime(household_df['interval_start']).to_list()
+            # else:
+            #     self.simulation_datetimes = None
 
             # Initialize time-series arrays for plotting and analysis
             self.port_energy_level = np.zeros(
@@ -283,6 +298,8 @@ class EV2Gym(gym.Env):
         # Observation mask: is a vector of size ("Sum of all ports of all charging stations") showing in which ports an EV is connected
         self.observation_mask = np.zeros(self.number_of_ports)
 
+        self._log_initial_state()
+
     def reset(self, seed=None, options=None, **kwargs):
         '''Resets the environment to its initial state'''
 
@@ -301,14 +318,15 @@ class EV2Gym(gym.Env):
 
         self.current_step = 0
         self.stats = None
-        # Reset all charging stations
+
+        # Reset all charging stations to ensure a clean state before spawning EVs
         for cs in self.charging_stations:
             cs.reset()
 
         for tr in self.transformers:
             tr.reset(step=self.current_step)
 
-        if self.load_from_replay_path is not None or not self.config['random_day']:
+        if self.load_from_replay_path is None or not self.config['random_day']:
             self.sim_date = self.sim_starting_date
         else:
             # select random date in range
@@ -348,7 +366,12 @@ class EV2Gym(gym.Env):
         # self.sim_name = f'ev_city_{self.simulation_length}_' + \
         # f'{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")}'
 
+        # Spawn EVs with arrival time 0
+        self._spawn_evs_at_current_step()
+
         self.init_statistic_variables()
+
+        self._log_initial_state()
 
         return self._get_observation(), {}
 
@@ -363,6 +386,12 @@ class EV2Gym(gym.Env):
         self.current_ev_departed = 0
         self.current_ev_arrived = 0
         self.current_evs_parked = 0
+        
+        # Initialize/reset EV location data for tracking
+        self.ev_location_data = np.zeros(
+            (self.number_of_ports_per_cs, self.cs, self.simulation_length),
+            dtype=np.int8
+        )
 
         self.previous_power_usage = self.current_power_usage
         self.current_power_usage = np.zeros(self.simulation_length)
@@ -427,22 +456,28 @@ class EV2Gym(gym.Env):
         if self.verbose:
             print(f"Step: {self.current_step}/{self.simulation_length}")
 
+        # Spawn EVs with arrival time equal to the current step
+        self._spawn_evs_at_current_step()
+
+        # Reset the current number of EVs departed and arrived
+        self.current_ev_departed = 0
+        self.current_ev_arrived = 0
+
         # Reset power usage for this timestep to zero before processing charging stations
         self.current_power_usage[self.current_step] = 0.0
+
+        # Add inflexible loads and solar power from transformers to the current power usage
+        for tr in self.transformers:
+            # Reset sets the current_power to inflexible_load + solar_power for the current step
+            tr.reset(step=self.current_step)
+            self.current_power_usage[self.current_step] += tr.current_power
 
         total_costs = 0
         total_invalid_action_punishment = 0
         user_satisfaction_list = []
         self.departing_evs = []
 
-        self.current_ev_departed = 0
-        self.current_ev_arrived = 0
-
         port_counter = 0
-
-        # Reset current power of all transformers
-        for tr in self.transformers:
-            tr.reset(step=self.current_step)
 
         # Call step for each charging station and spawn EVs where necessary
         for i, cs in enumerate(self.charging_stations):
@@ -480,15 +515,17 @@ class EV2Gym(gym.Env):
                 ev = deepcopy(ev)
                 ev.reset()
                 ev.simulation_length = self.simulation_length
-                index = self.charging_stations[ev.location].spawn_ev(ev)
+                
+                # Spawn the new EV at its designated charging station
+                cs_index = ev.location
+                if 0 <= cs_index < len(self.charging_stations):
+                    self.charging_stations[cs_index].spawn_ev(ev)
+                    self.total_evs_spawned += 1
+                    self.current_ev_arrived += 1
+                    self.EVs.append(ev)
 
-                if not self.lightweight_plots:
-                    self.port_arrival[f'{ev.location}.{index}'].append(
-                        (self.current_step+1, ev.time_of_departure+1))
-
-                self.total_evs_spawned += 1
-                self.current_ev_arrived += 1
-                self.EVs.append(ev)
+                else:
+                    print(f"Warning: EV {ev.id} has invalid location {cs_index} and was not spawned.")
 
             elif ev.time_of_arrival > self.current_step + 1:
                 break
@@ -497,6 +534,7 @@ class EV2Gym(gym.Env):
 
         self.current_step += 1
         self._step_date()
+        self.timestamps.append(self.sim_date)
 
         if self.current_step < self.simulation_length:
             self.charge_power_potential[self.current_step] = calculate_charge_power_potential(
@@ -541,31 +579,42 @@ class EV2Gym(gym.Env):
         self.render()
 
         # Record solar power for the current step if within simulation bounds
-        step_index = self.current_step - 1
-        if step_index < self.simulation_length:
-            self.tr_solar_power[:, step_index] = [tr.solar_power[step_index] for tr in self.transformers]
+        if self.current_step < self.simulation_length:
+            for i, tr in enumerate(self.transformers):
+                self.tr_solar_power[i, self.current_step] = tr.solar_power[self.current_step]
 
         # Record port energy levels for the current step for plotting
-        if step_index < self.simulation_length:
+        if self.current_step < self.simulation_length:
             for i, cs in enumerate(self.charging_stations):
                 for j in range(self.number_of_ports_per_cs):
                     if j < cs.n_ports and cs.evs_connected[j] is not None:
-                        self.port_energy_level[j, i, step_index] = cs.evs_connected[j].get_soc()
+                        self.port_energy_level[j, i, self.current_step] = cs.evs_connected[j].get_soc()
                     else:
-                        self.port_energy_level[j, i, step_index] = 0
+                        self.port_energy_level[j, i, self.current_step] = 0
 
             # --- DEBUGGING PRINTS ---
-            if self.verbose and step_index % 10 == 0: # Print every 10 steps
-                print(f"--- Step {step_index} Data ---")
-                print(f"Power Usage: {self.current_power_usage[step_index]}")
-                print(f"PV Generation: {np.sum(self.tr_solar_power[:, step_index])}")
-                soc_mean = np.mean(self.port_energy_level[:, :, step_index][self.port_energy_level[:, :, step_index] > 0]) if np.any(self.port_energy_level[:, :, step_index] > 0) else 0
+            if self.verbose and self.current_step % 10 == 0: # Print every 10 steps
+                print(f"\n\n--- Step {self.current_step} Data: at {self.sim_date} ---")
+                print(f"Power Usage: {self.current_power_usage[self.current_step]}")
+                print(f"PV Generation: {np.sum(self.tr_solar_power[:, self.current_step])}")
+                soc_mean = np.mean(self.port_energy_level[:, :, self.current_step][self.port_energy_level[:, :, self.current_step] > 0]) if np.any(self.port_energy_level[:, :, self.current_step] > 0) else 0
                 print(f"Mean SoC: {soc_mean}")
                 print("---------------------")
 
-        return self._check_termination(reward, info)
+        # Track EV locations and plug-in status for this timestep
+        self._update_ev_location_data()
 
+        # Determine if the episode is done
+        done = self.current_step >= self.simulation_length
+        if done and self.verbose:
+            print(f"Episode done: {self.done}")
+            print(f"Total EVs spawned: {self.total_evs_spawned}")
+            print(f"Episode done: {self.done}")
 
+        self.done = done
+
+        # Return the observation, reward, done flag, and info dictionary
+        return self._get_observation(), reward, self.done, False, info
 
     def render(self):
         '''Renders the simulation'''
@@ -602,9 +651,18 @@ class EV2Gym(gym.Env):
             self.tr_solar_power[tr.id,
                                 self.current_step] = tr.solar_power[self.current_step]
 
-        for cs in self.charging_stations:
+        for i, cs in enumerate(self.charging_stations):
             self.cs_power[cs.id, self.current_step] = cs.current_power_output
             self.cs_current[cs.id, self.current_step] = cs.current_total_amps
+
+            for j in range(self.number_of_ports_per_cs):
+                if j < len(cs.evs_connected) and cs.evs_connected[j] is not None:
+                    ev = cs.evs_connected[j]
+                    self.port_energy_level[j, i, self.current_step] = ev.current_capacity
+                    self.ev_location_data[j, i, self.current_step] = ev.location_state  # Track location state
+                else:
+                    self.port_energy_level[j, i, self.current_step] = 0
+                    self.ev_location_data[j, i, self.current_step] = -1  # -1 indicates no EV
 
             for port in range(cs.n_ports):
                 if not self.lightweight_plots:
@@ -728,3 +786,56 @@ class EV2Gym(gym.Env):
         This function sets the reward function of the environment
         '''
         self.reward_function = reward_function
+
+    def _update_ev_location_data(self):
+        """Update EV location data for the current timestep."""
+        # For each charging station and port
+        for cs_idx, cs in enumerate(self.charging_stations):
+            for port_idx in range(self.number_of_ports_per_cs):
+                if port_idx < len(cs.evs_connected) and cs.evs_connected[port_idx] is not None:
+                    ev = cs.evs_connected[port_idx]
+                    # Update location state (0=home, 1=work, 2=commuting)
+                    self.ev_location_data[port_idx, cs_idx, self.current_step] = ev.location_state
+                else:
+                    # No EV in this port
+                    self.ev_location_data[port_idx, cs_idx, self.current_step] = -1
+
+    def _log_initial_state(self):
+        """Logs the initial state of EVs in the environment if verbose is True."""
+        if self.verbose:
+            initial_evs_connected = sum(1 for cs in self.charging_stations for ev in cs.evs_connected if ev is not None)
+            print(f"[EV2Gym] Environment initialized. Total EV profiles: {len(self.EVs_profiles)}")
+            print(f"[EV2Gym] Initial EVs connected at step 0: {initial_evs_connected}")
+            for cs in self.charging_stations:
+                for ev in cs.evs_connected:
+                    if ev is not None:
+                        print(f"[EV2Gym] - EV {ev.id} is at station {cs.id} (Location: {ev.location}) at start.")
+
+    def _spawn_evs_at_current_step(self):
+        """Connects EVs that are scheduled to arrive at the current timestep."""
+        # Track which EVs have already been connected to avoid duplicates
+        connected_evs = set()
+        
+        for ev_profile in self.EVs_profiles:
+            # Check if this EV should spawn at current step
+            if ev_profile.time_of_arrival == self.current_step:
+                # Use deepcopy to create a new EV instance from the profile
+                new_ev = deepcopy(ev_profile)
+                new_ev.reset()
+                new_ev.simulation_length = self.simulation_length
+                
+                # Spawn the new EV at its designated charging station
+                cs_index = new_ev.location
+                if 0 <= cs_index < len(self.charging_stations):     # verifies that the EV is assigned to a valid charging station
+                    target_cs = self.charging_stations[cs_index]
+                    # Only connect if EV isn't already connected somewhere else
+                    if (target_cs.n_evs_connected < target_cs.n_ports and 
+                        new_ev.id not in connected_evs):
+                        target_cs.spawn_ev(new_ev)
+                        self.EVs.append(new_ev)
+                        connected_evs.add(new_ev.id)
+                    else:
+                        if self.verbose:
+                            print(f"[EV2Gym] - Skipping EV {new_ev.id}: Charger {cs_index} is full at step {self.current_step}.")
+                else:
+                    print(f"Warning: EV {new_ev.id} has invalid location {cs_index} and was not spawned.")

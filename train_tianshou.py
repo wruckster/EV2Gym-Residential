@@ -193,7 +193,25 @@ def main(config_path: str):
     dist_fn = None
     if isinstance(env.action_space, gym.spaces.Box):
         def dist_fn_wrapper(x):
-            return torch.distributions.Normal(loc=x[0], scale=x[1])
+            """Return an Independent Normal so that log_prob is scalar per sample."""
+            mean, std = x  # unpack first
+            # Ensure leading batch dimension exists when batch size == 1
+            if mean.dim() == 1:
+                mean = mean.unsqueeze(0)
+                std = std.unsqueeze(0)
+            
+            # Replace NaNs/Infs to keep distribution valid
+            if torch.isnan(mean).any() or torch.isinf(mean).any():
+                logging.warning("NaNs or Infs detected in action mean – replacing with zeros.")
+                mean = torch.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            if torch.isnan(std).any() or torch.isinf(std).any() or (std <= 0).any():
+                logging.warning("Invalid std detected (NaN/Inf/<=0) – applying fallback clamp.")
+                std = torch.nan_to_num(std, nan=1.0, posinf=7.0, neginf=1e-3)
+                std = torch.clamp(std, min=1e-3, max=7.0)
+            normal = torch.distributions.Normal(mean, std)
+            return torch.distributions.Independent(normal, 1)
+        
         dist_fn = dist_fn_wrapper
 
     # Get policy args from config

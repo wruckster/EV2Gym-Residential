@@ -77,6 +77,7 @@ def plot_from_replay(
         - "prices": Plot of electricity prices
         - "solar": Plot of solar power generation
         - "details": Detailed plots of transformer, CS, and EV states
+        - "ev_status": Plot of EV plug-in status (home/work/away)
     """
 
     # ------------------------------------------------------------------
@@ -120,6 +121,9 @@ def plot_from_replay(
     elif plot_type == "details":
         _plot_details(replays[0], save_path)
         return
+    elif plot_type == "ev_status":
+        _plot_ev_status(replays[0], save_path)
+        return
     else:  # Default to main plot
         _plot_main(replays, labels, save_path)
 
@@ -128,7 +132,7 @@ def _plot_main(replays, labels, save_path):
     """Generate the main 6-panel evaluation plot."""
     plt.close("all")
     plt.style.use("seaborn-v0_8")
-    fig = plt.figure(figsize=(15, 12))
+    fig = plt.figure(figsize=(15, 15))  
 
     # ------------------------------------------------------------------
     # 3. Extract data series from replays
@@ -137,8 +141,9 @@ def _plot_main(replays, labels, save_path):
     setpoint_data = []
     ev_count_data = []
     reward_data = []
-    solar_data = []  # aggregated solar power per replay
-    demand_data = []  # aggregated residential inflexible load per replay
+    solar_data = []  
+    demand_data = []  
+    ev_locations = []  
 
     for rep in replays:
         power = _extract_series(rep, "current_power_usage")
@@ -147,6 +152,11 @@ def _plot_main(replays, labels, save_path):
         rewards = _extract_series(rep, "reward_history")
         demand = _extract_series(rep, "tr_inflexible_loads")
         solar = _extract_series(rep, "tr_solar_power")
+        
+        # Extract EV metadata if available (from enhanced replay)
+        ev_meta = _extract_ev_location_data(rep)
+        if ev_meta is not None:
+            ev_locations.append(ev_meta)
 
         if power is not None:
             power_data.append(power)
@@ -167,7 +177,7 @@ def _plot_main(replays, labels, save_path):
     # ------------------------------------------------------------------
     # 4. Create subplots
     # ------------------------------------------------------------------
-    grid = plt.GridSpec(3, 2, figure=fig)
+    grid = plt.GridSpec(4, 2, figure=fig)  
 
     # 4.1 Total power usage (actual vs setpoint)
     ax1 = fig.add_subplot(grid[0, 0])
@@ -188,13 +198,17 @@ def _plot_main(replays, labels, save_path):
     # 4.5 Per-step reward
     ax5 = fig.add_subplot(grid[2, 0])
     _plot_per_step_reward(ax5, reward_data, labels)
-
-    # 4.6 Info panel
+    
+    # 4.6 EV plug-in status (NEW)
     ax6 = fig.add_subplot(grid[2, 1])
-    _add_info_panel(ax6, replays, labels)
+    _plot_ev_plug_status(ax6, ev_locations, labels, replays[0])
+
+    # 4.7 EV Trajectory
+    ax7 = fig.add_subplot(grid[3, 0:])
+    plot_ev_trajectories(replays[0], ax7)
 
     # Apply step + datetime formatter to all time-series axes
-    for ax in [ax1, ax2, ax3, ax4, ax5]:
+    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
         _apply_time_formatter(ax, replays[0])
 
     # ------------------------------------------------------------------
@@ -350,7 +364,7 @@ def _plot_ev_energy(ax, replay):
     ax.set_title("EV Energy Level [kWh]")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("kWh")
-    if n_cs * ev_energy.shape[0] < 15:  # Avoid crowded legend
+    if n_cs * ev_energy.shape[0] < 15:  
         ax.legend()
     ax.grid(True, which="both", ls=":", lw=0.5)
     _apply_time_formatter(ax, replay)
@@ -474,9 +488,9 @@ def _apply_time_formatter(ax, replay):
     start_dt = getattr(replay, "sim_date", None)
     timescale = getattr(replay, "timescale", 15)
     if start_dt is None:
-        return  # nothing to do
+        return  
 
-    def _fmt(x, _):  # x is the tick position (timestep index)
+    def _fmt(x, _):  
         step = int(x)
         dt = start_dt + _dt.timedelta(minutes=timescale * step)
         return f"step: {step}\n{dt.strftime('%y-%m-%d %H:%M')}"
@@ -524,3 +538,158 @@ def plot_comparable_EV_SoC_single(*args, **kwargs):
 def plot_prices(*args, **kwargs):
     print("[evaluator_plot] plot_prices() is deprecated – use plot_from_replay().")
     return plot_from_replay(*args, **kwargs)
+
+
+def _extract_ev_location_data(replay_obj):
+    """Extract EV location and plug-in status data from replay.
+    
+    Returns a dictionary with timesteps as keys and lists of EVs with their
+    locations and plug-in status as values.
+    """
+    # Try to extract EV metadata if it exists in the replay
+    if hasattr(replay_obj, "ev_location_data"):
+        return replay_obj.ev_location_data
+    
+    # For backward compatibility with older replays
+    return None
+
+
+def _plot_ev_plug_status(ax, ev_location_data_list, labels, replay):
+    """Plot EV plug-in status over time (home/work/away)."""
+    if not ev_location_data_list:
+        ax.text(0.5, 0.5, "No EV plug-in data available", ha="center", va="center")
+        ax.set_title("EV Plug-in Status")
+        return
+    
+    timesteps = None
+    colors = {'home': 'green', 'work': 'blue', 'away': 'red'}
+    markers = {'home': 'o', 'work': 's', 'away': 'x'}
+    
+    for i, ev_data in enumerate(ev_location_data_list):
+        # Extract data for plotting
+        home_count = []
+        work_count = []
+        away_count = []
+        
+        if isinstance(ev_data, dict):
+            timesteps = sorted(ev_data.keys())
+            for t in timesteps:
+                loc_counts = {"home": 0, "work": 0, "away": 0}
+                for ev_info in ev_data[t]:
+                    if "location_type" in ev_info:
+                        loc_type = ev_info["location_type"]
+                        if loc_type in loc_counts:
+                            loc_counts[loc_type] += 1
+                
+                home_count.append(loc_counts["home"])
+                work_count.append(loc_counts["work"])
+                away_count.append(loc_counts["away"])
+        
+        # If no valid data, try to estimate from simulation length
+        if not timesteps and hasattr(replay, "sim_length"):
+            timesteps = list(range(replay.sim_length))
+            home_count = [0] * len(timesteps)
+            work_count = [0] * len(timesteps)
+            away_count = [0] * len(timesteps)
+        
+        if timesteps:
+            label_base = labels[i] if i < len(labels) else f"Replay {i}"
+            ax.plot(timesteps, home_count, '-', color=colors['home'], 
+                   marker=markers['home'], markevery=max(1, len(timesteps)//20),
+                   label=f"{label_base} - Home")
+            ax.plot(timesteps, work_count, '-', color=colors['work'], 
+                   marker=markers['work'], markevery=max(1, len(timesteps)//20),
+                   label=f"{label_base} - Work")
+            ax.plot(timesteps, away_count, '-', color=colors['away'], 
+                   marker=markers['away'], markevery=max(1, len(timesteps)//20),
+                   label=f"{label_base} - Away")
+    
+    ax.set_title("EV Plug-in Status")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Number of EVs")
+    ax.legend()
+    ax.grid(True, which="both", ls=":", lw=0.5)
+
+
+def _plot_ev_status(replay, save_path):
+    """Generate detailed EV plug-in status plots."""
+    plt.close("all")
+    plt.style.use("seaborn-v0_8")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Extract EV metadata if available
+    ev_data = _extract_ev_location_data(replay)
+    
+    if ev_data:
+        _plot_ev_plug_status(ax, [ev_data], ["EV Location"], replay)
+    else:
+        ax.text(0.5, 0.5, "No EV plug-in data available", ha="center", va="center")
+        ax.set_title("EV Plug-in Status")
+    
+    _apply_time_formatter(ax, replay)
+    plt.tight_layout()
+    
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=120)
+        print(f"[evaluator_plot] Saved EV status plot to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_ev_trajectories(replay_data, ax=None):
+    """Plot EV location states over time.
+    
+    Args:
+        replay_data: Loaded replay data dictionary
+        ax: Optional matplotlib axis to plot on
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 4))
+    
+    ev_data = replay_data.ev_location_data
+    states = replay_data.location_states
+    timesteps = np.arange(ev_data.shape[2])
+    
+    # Create a colormap for states
+    colors = {
+        -1: 'lightgray',  # No EV
+        0: 'green',      # Home
+        1: 'blue',       # Work
+        2: 'orange'      # Commuting
+    }
+    
+    # Plot each EV's trajectory
+    for port in range(ev_data.shape[0]):
+        for cs in range(ev_data.shape[1]):
+            trajectory = ev_data[port, cs, :]
+            # Only plot if this port/cs combination has an EV at some point
+            if not np.all(trajectory == -1):
+                # Create segments for each state
+                current_state = trajectory[0]
+                start_idx = 0
+                for i in range(1, len(trajectory)):
+                    if trajectory[i] != current_state:
+                        # Plot the segment
+                        ax.plot(timesteps[start_idx:i], 
+                               [port + cs * ev_data.shape[0]] * (i - start_idx),
+                               color=colors[current_state],
+                               linewidth=3,
+                               label=states[current_state] if start_idx == 0 else "")
+                        start_idx = i
+                        current_state = trajectory[i]
+                # Plot the final segment
+                ax.plot(timesteps[start_idx:], 
+                       [port + cs * ev_data.shape[0]] * (len(trajectory) - start_idx),
+                       color=colors[current_state],
+                       linewidth=3,
+                       label=states[current_state] if start_idx == 0 else "")
+    
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('EV Port')
+    ax.set_title('EV Location States Over Time')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    return ax

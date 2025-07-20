@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 from ev2gym.models.ev.vehicle import EV
@@ -37,6 +37,8 @@ class PresenceBlock:
     end_step: int    # exclusive
     location: int    # station id
     energy_consumed: float  # kWh consumed while away before this block
+    is_plugged_in: bool = True  # whether the EV is plugged in at this location
+    location_type: str = "home"  # one of: "home", "work", "away"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,8 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
         home_station = int(p_cfg.get("default_station", 0))
         work_station = int(p_cfg.get("work_station", 1))
         commute_dist = float(p_cfg["commute"].get("distance_km", 20))
+        commute_min_time = int(p_cfg["commute"].get("min_time_minutes", 30))
+        commute_max_time = int(p_cfg["commute"].get("max_time_minutes", 60))
         kwh_per_km = float(p_cfg["commute"].get("consumption_kwh_per_km", 0.18))
         short_trip_cfg = p_cfg.get("short_trip", {})
 
@@ -100,19 +104,27 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             def _hm_to_offset(hm: str) -> int:
                 hour, minute = map(int, hm.split(":"))
                 return (hour * 60 + minute) // timestep_minutes
-
+            
+            # Process main schedule blocks
+            regular_blocks = []
             for blk_name, blk_cfg in day_sched.items():
                 start_ofs = _hm_to_offset(blk_cfg["start_time"])
                 end_ofs = _hm_to_offset(blk_cfg["end_time"])
                 loc_str = blk_cfg["location"]
+                is_plugged_in = True  # Default is plugged in
+                
                 if loc_str == "home":
                     loc = home_station
+                    loc_type = "home"
                     energy = 0.0  # no driving before this block
                 elif loc_str == "work":
                     loc = work_station
+                    loc_type = "work"
                     energy = commute_kwh  # just drove from home → work
                 else:  # away (short/random trip)
-                    loc = home_station  # treat as returning to home after trip
+                    loc = -1  # Not at any charging station
+                    loc_type = "away"
+                    is_plugged_in = False
                     # Random duration already in schedule; compute distance via time * avg speed stub
                     energy = (short_trip_cfg.get("avg_distance_km", commute_dist / 2)) * kwh_per_km
 
@@ -123,14 +135,100 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                     break
                 abs_end = min(abs_end, sim_len)
                 if abs_end > abs_start:
-                    presence_blocks.append(PresenceBlock(abs_start, abs_end, loc, energy))
-
+                    regular_blocks.append((abs_start, abs_end, loc, loc_type, energy, is_plugged_in))
+            
+            # Process short trips (random trips during blocks)
+            final_blocks = []
+            for start, end, loc, loc_type, energy, is_plugged_in in regular_blocks:
+                # If we're at home or work, check for random trips
+                if loc_type in ["home", "work"]:
+                    blk_name = next((name for name, cfg in day_sched.items() 
+                                     if _hm_to_offset(cfg["start_time"]) == (start - step) 
+                                     and _hm_to_offset(cfg["end_time"]) == (end - step)), None)
+                    
+                    if blk_name:
+                        blk_cfg = day_sched[blk_name]
+                        prob_short_trip = float(blk_cfg.get("prob_short_trip", 0.0))
+                        
+                        # Check if we should generate a short trip
+                        if prob_short_trip > 0 and rng.random() < prob_short_trip:
+                            # Get trip duration parameters
+                            trip_dur_range = blk_cfg.get("short_trip_duration", [15, 120])
+                            min_dur, max_dur = trip_dur_range
+                            
+                            # Ensure duration is within block bounds
+                            max_possible_dur = (end - start) * timestep_minutes // 2  # Max half the block
+                            actual_max_dur = min(max_dur, max_possible_dur)
+                            
+                            if actual_max_dur > min_dur:
+                                # Generate random trip duration
+                                trip_dur_min = rng.integers(min_dur, actual_max_dur)
+                                trip_dur_steps = trip_dur_min // timestep_minutes
+                                
+                                # Calculate trip start time (avoid very start/end of block)
+                                earliest_start = start + 1
+                                latest_start = end - trip_dur_steps - 1
+                                
+                                if latest_start > earliest_start:
+                                    trip_start = rng.integers(earliest_start, latest_start)
+                                    trip_end = trip_start + trip_dur_steps
+                                    
+                                    # Split the block into: before trip, trip, after trip
+                                    if trip_start > start:
+                                        final_blocks.append(PresenceBlock(
+                                            start_step=start,
+                                            end_step=trip_start,
+                                            location=loc,
+                                            energy_consumed=energy,
+                                            is_plugged_in=is_plugged_in,
+                                            location_type=loc_type
+                                        ))
+                                        
+                                    # Add trip block (unplugged)
+                                    trip_distance = (short_trip_cfg.get("avg_distance_km", commute_dist / 3)) * kwh_per_km
+                                    final_blocks.append(PresenceBlock(
+                                        start_step=trip_start,
+                                        end_step=trip_end,
+                                        location=-1,  # Away
+                                        energy_consumed=trip_distance,
+                                        is_plugged_in=False,
+                                        location_type="away"
+                                    ))
+                                    
+                                    if trip_end < end:
+                                        final_blocks.append(PresenceBlock(
+                                            start_step=trip_end,
+                                            end_step=end,
+                                            location=loc,
+                                            energy_consumed=trip_distance,
+                                            is_plugged_in=is_plugged_in,
+                                            location_type=loc_type
+                                        ))
+                                    continue
+                
+                # If no trip was generated, add the original block
+                final_blocks.append(PresenceBlock(
+                    start_step=start,
+                    end_step=end,
+                    location=loc,
+                    energy_consumed=energy,
+                    is_plugged_in=is_plugged_in,
+                    location_type=loc_type
+                ))
+                        
+            # Add commutes between blocks if needed
+            presence_blocks.extend(final_blocks)
+                
             # Advance to next day.
             step += (24 * 60) // timestep_minutes
             current_dt += _dt.timedelta(days=1)
 
         # Convert presence blocks to EVs.
         for blk in presence_blocks:
+            # Skip blocks where EV is not plugged in (away)
+            if not blk.is_plugged_in or blk.location < 0:
+                continue
+                
             # Arrival battery capacity: random 40-80% minus trip energy, but at least min capacity.
             ev_spec = env.config["ev"]
             batt_kwh = float(ev_spec["battery_capacity"])
@@ -140,6 +238,14 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             cap_arrival = max(min_capacity, cap_arrival)
 
             desired_capacity = float(ev_spec.get("desired_capacity", 0.8)) * batt_kwh
+            
+            # Create metadata for tracking plug-in status
+            metadata = {
+                "profile_type": profile_key,
+                "location_type": blk.location_type,
+                "is_plugged_in": blk.is_plugged_in
+            }
+            
             ev_profile = EV(
                 id=ev_id_counter,
                 location=blk.location,
@@ -160,6 +266,7 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 charge_efficiency=ev_spec["charge_efficiency"],
                 discharge_efficiency=ev_spec["discharge_efficiency"],
                 timescale=env.timescale,
+                metadata=metadata  # Add metadata for tracking
             )
             all_ev_profiles.append(ev_profile)
             ev_id_counter += 1
@@ -169,4 +276,3 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
     # Sort by arrival time as required by env logic.
     all_ev_profiles.sort(key=lambda ev: ev.time_of_arrival)
     return all_ev_profiles
-```

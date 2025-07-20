@@ -33,6 +33,10 @@ class Actor(nn.Module):
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32)
 
+        # Ensure obs has batch dimension
+        if len(obs.shape) == 1:
+            obs = obs.unsqueeze(0)
+
         features = self.model(obs)
         mean = self.mean_layer(features)
         
@@ -41,6 +45,11 @@ class Actor(nn.Module):
         # Clamp the log_std to prevent it from becoming too large or too small
         log_std = torch.clamp(log_std, -20, 2)
         std = torch.exp(log_std)
+
+        # Always keep the first (batch) dimension, even if batch size is 1.
+        # Removing the batch dimension causes shape mismatches during log_prob
+        # calculation inside standard Tianshou PPOPolicy. Therefore, we no
+        # longer squeeze singleton batch dimensions here.
 
         return (mean, std), state
 

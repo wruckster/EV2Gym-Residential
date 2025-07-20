@@ -45,6 +45,18 @@ class EvCityReplay():
             self.tr_solar_power = env.tr_solar_power
         if hasattr(env, 'port_energy_level'):
             self.port_energy_level = env.port_energy_level
+            
+        # Add EV location data for plug-in status visualization
+        if hasattr(env, 'ev_location_data'):
+            self.ev_location_data = env.ev_location_data
+
+        # Add location tracking arrays
+        self.location_states = {
+            -1: 'No EV',
+            0: 'Home',
+            1: 'Work',
+            2: 'Commuting'
+        }
 
         self.transformers = env.transformers
         self.charging_stations = env.charging_stations
@@ -204,3 +216,56 @@ class EvCityReplay():
         # print(f'ev_max_energy: {self.ev_max_energy}')
         # print(f'ev_max_ch_power: {self.ev_max_ch_power}')
         # print(f'ev_max_dis_power: {self.ev_max_dis_power}')
+
+    def save(self):
+        '''Save the replay data to a pickle file'''
+        data = {
+            'sim_name': self.sim_name,
+            'sim_length': self.sim_length,
+            'n_cs': self.n_cs,
+            'max_n_ports': self.max_n_ports,
+            'current_power_usage': self.current_power_usage,
+            'port_energy_level': self.port_energy_level,
+            'tr_solar_power': self.tr_solar_power,
+            'cs_power': self.cs_power,
+            'cs_current': self.cs_current,
+            'ev_location_data': self.ev_location_data,  # Add location data
+            'location_states': self.location_states,  # Add state mapping
+            'transformers': self.transformers,
+            'charging_stations': self.charging_stations,
+            'EVs': self.EVs,
+            'unstirred_EVs': self.unstirred_EVs,
+            'unstirred_stats': self.unstirred_stats,
+            'optimal_EVs': self.optimal_EVs,
+            'optimal_stats': self.optimal_stats,
+            'power_setpoints': self.power_setpoints,
+            'scenario': self.scenario,
+            'heterogeneous_specs': self.heterogeneous_specs,
+            'simulate_grid': self.simulate_grid,
+            'charge_prices': self.charge_prices,
+            'discharge_prices': self.discharge_prices,
+            'tra_max_amps': self.tra_max_amps,
+            'tra_min_amps': self.tra_min_amps,
+            'port_max_charge_current': self.port_max_charge_current,
+            'port_min_charge_current': self.port_min_charge_current,
+            'port_max_discharge_current': self.port_max_discharge_current,
+            'port_min_discharge_current': self.port_min_discharge_current,
+            'voltages': self.voltages,
+            'phases': self.phases,
+            'cs_ch_efficiency': self.cs_ch_efficiency,
+            'cs_dis_efficiency': self.cs_dis_efficiency,
+            'cs_transformer': self.cs_transformer,
+            'ev_max_energy': self.ev_max_energy,
+            'ev_min_energy': self.ev_min_energy,
+            'ev_max_ch_power': self.ev_max_ch_power,
+            'ev_max_dis_power': self.ev_max_dis_power,
+            'u': self.u,
+            'energy_at_arrival': self.energy_at_arrival,
+            'ev_arrival': self.ev_arrival,
+            't_dep': self.t_dep,
+            'ev_des_energy': self.ev_des_energy,
+            'max_energy_at_departure': self.max_energy_at_departure,
+        }
+        import pickle
+        with open(self.replay_path, 'wb') as f:
+            pickle.dump(data, f)

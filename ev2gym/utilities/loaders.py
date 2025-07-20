@@ -544,6 +544,7 @@ def _load_household_profiles(env):
                 
             # Resample to the simulation time-step and fill gaps by interpolation
             df = df.resample(f"{env.timescale}min").mean().interpolate(method='time')
+            df = df.reset_index(drop=False)
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {p}: {e}")
@@ -559,6 +560,8 @@ def _load_household_profiles(env):
     reps = math.ceil(env.simulation_length / len(data)) + 1
     data = pd.concat([data] * reps).iloc[:env.simulation_length]
     data.reset_index(drop=True, inplace=True)
+    assert len(data) == env.simulation_length, \
+        f"Household profile data length ({len(data)}) does not match simulation length ({env.simulation_length})"
     return data
 
 
