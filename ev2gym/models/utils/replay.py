@@ -50,6 +50,12 @@ class EvCityReplay():
         if hasattr(env, 'ev_location_data'):
             self.ev_location_data = env.ev_location_data
 
+        # Add detailed energy and cost data for residential plotting
+        if hasattr(env, 'energy_flow_breakdown'):
+            self.energy_flow_breakdown = env.energy_flow_breakdown
+        if hasattr(env, 'cost_history'):
+            self.cost_history = env.cost_history
+
         # Add location tracking arrays
         self.location_states = {
             -1: 'No EV',
@@ -265,6 +271,8 @@ class EvCityReplay():
             't_dep': self.t_dep,
             'ev_des_energy': self.ev_des_energy,
             'max_energy_at_departure': self.max_energy_at_departure,
+            'energy_flow_breakdown': self.energy_flow_breakdown,
+            'cost_history': self.cost_history,
         }
         import pickle
         with open(self.replay_path, 'wb') as f:

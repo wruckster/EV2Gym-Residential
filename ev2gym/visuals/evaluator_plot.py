@@ -74,6 +74,7 @@ def plot_from_replay(
     plot_type
         Type of plot to generate. Options:
         - "main": Standard 6-panel evaluation plot (default)
+        - "replays": 4-panel residential simulation plot
         - "prices": Plot of electricity prices
         - "solar": Plot of solar power generation
         - "details": Detailed plots of transformer, CS, and EV states
@@ -112,18 +113,19 @@ def plot_from_replay(
     # ------------------------------------------------------------------
     # 2. Generate the requested plot type
     # ------------------------------------------------------------------
-    if plot_type == "prices":
+    if plot_type == "main":
+        _plot_main(replays, labels, save_path)
+    elif plot_type == "replays":
+        _plot_replays(replays, labels, save_path)
+    elif plot_type == "prices":
+        # For simplicity, plot prices from the first replay only
         _plot_prices(replays[0], save_path)
-        return
     elif plot_type == "solar":
         _plot_solar(replays[0], save_path)
-        return
     elif plot_type == "details":
         _plot_details(replays[0], save_path)
-        return
     elif plot_type == "ev_status":
         _plot_ev_status(replays[0], save_path)
-        return
     else:  # Default to main plot
         _plot_main(replays, labels, save_path)
 
@@ -183,9 +185,9 @@ def _plot_main(replays, labels, save_path):
     ax1 = fig.add_subplot(grid[0, 0])
     _plot_power_usage(ax1, power_data, setpoint_data, demand_data, solar_data, labels)
 
-    # 4.2 Power tracking error
+    # 4.2 EV Trajectory
     ax2 = fig.add_subplot(grid[0, 1])
-    _plot_tracking_error(ax2, power_data, setpoint_data, labels)
+    _plot_ev_trajectory(ax2, replays[0], np.arange(len(replays[0].reward_history)))
 
     # 4.3 Total EVs parked
     ax3 = fig.add_subplot(grid[1, 0])
@@ -215,6 +217,94 @@ def _plot_main(replays, labels, save_path):
     # 5. Finalize and save
     # ------------------------------------------------------------------
     plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=120)
+        print(f"[evaluator_plot] Saved evaluation plot to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_replays(replays, labels, save_path):
+    """Generate the 4-panel residential simulation plot."""
+    plt.close("all")
+    plt.style.use("seaborn-v0_8")
+    fig = plt.figure(figsize=(12, 12))  
+
+    # ------------------------------------------------------------------
+    # 3. Extract data series from replays
+    # ------------------------------------------------------------------
+    power_data = []
+    setpoint_data = []
+    ev_count_data = []
+    reward_data = []
+    solar_data = []  
+    demand_data = []  
+    ev_locations = []  
+
+    for rep in replays:
+        power = _extract_series(rep, "current_power_usage")
+        setpoint = _extract_series(rep, "power_setpoints")
+        ev_count = _extract_series(rep, "total_evs_parked")
+        rewards = _extract_series(rep, "reward_history")
+        demand = _extract_series(rep, "tr_inflexible_loads")
+        solar = _extract_series(rep, "tr_solar_power")
+        
+        # Extract EV metadata if available (from enhanced replay)
+        ev_meta = _extract_ev_location_data(rep)
+        if ev_meta is not None:
+            ev_locations.append(ev_meta)
+
+        if power is not None:
+            power_data.append(power)
+        if setpoint is not None:
+            setpoint_data.append(setpoint)
+        if ev_count is not None:
+            ev_count_data.append(ev_count)
+        if rewards is not None:
+            reward_data.append(rewards)
+        if demand is not None:
+            demand_tot = demand.sum(axis=0) if isinstance(demand, np.ndarray) else np.sum(demand, axis=0)
+            demand_data.append(demand_tot)
+        if solar is not None:
+            # Sum across transformers to get total solar generation
+            solar_tot = solar.sum(axis=0) if isinstance(solar, np.ndarray) else np.sum(solar, axis=0)
+            solar_data.append(solar_tot)
+
+    # ------------------------------------------------------------------
+    # 4. Create subplots
+    # ------------------------------------------------------------------
+    grid = plt.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
+
+    # Extract a common time_steps array for plotting
+    time_steps = np.arange(len(replays[0].reward_history))
+
+    # 4.1 Energy Flow Breakdown
+    ax1 = fig.add_subplot(grid[0, 0])
+    _plot_energy_flow_breakdown(ax1, replays[0], time_steps)
+
+    # 4.2 EV SoC vs. Price
+    ax2 = fig.add_subplot(grid[0, 1])
+    _plot_ev_soc_vs_price(ax2, replays[0], time_steps)
+
+    # 4.3 EV Trajectory (SoC and Location)
+    ax3 = fig.add_subplot(grid[1, 0])
+    _plot_ev_trajectory(ax3, replays[0], time_steps)
+
+    # 4.4 Cumulative Reward/Cost
+    ax4 = fig.add_subplot(grid[1, 1])
+    _plot_cumulative_reward_cost(ax4, replays[0], time_steps)
+
+    # Apply step + datetime formatter to all time-series axes
+    for ax in [ax1, ax2, ax3, ax4]:
+        _apply_time_formatter(ax, replays[0])
+
+    # ------------------------------------------------------------------
+    # 5. Finalize and save
+    # ------------------------------------------------------------------
+    fig.suptitle('Residential Simulation Evaluation', fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=120)
@@ -693,3 +783,129 @@ def plot_ev_trajectories(replay_data, ax=None):
     ax.grid(True, alpha=0.3)
     
     return ax
+
+
+def _plot_ev_trajectory(ax, replay, time_steps):
+    """Plot EV SoC and location trajectory.
+    
+    Priority of data sources:
+    1. `ev_soc` and `ev_locations` arrays if they exist (legacy / explicit tracking)
+    2. Derive from `port_energy_level` and `ev_location_data` which are always
+       present in residential simulations. We use port 0 of charging station 0
+       as a proxy for the "first EV". This keeps the plot informative even if
+       detailed per-EV arrays were not saved.
+    """
+    sim_steps = len(time_steps)
+
+    if hasattr(replay, 'ev_soc') and hasattr(replay, 'ev_locations') and replay.ev_soc.shape[1] > 0:
+        ev_soc = replay.ev_soc[:sim_steps, 0] * 100  # percentage
+        locations = replay.ev_locations[:sim_steps, 0]
+    elif hasattr(replay, 'port_energy_level') and hasattr(replay, 'ev_location_data'):
+        # Use port 0 @ CS 0 as representative trajectory
+        soc_raw = replay.port_energy_level[0, 0, :sim_steps]
+        max_cap = np.nanmax(soc_raw) if np.nanmax(soc_raw) > 0 else 1.0
+        ev_soc = (soc_raw / max_cap) * 100  # normalise to percentage
+        locations = replay.ev_location_data[0, 0, :sim_steps]
+    else:
+        ax.text(0.5, 0.5, 'EV Trajectory data not available in replay.',
+                horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+        ax.set_title("EV Trajectory: SoC & Location")
+        return
+ 
+    # Plot SoC line
+    ax.plot(time_steps, ev_soc, label='EV SoC', color='#007ACC', zorder=10)
+    ax.set_ylabel('State of Charge (%)', color='#007ACC')
+    ax.tick_params(axis='y', labelcolor='#007ACC')
+    ax.set_ylim(-5, 105)
+    ax.set_title("EV Trajectory: SoC & Location (EV 0)")
+    ax.grid(True, which="both", ls=":", lw=0.5)
+
+    # Create a secondary axis for location bars
+    ax_loc = ax.twinx()
+    ax_loc.set_ylim(0, 1)
+    ax_loc.set_yticks([]) # Hide y-ticks for the location axis
+
+    # Define location colors and labels
+    location_map = {
+        0: {'label': 'Home', 'color': '#5CB85C'},
+        1: {'label': 'Work', 'color': '#F0AD4E'},
+        2: {'label': 'Driving', 'color': '#D9534F'}
+    }
+
+    # Plot location bars
+    for loc_id, props in location_map.items():
+        ax_loc.fill_between(time_steps, 0, 1, where=(locations == loc_id),
+                             color=props['color'], alpha=0.6, label=props['label'], step='mid')
+
+    # Create a single legend for both axes
+    lines, labels = ax.get_legend_handles_labels()
+    patches, patch_labels = ax_loc.get_legend_handles_labels()
+    ax.legend(lines + patches, labels + patch_labels, loc='upper left')
+
+def _plot_energy_flow_breakdown(ax, replay, time_steps):
+    # Plot energy flow breakdown
+    if hasattr(replay, 'energy_flow_breakdown'):
+        ax.plot(time_steps, replay.energy_flow_breakdown['grid_draw'][:len(time_steps)], label='Grid')
+        ax.plot(time_steps, replay.energy_flow_breakdown['solar_production'][:len(time_steps)], label='Solar')
+        ax.plot(time_steps, replay.energy_flow_breakdown['battery_discharge'][:len(time_steps)], label='Battery')
+        ax.plot(time_steps, replay.energy_flow_breakdown['ev_charge_demand'][:len(time_steps)], label='EV Charging')
+        ax.set_title("Energy Flow Breakdown")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Energy [kWh]")
+        ax.legend()
+        ax.grid(True, which="both", ls=":", lw=0.5)
+    else:
+        ax.text(0.5, 0.5, 'Energy flow data not available in replay.', 
+                horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+        ax.set_title("Energy Flow Breakdown")
+
+def _plot_ev_soc_vs_price(ax, replay, time_steps):
+    # Plot EV SoC vs. price
+    # Check if we have port_energy_level data (for SoC)
+    if hasattr(replay, 'port_energy_level') and replay.port_energy_level.shape[0] > 0:
+        # Get the first EV's energy level (first port, first CS)
+        ev_energy = replay.port_energy_level[0, 0, :len(time_steps)]
+        
+        # Calculate SoC as a percentage of max capacity (assuming 100 kWh as max if not available)
+        max_capacity = 100  # Default max capacity in kWh
+        if hasattr(replay, 'EVs') and len(replay.EVs) > 0:
+            max_capacity = replay.EVs[0].battery_capacity
+        
+        ev_soc = (ev_energy / max_capacity) * 100
+        ax.plot(time_steps, ev_soc, label='EV SoC')
+        
+        # Plot charge prices if available
+        if hasattr(replay, 'charge_prices'):
+            # Use the first charging station's prices
+            prices = replay.charge_prices[0, :len(time_steps)]
+            ax.plot(time_steps, prices, label='Charge Price')
+        
+        ax.set_title("EV SoC vs. Charge Price")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("SoC [%] / Price [€/kWh]")
+        ax.legend()
+        ax.grid(True, which="both", ls=":", lw=0.5)
+    else:
+        ax.text(0.5, 0.5, 'EV SoC data not available in replay.', 
+                horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+        ax.set_title("EV SoC vs. Charge Price")
+
+def _plot_cumulative_reward_cost(ax, replay, time_steps):
+    # Plot cumulative reward and cost
+    sim_steps = len(time_steps)
+    
+    # Check if we have reward history
+    if hasattr(replay, 'reward_history') and len(replay.reward_history) > 0:
+        rewards = replay.reward_history[:sim_steps]
+        ax.plot(time_steps, np.cumsum(rewards), label='Cumulative Reward')
+    
+    # Check if we have cost history
+    if hasattr(replay, 'cost_history') and len(replay.cost_history) > 0:
+        costs = replay.cost_history[:sim_steps]
+        ax.plot(time_steps, np.cumsum(costs), label='Cumulative Cost')
+    
+    ax.set_title("Cumulative Reward and Cost")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Reward / Cost [€]")
+    ax.legend()
+    ax.grid(True, which="both", ls=":", lw=0.5)

@@ -411,6 +411,15 @@ class EV2Gym(gym.Env):
         self.tr_solar_power = np.zeros(
             [self.number_of_transformers, self.simulation_length])
 
+        # New structures for detailed plotting
+        self.energy_flow_breakdown = {
+            'grid_draw': np.zeros(self.simulation_length, dtype=np.float32),
+            'solar_production': np.zeros(self.simulation_length, dtype=np.float32),
+            'battery_discharge': np.zeros(self.simulation_length, dtype=np.float32),
+            'ev_charge_demand': np.zeros(self.simulation_length, dtype=np.float32),
+        }
+        self.cost_history = np.zeros(self.simulation_length, dtype=np.float32)
+
         # self.port_power = np.zeros([self.number_of_ports,
         #                             self.cs,
         #                             self.simulation_length],
@@ -650,10 +659,23 @@ class EV2Gym(gym.Env):
                                      self.current_step] = tr.inflexible_load[self.current_step]
             self.tr_solar_power[tr.id,
                                 self.current_step] = tr.solar_power[self.current_step]
+        
+            # Update energy flow breakdown for solar production
+            self.energy_flow_breakdown['solar_production'][self.current_step] += tr.solar_power[self.current_step]
 
+        # Calculate total EV charging demand and grid draw
+        total_ev_charge_demand = 0
+        total_battery_discharge = 0
+        
         for i, cs in enumerate(self.charging_stations):
             self.cs_power[cs.id, self.current_step] = cs.current_power_output
             self.cs_current[cs.id, self.current_step] = cs.current_total_amps
+            
+            # Track EV charging demand (positive values are charging, negative are discharging)
+            if cs.current_power_output > 0:
+                total_ev_charge_demand += cs.current_power_output
+            elif cs.current_power_output < 0:
+                total_battery_discharge += abs(cs.current_power_output)
 
             for j in range(self.number_of_ports_per_cs):
                 if j < len(cs.evs_connected) and cs.evs_connected[j] is not None:
@@ -684,6 +706,28 @@ class EV2Gym(gym.Env):
                         ev.get_soc()
                     self.port_current[ev.id, ev.location,
                                       self.current_step] = ev.actual_current
+
+        # Update energy flow breakdown components
+        self.energy_flow_breakdown['ev_charge_demand'][self.current_step] = total_ev_charge_demand
+        self.energy_flow_breakdown['battery_discharge'][self.current_step] = total_battery_discharge
+        
+        # Grid draw is the net power usage minus solar production and battery discharge
+        self.energy_flow_breakdown['grid_draw'][self.current_step] = (
+            self.current_power_usage[self.current_step] - 
+            self.energy_flow_breakdown['solar_production'][self.current_step] + 
+            self.energy_flow_breakdown['battery_discharge'][self.current_step]
+        )
+        
+        # Update cost history if we have prices available
+        if hasattr(self, 'charge_prices') and hasattr(self, 'discharge_prices'):
+            # Simple cost calculation: grid draw * charge price - battery discharge * discharge price
+            grid_price = np.mean([self.charge_prices[cs.id, self.current_step] for cs in self.charging_stations])
+            discharge_price = np.mean([self.discharge_prices[cs.id, self.current_step] for cs in self.charging_stations])
+            
+            self.cost_history[self.current_step] = (
+                self.energy_flow_breakdown['grid_draw'][self.current_step] * grid_price -
+                self.energy_flow_breakdown['battery_discharge'][self.current_step] * discharge_price
+            )
 
     def _step_date(self):
         '''Steps the simulation date by one timestep'''

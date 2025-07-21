@@ -194,8 +194,8 @@ def test_ev_tracking():
     plot_path = os.path.join('results/ev_tracking_test', 'ev_trajectory.png')
     
     # Create figure with larger size and higher DPI
-    plt.figure(figsize=(15, 10))
-    plot_from_replay(replay_path, save_path=plot_path)  # Use the path instead of the object
+    plt.figure(figsize=(15, 20))
+    plot_from_replay(replay_path, plot_type='replays', save_path=plot_path)
     print(f"\nVisualization saved to {plot_path}")
 
     return metrics

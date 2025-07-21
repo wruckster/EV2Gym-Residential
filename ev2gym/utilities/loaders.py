@@ -438,54 +438,74 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
     if env.load_from_replay_path is not None:
         return env.replay.charge_prices, env.replay.discharge_prices
 
-    if env.price_data is None:
-        # else load historical prices
-        file_path = get_resource_path('ev2gym.data', 'Netherlands_day-ahead-2015-2024.csv')
-        env.price_data = pd.read_csv(file_path, sep=',', header=0)
-        drop_columns = ['Country', 'Datetime (Local)']        
+    # Try to load prices from external features first
+    external_features = _load_external_features(env)
+    price_col = None
+    if external_features is not None:
+        # Look for 'rrp' (for AUD) or 'price' columns
+        if 'rrp' in [c.lower() for c in external_features.columns]:
+            price_col = 'RRP' if 'RRP' in external_features.columns else 'rrp'
+        else:
+            for col in external_features.columns:
+                if 'price' in col.lower():
+                    price_col = col
+                    break
 
-        env.price_data.drop(drop_columns, inplace=True, axis=1)
-        env.price_data['year'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).year
-        env.price_data['month'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).month
-        env.price_data['day'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).day
-        env.price_data['hour'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).hour
+    if price_col:
+        # Prices are assumed to be in $/MWh, converting to $/kWh
+        prices = external_features[price_col].values / 1000
+        charge_prices = np.tile(-prices, (env.cs, 1))
+        discharge_prices = np.tile(prices, (env.cs, 1))
+    else:
+        # Fallback to original method if external features don't contain prices
+        if env.price_data is None:
+            # else load historical prices
+            file_path = get_resource_path('ev2gym.data', 'Netherlands_day-ahead-2015-2024.csv')
+            env.price_data = pd.read_csv(file_path, sep=',', header=0)
+            drop_columns = ['Country', 'Datetime (Local)']
 
-    # assume charge and discharge prices are the same
-    # assume prices are the same for all charging stations
+            env.price_data.drop(drop_columns, inplace=True, axis=1)
+            env.price_data['year'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).year
+            env.price_data['month'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).month
+            env.price_data['day'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).day
+            env.price_data['hour'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).hour
 
-    data = env.price_data
-    charge_prices = np.zeros((env.cs, env.simulation_length))
-    discharge_prices = np.zeros((env.cs, env.simulation_length))
-    # for every simulation step, take the price of the corresponding hour
-    sim_temp_date = env.sim_date
-    for i in range(env.simulation_length):
+        # assume charge and discharge prices are the same
+        # assume prices are the same for all charging stations
 
-        year = sim_temp_date.year
-        month = sim_temp_date.month
-        day = sim_temp_date.day
-        hour = sim_temp_date.hour
-        # find the corresponding price
-        try:
-            charge_prices[:, i] = -data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                            'Price (EUR/MWhe)'].iloc[0]/1000  # price/kWh
-            discharge_prices[:, i] = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                              'Price (EUR/MWhe)'].iloc[0]/1000  # price/kWh
-        except:
-            print(
-                'Error: no price found for the given date and hour. Using 2022 prices instead.')
+        data = env.price_data
+        charge_prices = np.zeros((env.cs, env.simulation_length))
+        discharge_prices = np.zeros((env.cs, env.simulation_length))
+        # for every simulation step, take the price of the corresponding hour
+        sim_temp_date = env.sim_date
+        for i in range(env.simulation_length):
 
-            year = 2022
-            if day > 28:
-                day -= 1
-            print("Debug:", year, month, day, hour)
-            charge_prices[:, i] = -data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                            'Price (EUR/MWhe)'].iloc[0]/1000  # price/kWh
-            discharge_prices[:, i] = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                              'Price (EUR/MWhe)'].iloc[0]/1000  # price/kWh
+            year = sim_temp_date.year
+            month = sim_temp_date.month
+            day = sim_temp_date.day
+            hour = sim_temp_date.hour
+            # find the corresponding price
+            try:
+                price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
+                                       'Price (EUR/MWhe)'].iloc[0] / 1000  # price/kWh
+                charge_prices[:, i] = -price_value
+                discharge_prices[:, i] = price_value
+            except IndexError:
+                print(
+                    'Error: no price found for the given date and hour. Using 2022 prices instead.')
 
-        # step to next
-        sim_temp_date = sim_temp_date + \
-            datetime.timedelta(minutes=env.timescale)
+                year = 2022
+                if day > 28:
+                    day -= 1
+                print("Debug:", year, month, day, hour)
+                price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
+                                       'Price (EUR/MWhe)'].iloc[0] / 1000  # price/kWh
+                charge_prices[:, i] = -price_value
+                discharge_prices[:, i] = price_value
+
+            # step to next
+            sim_temp_date = sim_temp_date + \
+                datetime.timedelta(minutes=env.timescale)
 
     discharge_prices = discharge_prices * env.config['discharge_price_factor']
     return charge_prices, discharge_prices
@@ -578,7 +598,7 @@ def _load_external_features(env):
         return None
         
     import os
-    external_file = os.path.join(env.config['data_path'], 'external_features', 'external_dataset.parquet')
+    external_file = env.config['data_path']
     if not os.path.exists(external_file):
         # Try alternative path structure
         external_file = os.path.join(env.config['data_path'], 'nsw_dataset', 'external_features', 'external_dataset.parquet')
@@ -589,16 +609,16 @@ def _load_external_features(env):
         # Load the parquet file
         df = pd.read_parquet(external_file)
         
-        # Check if there's a timestamp column
-        timestamp_col = None
-        for col in df.columns:
-            if col.lower() in ['timestamp', 'time', 'date', 'datetime', 'interval_start']:
-                timestamp_col = col
-                break
+        # # Check if there's a timestamp column
+        # timestamp_col = None
+        # for col in df.columns:
+        #     if col.lower() in ['timestamp', 'time', 'date', 'datetime', 'interval_start']:
+        #         timestamp_col = col
+        #         break
                 
-        if timestamp_col is None:
-            print("Warning: No timestamp column found in external features dataset.")
-            return None
+        # if timestamp_col is None:
+        #     print("Warning: No timestamp column found in external features dataset.")
+        #     return None
             
         # Convert timestamp to datetime if it's not already
         if not pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
