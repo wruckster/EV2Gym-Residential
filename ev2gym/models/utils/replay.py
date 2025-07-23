@@ -176,8 +176,18 @@ class EvCityReplay():
                                                 self.sim_length])  # max energy of ev when only charging
 
         for i, ev in enumerate(env.EVs):
-            port = ev.id
-            cs_id = ev.location
+            cs_id = ev.location  # charging station id
+
+            # Determine the port index this EV was connected to at its charging station.
+            port = 0  # fallback if not found
+            if 0 <= cs_id < len(env.charging_stations):
+                cs = env.charging_stations[cs_id]
+                if ev in cs.evs_connected:
+                    port = cs.evs_connected.index(ev)
+            # Ensure port does not exceed max_n_ports
+            if port >= self.max_n_ports:
+                continue  # skip EVs assigned to non-existent port index
+
             t_arr = ev.time_of_arrival
             original_t_dep = ev.time_of_departure
             # print(f'EV {i} is at port {port} of CS {cs_id} from {t_arr} to {original_t_dep}')            

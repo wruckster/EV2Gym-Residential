@@ -70,11 +70,13 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
     sim_len = env.simulation_length
 
     start_datetime = env.sim_starting_date
+    print(f"DEBUG: Starting date: {start_datetime}, simulation length: {sim_len}, timestep: {timestep_minutes}min")
 
     all_ev_profiles: List[EV] = []
     ev_id_counter = 0
 
     for profile_key, p_cfg in cfg.items():
+        print(f"DEBUG: Processing profile: {profile_key}")
         v_count: int = int(p_cfg.get("vehicle_count", 1))
         home_station = int(p_cfg.get("default_station", 0))
         work_station = int(p_cfg.get("work_station", 1))
@@ -100,7 +102,11 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             # Build list of (start,end,location) intervals for this day.
             day_blocks: List[Tuple[int, int, int, float]] = []
 
-            # Helper to convert HH:MM to step offset within day.
+            start_hour_offset = env.sim_starting_date.hour * 60 + env.sim_starting_date.minute
+            start_offset_steps = start_hour_offset // timestep_minutes
+            steps_in_day = (24 * 60) // timestep_minutes
+
+            # Helper to convert HH:MM to step offset from midnight.
             def _hm_to_offset(hm: str) -> int:
                 hour, minute = map(int, hm.split(":"))
                 return (hour * 60 + minute) // timestep_minutes
@@ -110,6 +116,15 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             for blk_name, blk_cfg in day_sched.items():
                 start_ofs = _hm_to_offset(blk_cfg["start_time"])
                 end_ofs = _hm_to_offset(blk_cfg["end_time"])
+
+                # Handle overnight blocks by adding a day to the end time
+                if end_ofs < start_ofs:
+                    end_ofs += steps_in_day
+
+                # Make offsets relative to simulation start time
+                start_ofs -= start_offset_steps
+                end_ofs -= start_offset_steps
+
                 loc_str = blk_cfg["location"]
                 is_plugged_in = True  # Default is plugged in
                 
@@ -142,9 +157,12 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             for start, end, loc, loc_type, energy, is_plugged_in in regular_blocks:
                 # If we're at home or work, check for random trips
                 if loc_type in ["home", "work"]:
+                    # Find original block name by matching start time
+                    # Reverse the offset calculation to find the original offset from midnight
+                    original_start_ofs = (start - step) + start_offset_steps
+
                     blk_name = next((name for name, cfg in day_sched.items() 
-                                     if _hm_to_offset(cfg["start_time"]) == (start - step) 
-                                     and _hm_to_offset(cfg["end_time"]) == (end - step)), None)
+                                     if _hm_to_offset(cfg["start_time"]) == original_start_ofs), None)
                     
                     if blk_name:
                         blk_cfg = day_sched[blk_name]
@@ -218,15 +236,26 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                         
             # Add commutes between blocks if needed
             presence_blocks.extend(final_blocks)
+            
+            # Debug the blocks we've generated so far
+            print(f"DEBUG: Day {current_dt.strftime('%Y-%m-%d')}, added {len(final_blocks)} blocks, total now: {len(presence_blocks)}")
                 
             # Advance to next day.
             step += (24 * 60) // timestep_minutes
             current_dt += _dt.timedelta(days=1)
 
         # Convert presence blocks to EVs.
+        print(f"DEBUG: Generated {len(presence_blocks)} presence blocks for profile {profile_key}")
+        
+        # Debug the first few blocks to understand their properties
+        for i, blk in enumerate(presence_blocks[:5]):
+            print(f"DEBUG: Block {i}: location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}, start={blk.start_step}, end={blk.end_step}")
+            
+        ev_count = 0
         for blk in presence_blocks:
             # Skip blocks where EV is not plugged in (away)
             if not blk.is_plugged_in or blk.location < 0:
+                print(f"DEBUG: Skipping block with location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}")
                 continue
                 
             # Arrival battery capacity: random 40-80% minus trip energy, but at least min capacity.
@@ -247,7 +276,7 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             }
             
             ev_profile = EV(
-                id=ev_id_counter,
+                id=f"ev_{profile_key}_{ev_id_counter}",
                 location=blk.location,
                 battery_capacity_at_arrival=cap_arrival,
                 time_of_arrival=blk.start_step,
@@ -263,16 +292,42 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 min_discharge_power=float(ev_spec["min_discharge_power"]),
                 ev_phases=int(ev_spec["ev_phases"]),
                 transition_soc=float(ev_spec["transition_soc"]),
+                transition_soc_multiplier=float(ev_spec.get("transition_soc_multiplier", 1.0)),
                 charge_efficiency=ev_spec["charge_efficiency"],
                 discharge_efficiency=ev_spec["discharge_efficiency"],
-                timescale=env.timescale,
-                metadata=metadata  # Add metadata for tracking
+                timescale=timestep_minutes,
+                metadata=metadata,  # Add metadata for tracking
+                location_state=0 if blk.location_type == "home" else 1,  # 0=home, 1=work
             )
+            
+            # Add schedule transitions for future blocks
+            # Find all blocks that come after this one for this vehicle
+            future_blocks = [b for b in presence_blocks if b.start_step > blk.end_step]
+            future_blocks.sort(key=lambda b: b.start_step)
+            
+            # Add transitions for each future block
+            for future_blk in future_blocks:
+                # Add transition to "commuting" state at the end of current block
+                ev_profile.add_schedule_transition(blk.end_step, 2)  # 2 = commuting
+                
+                # Add transition to new location at the start of next block
+                new_state = 0 if future_blk.location_type == "home" else 1
+                ev_profile.add_schedule_transition(future_blk.start_step, new_state)
+                
+                # Stop after adding the first future block transition
+                break
+                
+            print(f"DEBUG: Added EV profile with transitions: {ev_profile._schedule_transitions}")
+            
             all_ev_profiles.append(ev_profile)
             ev_id_counter += 1
+            ev_count += 1
             if ev_id_counter >= v_count:
                 break  # one vehicle per profile for now
+                
+        print(f"DEBUG: Created {ev_count} EV profiles for profile {profile_key}")
 
     # Sort by arrival time as required by env logic.
     all_ev_profiles.sort(key=lambda ev: ev.time_of_arrival)
+    print(f"DEBUG: Total EV profiles created: {len(all_ev_profiles)}")
     return all_ev_profiles

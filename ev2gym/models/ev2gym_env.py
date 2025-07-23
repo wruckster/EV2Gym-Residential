@@ -496,7 +496,8 @@ class EV2Gym(gym.Env):
                 self.charge_prices[cs.id, self.current_step],
                 self.discharge_prices[cs.id, self.current_step])
 
-            self.departing_evs += ev
+            # Store departing EV for logging / statistics
+            self.departing_evs.append(ev)
 
             for u in user_satisfaction:
                 user_satisfaction_list.append(u)
@@ -538,6 +539,10 @@ class EV2Gym(gym.Env):
 
             elif ev.time_of_arrival > self.current_step + 1:
                 break
+
+        # Update EV location states based on schedule transitions
+        for ev in self.EVs:
+            ev.update_location_state(self.current_step)
 
         self._update_power_statistics(self.departing_evs)
 
@@ -700,12 +705,12 @@ class EV2Gym(gym.Env):
                     self.port_energy_level[port, cs.id,
                                            self.current_step] = ev.get_soc()
 
-            for ev in departing_evs:
-                if not self.lightweight_plots:
-                    self.port_energy_level[ev.id, ev.location, self.current_step] = \
-                        ev.get_soc()
-                    self.port_current[ev.id, ev.location,
-                                      self.current_step] = ev.actual_current
+        # Departed EVs are no longer connected; their port data has already been
+        # set to 0 above. We keep them only for high-level metrics, so skip
+        # port-level array updates that rely on integer indices.
+        # (Previously this attempted to index using ev.id, causing IndexError.)
+        for ev in departing_evs:
+            pass  # placeholder for any future aggregate tracking
 
         # Update energy flow breakdown components
         self.energy_flow_breakdown['ev_charge_demand'][self.current_step] = total_ev_charge_demand

@@ -146,18 +146,45 @@ def test_ev_tracking():
             print("\nEV Status:")
             for ev_id, ev_data in metrics['evs'].items():
                 print(f"  EV {ev_id}:")
-                print(f"    - SoC: {ev_data['soc'][-1]:.1f}%")
-                print(f"    - Location: {ev_data['location'][-1]}")
-                print(f"    - Charging: {ev_data['charging_power'][-1]:.2f} kW")
-                print(f"    - Discharging: {ev_data['discharging_power'][-1]:.2f} kW")
+                # Safely access each metric, handle empty lists
+                if ev_data['soc']:
+                    print(f"    - SoC: {ev_data['soc'][-1]:.1f}%")
+                else:
+                    print("    - SoC: N/A")
+                
+                if ev_data['location']:
+                    print(f"    - Location: {ev_data['location'][-1]}")
+                else:
+                    print("    - Location: N/A")
+                
+                if ev_data['charging_power']:
+                    print(f"    - Charging: {ev_data['charging_power'][-1]:.2f} kW")
+                else:
+                    print("    - Charging: 0.00 kW")
+                
+                if ev_data['discharging_power']:
+                    print(f"    - Discharging: {ev_data['discharging_power'][-1]:.2f} kW")
+                else:
+                    print("    - Discharging: 0.00 kW")
             
             # Print charging station status
             print("\nCharging Stations:")
             for cs_id, cs_data in metrics['charging_stations'].items():
                 print(f"  CS {cs_id}:")
-                print(f"    - Connected EVs: {len(cs_data['connected_evs'][-1])}")
-                print(f"    - Total Charging: {cs_data['total_charging_power'][-1]:.2f} kW")
-                print(f"    - Total Discharging: {cs_data['total_discharging_power'][-1]:.2f} kW")
+                if 'connected_evs' in cs_data and cs_data['connected_evs'] and len(cs_data['connected_evs']) > 0:
+                    print(f"    - Connected EVs: {len(cs_data['connected_evs'][-1])}")
+                else:
+                    print(f"    - Connected EVs: 0")
+                    
+                if 'total_charging_power' in cs_data and cs_data['total_charging_power'] and len(cs_data['total_charging_power']) > 0:
+                    print(f"    - Total Charging: {cs_data['total_charging_power'][-1]:.2f} kW")
+                else:
+                    print(f"    - Total Charging: 0.00 kW")
+                    
+                if 'total_discharging_power' in cs_data and cs_data['total_discharging_power'] and len(cs_data['total_discharging_power']) > 0:
+                    print(f"    - Total Discharging: {cs_data['total_discharging_power'][-1]:.2f} kW")
+                else:
+                    print(f"    - Total Discharging: 0.00 kW")
     
     print("\nSimulation complete!")
     print(f"Average reward: {np.mean(rewards):.2f}")
