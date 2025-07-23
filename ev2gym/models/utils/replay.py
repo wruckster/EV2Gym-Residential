@@ -214,16 +214,22 @@ class EvCityReplay():
                                    t_arr] = ev.battery_capacity_at_arrival
             self.ev_arrival[port, cs_id, t_arr] = 1
             if original_t_dep < self.sim_length:
+                # Safe index within bounds
                 self.t_dep[port, cs_id, t_dep] = 1            
-                if ev.prev_capacity < ev.battery_capacity:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.prev_capacity #-5
-                else:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.battery_capacity
+                idx_safe = t_dep
             else:
+                # EV departs after simulation ends; record at last in-bounds step
                 self.t_dep[port, cs_id, t_dep-1] = 1                            
-                self.max_energy_at_departure[port, cs_id, t_dep-1] = ev.prev_capacity
-            
-            self.ev_des_energy[port, cs_id, t_dep] = ev.desired_capacity
+                idx_safe = t_dep - 1
+
+            # max energy at departure
+            if ev.prev_capacity < ev.battery_capacity:
+                self.max_energy_at_departure[port, cs_id, idx_safe] = ev.prev_capacity
+            else:
+                self.max_energy_at_departure[port, cs_id, idx_safe] = ev.battery_capacity
+
+            # desired energy at departure
+            self.ev_des_energy[port, cs_id, idx_safe] = ev.desired_capacity
 
         # print(f'u: {self.u}')
         # print(f'ev_arrival: {self.ev_arrival}')
