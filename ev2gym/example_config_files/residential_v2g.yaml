@@ -3,8 +3,8 @@
 ##############################################################################
 # Simulation Parameters
 ##############################################################################
-timescale: 30  # minutes per step
-simulation_length: 50  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+timescale: 5  # minutes per step
+simulation_length: 1000  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 # Path to external features
 data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet

@@ -812,24 +812,16 @@ def _plot_ev_trajectory(ax, replay, time_steps):
         ax.set_title("EV Trajectory: SoC & Location")
         return
  
-    # Plot SoC line
-    ax.plot(time_steps, ev_soc, label='EV SoC', color='#007ACC', zorder=10)
-    ax.set_ylabel('State of Charge (%)', color='#007ACC')
-    ax.tick_params(axis='y', labelcolor='#007ACC')
-    ax.set_ylim(-5, 105)
-    ax.set_title("EV Trajectory: SoC & Location (EV 0)")
-    ax.grid(True, which="both", ls=":", lw=0.5)
-
-    # Create a secondary axis for location bars
+    # Plot location bars
     ax_loc = ax.twinx()
     ax_loc.set_ylim(0, 1)
     ax_loc.set_yticks([]) # Hide y-ticks for the location axis
 
     # Define location colors and labels
     location_map = {
-        0: {'label': 'Home', 'color': '#5CB85C'},
-        1: {'label': 'Work', 'color': '#F0AD4E'},
-        2: {'label': 'Driving', 'color': '#D9534F'}
+        0: {'label': 'Home', 'color': '#AAAAAA'},
+        1: {'label': 'Work', 'color': '#CCCCCC'},
+        2: {'label': 'Driving', 'color': '#666666'}
     }
 
     # Plot location bars
@@ -837,20 +829,39 @@ def _plot_ev_trajectory(ax, replay, time_steps):
         ax_loc.fill_between(time_steps, 0, 1, where=(locations == loc_id),
                              color=props['color'], alpha=0.6, label=props['label'], step='mid')
 
-    # Create a single legend for both axes
+    # Plot SoC line on the primary axis
+    ax.plot(time_steps, ev_soc, label='EV SoC', color='#007ACC')
+    ax.set_ylabel('State of Charge (%)')
+    ax.set_zorder(ax_loc.get_zorder() + 1)  # Bring ax to the front
+    ax.patch.set_alpha(0)  # Make ax background transparent
+
+    # Set plot titles and labels
+    ax.set_title("EV Trajectory: SoC & Location")
+    ax.set_xlabel("Timestep")
+    ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
+
+   # Combine legends from both axes
     lines, labels = ax.get_legend_handles_labels()
     patches, patch_labels = ax_loc.get_legend_handles_labels()
-    ax.legend(lines + patches, labels + patch_labels, loc='upper left')
+    legend = ax.legend(lines + patches, labels + patch_labels, loc='best', fancybox=True, shadow=True)
+    frame = legend.get_frame()
+    frame.set_facecolor('white')
+    frame.set_edgecolor('#CCCCCC')
+    frame.set_alpha(0.95)
+    frame.set_linewidth(0.8)
+    ax.grid(True, which="both", ls=":", lw=0.5, zorder=0) # Draw grid behind everything
+
 
 def _plot_energy_flow_breakdown(ax, replay, time_steps):
     # Plot energy flow breakdown
     if hasattr(replay, 'energy_flow_breakdown'):
-        ax.plot(time_steps, replay.energy_flow_breakdown['grid_draw'][:len(time_steps)], label='Grid')
-        ax.plot(time_steps, replay.energy_flow_breakdown['solar_production'][:len(time_steps)], label='Solar')
-        ax.plot(time_steps, replay.energy_flow_breakdown['battery_discharge'][:len(time_steps)], label='Battery')
-        ax.plot(time_steps, replay.energy_flow_breakdown['ev_charge_demand'][:len(time_steps)], label='EV Charging')
+        ax.fill_between(time_steps, 0, replay.energy_flow_breakdown['grid_draw'][:len(time_steps)], color='red', label='Household Demand', alpha=0.5)
+        ax.fill_between(time_steps, 0, replay.energy_flow_breakdown['solar_production'][:len(time_steps)], color='orange', label='Solar Production', alpha=0.5)
+        ax.fill_between(time_steps, 0, replay.energy_flow_breakdown['battery_discharge'][:len(time_steps)], color='green', label='Discharging', alpha=0.5)
+        ax.fill_between(time_steps, 0, replay.energy_flow_breakdown['ev_charge_demand'][:len(time_steps)], color='lightblue', label='Charging', alpha=0.5)
         ax.set_title("Energy Flow Breakdown")
         ax.set_xlabel("Timestep")
+        ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
         ax.set_ylabel("Energy [kWh]")
         ax.legend()
         ax.grid(True, which="both", ls=":", lw=0.5)
@@ -882,7 +893,8 @@ def _plot_ev_soc_vs_price(ax, replay, time_steps):
         
         ax.set_title("EV SoC vs. Charge Price")
         ax.set_xlabel("Timestep")
-        ax.set_ylabel("SoC [%] / Price [€/kWh]")
+        ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
+        ax.set_ylabel("SoC [%] / Price [$/kWh]")
         ax.legend()
         ax.grid(True, which="both", ls=":", lw=0.5)
     else:
@@ -891,21 +903,30 @@ def _plot_ev_soc_vs_price(ax, replay, time_steps):
         ax.set_title("EV SoC vs. Charge Price")
 
 def _plot_cumulative_reward_cost(ax, replay, time_steps):
-    # Plot cumulative reward and cost
+    # Plot cumulative reward and cost on separate y-axes for clarity
     sim_steps = len(time_steps)
     
-    # Check if we have reward history
+    # Plot cumulative reward on the primary y-axis (left)
     if hasattr(replay, 'reward_history') and len(replay.reward_history) > 0:
         rewards = replay.reward_history[:sim_steps]
-        ax.plot(time_steps, np.cumsum(rewards), label='Cumulative Reward')
+        ax.plot(time_steps, np.cumsum(rewards), 'b-', label='Cumulative Reward')
+        ax.set_ylabel("Cumulative Reward", color='b')
+        ax.tick_params(axis='y', labelcolor='b')
     
-    # Check if we have cost history
+    # Create a secondary y-axis for the cost (right)
+    ax2 = ax.twinx()
     if hasattr(replay, 'cost_history') and len(replay.cost_history) > 0:
         costs = replay.cost_history[:sim_steps]
-        ax.plot(time_steps, np.cumsum(costs), label='Cumulative Cost')
+        ax2.plot(time_steps, np.cumsum(costs), '--', color='r', label='Cumulative Cost')
+        ax2.set_ylabel("Cumulative Cost [$]", color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
     
     ax.set_title("Cumulative Reward and Cost")
     ax.set_xlabel("Timestep")
-    ax.set_ylabel("Reward / Cost [€]")
-    ax.legend()
+    ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
     ax.grid(True, which="both", ls=":", lw=0.5)
+    
+    # Combine legends from both axes
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc='best')
