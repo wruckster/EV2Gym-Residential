@@ -609,24 +609,6 @@ def _load_external_features(env):
         # Load the parquet file
         df = pd.read_parquet(external_file)
         
-        # # Check if there's a timestamp column
-        # timestamp_col = None
-        # for col in df.columns:
-        #     if col.lower() in ['timestamp', 'time', 'date', 'datetime', 'interval_start']:
-        #         timestamp_col = col
-        #         break
-                
-        # if timestamp_col is None:
-        #     print("Warning: No timestamp column found in external features dataset.")
-        #     return None
-            
-        # Convert timestamp to datetime if it's not already
-        if not pd.api.types.is_datetime64_any_dtype(df[timestamp_col]):
-            df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-            
-        # Set timestamp as index
-        df = df.set_index(timestamp_col)
-        
         # Create start and end dates for filtering
         start_date = pd.Timestamp(year=env.config.get('year', 2019), 
                                 month=env.config.get('month', 1), 
@@ -656,7 +638,7 @@ def _load_external_features(env):
             # If we have more than enough data, just take what we need
             filtered_df = filtered_df.iloc[:env.simulation_length]
             
-        filtered_df.reset_index(drop=True, inplace=True)
+        filtered_df.reset_index(drop=False, inplace=True)
         return filtered_df
         
     except Exception as e:
