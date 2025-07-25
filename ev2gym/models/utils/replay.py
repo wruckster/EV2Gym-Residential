@@ -289,6 +289,7 @@ class EvCityReplay():
             'max_energy_at_departure': self.max_energy_at_departure,
             'energy_flow_breakdown': self.energy_flow_breakdown,
             'cost_history': self.cost_history,
+            'reward_history': self.reward_history,
         }
         import pickle
         with open(self.replay_path, 'wb') as f:

@@ -725,13 +725,17 @@ class EV2Gym(gym.Env):
         
         # Update cost history if we have prices available
         if hasattr(self, 'charge_prices') and hasattr(self, 'discharge_prices'):
-            # Simple cost calculation: grid draw * charge price - battery discharge * discharge price
+            # Convert power (kW) to energy (kWh) for the timestep before calculating cost
+            timestep_hours = self.timescale / 60.0
+            grid_energy_kwh = self.energy_flow_breakdown['grid_draw'][self.current_step] * timestep_hours
+            battery_discharge_kwh = self.energy_flow_breakdown['battery_discharge'][self.current_step] * timestep_hours
+
             grid_price = np.mean([self.charge_prices[cs.id, self.current_step] for cs in self.charging_stations])
             discharge_price = np.mean([self.discharge_prices[cs.id, self.current_step] for cs in self.charging_stations])
             
             self.cost_history[self.current_step] = (
-                self.energy_flow_breakdown['grid_draw'][self.current_step] * grid_price -
-                self.energy_flow_breakdown['battery_discharge'][self.current_step] * discharge_price
+                grid_energy_kwh * grid_price -
+                battery_discharge_kwh * discharge_price
             )
 
     def _step_date(self):
