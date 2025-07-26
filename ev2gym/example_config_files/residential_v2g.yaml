@@ -22,7 +22,7 @@ random_hour: False  # True or False
 
 # Simulation Starting Time
 # Hour and minute do not change after the environment has been reset
-hour: 11  # 0-23
+hour: 0  # 0-23
 minute: 0  # Simulation starting minute (0-59)
 
 # Simulate weekdays, weekends, or both
