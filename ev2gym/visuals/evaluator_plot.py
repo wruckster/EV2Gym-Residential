@@ -874,29 +874,36 @@ def _plot_ev_soc_vs_price(ax, replay, time_steps):
     # Plot EV SoC vs. price
     # Check if we have port_energy_level data (for SoC)
     if hasattr(replay, 'port_energy_level') and replay.port_energy_level.shape[0] > 0:
-        # Get the first EV's energy level (first port, first CS)
-        ev_energy = replay.port_energy_level[0, 0, :len(time_steps)]
+        # Get the first EV's SoC ratio (stored in port_energy_level)
+        ev_soc_ratio = replay.port_energy_level[0, 0, :len(time_steps)]
         
-        # Calculate SoC as a percentage of max capacity (assuming 100 kWh as max if not available)
-        max_capacity = 100  # Default max capacity in kWh
-        if hasattr(replay, 'EVs') and len(replay.EVs) > 0:
-            max_capacity = replay.EVs[0].battery_capacity
+        # Convert SoC ratio to percentage
+        ev_soc = ev_soc_ratio * 100
         
-        ev_soc = (ev_energy / max_capacity) * 100
-        ax.plot(time_steps, ev_soc, label='EV SoC')
+        # Plot SoC on the primary y-axis (left)
+        ax.plot(time_steps, ev_soc, label='EV SoC (%)', color='blue')
+        ax.set_ylabel("SoC [%]", color='blue')
+        ax.tick_params(axis='y', labelcolor='blue')
         
-        # Plot charge prices if available
+        # Create a secondary y-axis for the charge price
+        ax2 = ax.twinx()
+        
+        # Plot charge prices if available on the secondary y-axis (right)
         if hasattr(replay, 'charge_prices'):
-            # Use the first charging station's prices
             prices = replay.charge_prices[0, :len(time_steps)]
-            ax.plot(time_steps, prices, label='Charge Price')
+            ax2.plot(time_steps, prices, label='Charge Price ($/kWh)', color='green', alpha=0.7)
+            ax2.set_ylabel("Price [$/kWh]", color='green')
+            ax2.tick_params(axis='y', labelcolor='green')
         
         ax.set_title("EV SoC vs. Charge Price")
         ax.set_xlabel("Timestep")
         ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
-        ax.set_ylabel("SoC [%] / Price [$/kWh]")
-        ax.legend()
         ax.grid(True, which="both", ls=":", lw=0.5)
+        
+        # Combine legends
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc='best')
     else:
         ax.text(0.5, 0.5, 'EV SoC data not available in replay.', 
                 horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
