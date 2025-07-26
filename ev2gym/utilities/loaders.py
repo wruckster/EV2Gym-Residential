@@ -454,7 +454,7 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
     if price_col:
         # Prices are assumed to be in $/MWh, converting to $/kWh
         prices = external_features[price_col].values / 1000
-        charge_prices = np.tile(-prices, (env.cs, 1))
+        charge_prices = np.tile(prices, (env.cs, 1))
         discharge_prices = np.tile(prices, (env.cs, 1))
     else:
         # Fallback to original method if external features don't contain prices
@@ -487,8 +487,8 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
             # find the corresponding price
             try:
                 price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                       'Price (EUR/MWhe)'].iloc[0] / 1000  # price/kWh
-                charge_prices[:, i] = -price_value
+                                       'Price ($/MWhe)'].iloc[0] / 1000  # price/kWh
+                charge_prices[:, i] = price_value
                 discharge_prices[:, i] = price_value
             except IndexError:
                 print(
@@ -499,8 +499,8 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
                     day -= 1
                 print("Debug:", year, month, day, hour)
                 price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                       'Price (EUR/MWhe)'].iloc[0] / 1000  # price/kWh
-                charge_prices[:, i] = -price_value
+                                       'Price ($/MWhe)'].iloc[0] / 1000  # price/kWh
+                charge_prices[:, i] = price_value
                 discharge_prices[:, i] = price_value
 
             # step to next
