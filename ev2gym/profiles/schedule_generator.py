@@ -257,59 +257,64 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
         if not plugged_blocks:
             continue  # nothing to generate
 
-        first_block = plugged_blocks[0]
-        last_block = plugged_blocks[-1]
+        # Create one EV profile per vehicle count, each with its own schedule.
+        for _ in range(v_count):
+            ev_id_counter += 1
 
-        ev_spec = env.config["ev"]
-        batt_kwh = float(ev_spec["battery_capacity"])
-        min_capacity = float(ev_spec.get("min_battery_capacity", 10))
-        soc_arrival = rng.uniform(0.4, 0.8)
-        cap_arrival = max(min_capacity, soc_arrival * batt_kwh - first_block.energy_consumed)
-        cap_arrival = max(min_capacity, cap_arrival)
+            first_block = plugged_blocks[0]
+            last_block = plugged_blocks[-1]
 
-        desired_capacity = float(ev_spec.get("desired_capacity", 0.8)) * batt_kwh
+            # If the first block starts before the simulation, set start time to 0.
+            if first_block.start_step < 0:
+                first_block.start_step = 0
 
-        ev_profile = EV(
-            id=f"ev_{profile_key}_{ev_id_counter}",
-            location=first_block.location,
-            battery_capacity_at_arrival=cap_arrival,
-            time_of_arrival=first_block.start_step,
-            time_of_departure=first_block.end_step,
-            desired_capacity=desired_capacity,
-            battery_capacity=batt_kwh,
-            min_battery_capacity=min_capacity,
-            min_emergency_battery_capacity=float(ev_spec.get("min_emergency_battery_capacity", 15)),
-            max_ac_charge_power=float(ev_spec["max_ac_charge_power"]),
-            min_ac_charge_power=float(ev_spec["min_ac_charge_power"]),
-            max_dc_charge_power=float(ev_spec["max_dc_charge_power"]),
-            max_discharge_power=float(ev_spec["max_discharge_power"]),
-            min_discharge_power=float(ev_spec["min_discharge_power"]),
-            ev_phases=int(ev_spec["ev_phases"]),
-            transition_soc=float(ev_spec["transition_soc"]),
-            transition_soc_multiplier=float(ev_spec.get("transition_soc_multiplier", 1.0)),
-            charge_efficiency=ev_spec["charge_efficiency"],
-            discharge_efficiency=ev_spec["discharge_efficiency"],
-            timescale=timestep_minutes,
-            metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in plugged_blocks]},
-            location_state=0 if first_block.location_type == "home" else 1,
-        )
+            ev_spec = env.config["ev"]
+            batt_kwh = float(ev_spec["battery_capacity"])
+            min_capacity = float(ev_spec.get("min_battery_capacity", 10))
+            soc_arrival = rng.uniform(0.4, 0.8)
+            cap_arrival = max(min_capacity, soc_arrival * batt_kwh - first_block.energy_consumed)
+            cap_arrival = max(min_capacity, cap_arrival)
 
-        # Build full transition list: for each consecutive block pair, add depart & arrive.
-        for idx, blk in enumerate(plugged_blocks[:-1]):
-            next_blk = plugged_blocks[idx + 1]
-            # end of current block -> commuting
-            ev_profile.add_schedule_transition(blk.end_step, 2)
-            # start of next block -> new location state (home=0, work=1)
-            new_state = 0 if next_blk.location_type == "home" else 1
-            ev_profile.add_schedule_transition(next_blk.start_step, new_state)
+            desired_capacity = float(ev_spec.get("desired_capacity", 0.8)) * batt_kwh
 
-        # Extend overall availability so EV object exists until after final block
-        ev_profile.time_of_departure = last_block.end_step
+            ev_profile = EV(
+                id=f"ev_{profile_key}_{ev_id_counter}",
+                location=first_block.location,
+                battery_capacity_at_arrival=cap_arrival,
+                time_of_arrival=first_block.start_step,
+                time_of_departure=first_block.end_step,
+                desired_capacity=desired_capacity,
+                battery_capacity=batt_kwh,
+                min_battery_capacity=min_capacity,
+                min_emergency_battery_capacity=float(ev_spec.get("min_emergency_battery_capacity", 15)),
+                max_ac_charge_power=float(ev_spec["max_ac_charge_power"]),
+                min_ac_charge_power=float(ev_spec["min_ac_charge_power"]),
+                max_dc_charge_power=float(ev_spec["max_dc_charge_power"]),
+                max_discharge_power=float(ev_spec["max_discharge_power"]),
+                min_discharge_power=float(ev_spec["min_discharge_power"]),
+                ev_phases=int(ev_spec["ev_phases"]),
+                transition_soc=float(ev_spec["transition_soc"]),
+                transition_soc_multiplier=float(ev_spec.get("transition_soc_multiplier", 1.0)),
+                charge_efficiency=ev_spec["charge_efficiency"],
+                discharge_efficiency=ev_spec["discharge_efficiency"],
+                timescale=timestep_minutes,
+                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in plugged_blocks]},
+                location_state=0 if first_block.location_type == "home" else 1,
+            )
 
-        all_ev_profiles.append(ev_profile)
-        ev_id_counter += 1
-        # Only ONE EV per user profile by design
-        break
+            # Build full transition list: for each consecutive block pair, add depart & arrive.
+            for idx, blk in enumerate(plugged_blocks[:-1]):
+                next_blk = plugged_blocks[idx + 1]
+                # end of current block -> commuting
+                ev_profile.add_schedule_transition(blk.end_step, 2)
+                # start of next block -> new location state (home=0, work=1)
+                new_state = 0 if next_blk.location_type == "home" else 1
+                ev_profile.add_schedule_transition(next_blk.start_step, new_state)
+
+            # Extend overall availability so EV object exists until after final block
+            ev_profile.time_of_departure = last_block.end_step
+
+            all_ev_profiles.append(ev_profile)
 
     # Sort by arrival time as required by env logic.
     all_ev_profiles.sort(key=lambda ev: ev.time_of_arrival)
