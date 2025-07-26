@@ -415,8 +415,7 @@ class EV2Gym(gym.Env):
         self.energy_flow_breakdown = {
             'grid_draw': np.zeros(self.simulation_length, dtype=np.float32),
             'solar_production': np.zeros(self.simulation_length, dtype=np.float32),
-            'battery_discharge': np.zeros(self.simulation_length, dtype=np.float32),
-            'ev_charge_demand': np.zeros(self.simulation_length, dtype=np.float32),
+            'ev_power': np.zeros(self.simulation_length, dtype=np.float32),
         }
         self.cost_history = np.zeros(self.simulation_length, dtype=np.float32)
 
@@ -668,75 +667,57 @@ class EV2Gym(gym.Env):
             # Update energy flow breakdown for solar production
             self.energy_flow_breakdown['solar_production'][self.current_step] += tr.solar_power[self.current_step]
 
-        # Calculate total EV charging demand and grid draw
-        total_ev_charge_demand = 0
-        total_battery_discharge = 0
+        # Calculate total EV power (positive for charging, negative for discharging)
+        total_ev_power = 0
         
         for i, cs in enumerate(self.charging_stations):
             self.cs_power[cs.id, self.current_step] = cs.current_power_output
             self.cs_current[cs.id, self.current_step] = cs.current_total_amps
             
-            # Track EV charging demand (positive values are charging, negative are discharging)
-            if cs.current_power_output > 0:
-                total_ev_charge_demand += cs.current_power_output
-            elif cs.current_power_output < 0:
-                total_battery_discharge += abs(cs.current_power_output)
+            # Accumulate EV power directly
+            total_ev_power += cs.current_power_output
 
             for j in range(self.number_of_ports_per_cs):
                 if j < len(cs.evs_connected) and cs.evs_connected[j] is not None:
                     ev = cs.evs_connected[j]
-                    self.port_energy_level[j, i, self.current_step] = ev.current_capacity
-                    self.ev_location_data[j, i, self.current_step] = ev.location_state  # Track location state
                 else:
-                    self.port_energy_level[j, i, self.current_step] = 0
-                    self.ev_location_data[j, i, self.current_step] = -1  # -1 indicates no EV
+                    continue
 
-            for port in range(cs.n_ports):
                 if not self.lightweight_plots:
-                    self.port_current_signal[port, cs.id,
-                                             self.current_step] = cs.current_signal[port]
-                ev = cs.evs_connected[port]
-                if ev is not None and not self.lightweight_plots:
-                    # self.port_power[port, cs.id,
-                    #                 self.current_step] = ev.current_energy
-                    self.port_current[port, cs.id,
-                                      self.current_step] = ev.actual_current
+                    self.port_current_signal[j, cs.id,
+                                             self.current_step] = cs.current_signal[j]
 
-                    self.port_energy_level[port, cs.id,
-                                           self.current_step] = ev.get_soc()
+                self.port_energy_level[j, cs.id,
+                                       self.current_step] = ev.get_soc()
 
         # Departed EVs are no longer connected; their port data has already been
         # set to 0 above. We keep them only for high-level metrics, so skip
         # port-level array updates that rely on integer indices.
-        # (Previously this attempted to index using ev.id, causing IndexError.)
-        for ev in departing_evs:
-            pass  # placeholder for any future aggregate tracking
 
-        # Update energy flow breakdown components
-        self.energy_flow_breakdown['ev_charge_demand'][self.current_step] = total_ev_charge_demand
-        self.energy_flow_breakdown['battery_discharge'][self.current_step] = total_battery_discharge
+        # Update the energy flow breakdown for the current step
+        self.energy_flow_breakdown['grid_draw'][self.current_step] = self.current_power_usage[self.current_step]
+        self.energy_flow_breakdown['ev_power'][self.current_step] = total_ev_power
+
+        # Always calculate cost for the current step (for visualization and analysis)
+        timestep_hours = self.timescale / 60.0
         
-        # Grid draw is the net power usage minus solar production and battery discharge
-        self.energy_flow_breakdown['grid_draw'][self.current_step] = (
-            self.current_power_usage[self.current_step] - 
-            self.energy_flow_breakdown['solar_production'][self.current_step] + 
-            self.energy_flow_breakdown['battery_discharge'][self.current_step]
+        # Positive power is grid draw, negative is grid injection (from solar/battery)
+        grid_energy_kwh = self.energy_flow_breakdown['grid_draw'][self.current_step] * timestep_hours
+        
+        # For cost calculation, split ev_power into charging (positive) and discharging (negative)
+        ev_power = self.energy_flow_breakdown['ev_power'][self.current_step]
+        charging_kwh = max(0, ev_power) * timestep_hours
+        discharging_kwh = max(0, -ev_power) * timestep_hours
+        
+        grid_price = np.mean([self.charge_prices[cs.id, self.current_step] for cs in self.charging_stations])
+        discharge_price = np.mean([self.discharge_prices[cs.id, self.current_step] for cs in self.charging_stations])
+        
+        # Calculate cost: pay for grid energy and charging, get credit for discharging
+        self.cost_history[self.current_step] = (
+            grid_energy_kwh * grid_price +
+            charging_kwh * grid_price -
+            discharging_kwh * discharge_price
         )
-        
-        # Update cost history if we have prices available
-        if hasattr(self, 'charge_prices') and hasattr(self, 'discharge_prices'):
-            # Convert power (kW) to energy (kWh) for the timestep before calculating cost
-            timestep_hours = self.timescale / 60.0
-            grid_energy_kwh = self.energy_flow_breakdown['grid_draw'][self.current_step] * timestep_hours
-            battery_discharge_kwh = self.energy_flow_breakdown['battery_discharge'][self.current_step] * timestep_hours
-
-            grid_price = np.mean([self.charge_prices[cs.id, self.current_step] for cs in self.charging_stations])
-            discharge_price = np.mean([self.discharge_prices[cs.id, self.current_step] for cs in self.charging_stations])
-            
-            self.cost_history[self.current_step] = (
-                grid_energy_kwh * grid_price -
-                battery_discharge_kwh * discharge_price
-            )
 
     def _step_date(self):
         '''Steps the simulation date by one timestep'''
@@ -848,10 +829,10 @@ class EV2Gym(gym.Env):
                 if port_idx < len(cs.evs_connected) and cs.evs_connected[port_idx] is not None:
                     ev = cs.evs_connected[port_idx]
                     # Update location state (0=home, 1=work, 2=commuting)
-                    self.ev_location_data[port_idx, cs_idx, self.current_step] = ev.location_state
+                    self.ev_location_data[port_idx, cs_idx, self.current_step] = ev.location_state  # Track location state
                 else:
                     # No EV in this port
-                    self.ev_location_data[port_idx, cs_idx, self.current_step] = -1
+                    self.ev_location_data[port_idx, cs_idx, self.current_step] = -1  # -1 indicates no EV
 
     def _log_initial_state(self):
         """Logs the initial state of EVs in the environment if verbose is True."""
