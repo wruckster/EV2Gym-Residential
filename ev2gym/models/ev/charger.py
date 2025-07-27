@@ -159,6 +159,10 @@ class EV_Charger:
             if self.evs_connected[i] is None:
                 continue
 
+            # If EV is commuting, it cannot be charged/discharged
+            if self.evs_connected[i].location_state == 2:
+                continue
+
             if action > 0:
                 amps = action * self.max_charge_current
                 if amps < self.min_charge_current - 0.01:
