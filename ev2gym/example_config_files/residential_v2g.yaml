@@ -207,6 +207,7 @@ ev:
   min_time_of_stay: 180  # in minutes (3 hours typical home charging)
   min_emergency_battery_capacity: 15  # in kWh (safety buffer)
   desired_capacity: 0.8  # 80% target SOC for charging
+  commuting_consumption_kwh_km: 0.186 # kWh/km consumed during commuting
 
 ##############################################################################
 # Charging Station Specifications

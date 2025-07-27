@@ -65,6 +65,7 @@ class EV():
                  timescale=5,
                  metadata=None,  # Added metadata parameter for storing location type and plug-in status
                  location_state=0,  # Default to home charging station
+                 commuting_consumption_kwh_km=0.18, # Consumption per km
                  ):
 
         self.id = id
@@ -95,6 +96,7 @@ class EV():
 
         self.charge_efficiency = charge_efficiency
         self.discharge_efficiency = discharge_efficiency
+        self.commuting_consumption_kwh_km = commuting_consumption_kwh_km
 
         # Track location state (0=home, 1=work, 2=commuting)
         self.location_state = 0 if location_state == 0 else (1 if location_state == 1 else 2)
@@ -446,6 +448,14 @@ class EV():
             if self.max_energy_AFAP > self.battery_capacity:
                 self.max_energy_AFAP = self.battery_capacity
                 break
+
+    def drain_commuting_battery(self, distance_km: float):
+        """Drain battery when EV is commuting."""
+        if self.location_state == 2:  # Commuting
+            energy_consumed = self.commuting_consumption_kwh_km * distance_km
+            self.current_capacity -= energy_consumed
+            if self.current_capacity < 0:
+                self.current_capacity = 0
 
     def get_battery_degradation(self) -> Tuple[float, float]:
         '''

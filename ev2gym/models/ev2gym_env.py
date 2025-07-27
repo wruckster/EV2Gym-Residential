@@ -64,6 +64,8 @@ class EV2Gym(gym.Env):
         assert config_file is not None, "Please provide a config file!!!"
         self.config = yaml.load(open(config_file, 'r'), Loader=yaml.FullLoader)
 
+        self.ev_parameters = self.config.get('ev', {})
+
         self.generate_rnd_game = generate_rnd_game
         self.load_from_replay_path = load_from_replay_path
         self.empty_ports_at_end_of_simulation = empty_ports_at_end_of_simulation
@@ -470,6 +472,14 @@ class EV2Gym(gym.Env):
         # Reset the current number of EVs departed and arrived
         self.current_ev_departed = 0
         self.current_ev_arrived = 0
+
+        # Update EV states and drain battery for commuting EVs
+        for cs in self.charging_stations:
+            for ev in cs.evs_connected:
+                if ev is not None:
+                    ev.update_location_state(self.current_step)
+                    if ev.location_state == 2:  # If commuting
+                        ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
 
         # Reset power usage for this timestep to zero before processing charging stations
         self.current_power_usage[self.current_step] = 0.0
