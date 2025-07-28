@@ -152,6 +152,10 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 if abs_end > abs_start:
                     regular_blocks.append((abs_start, abs_end, loc, loc_type, energy, is_plugged_in))
             
+            # If no schedule blocks for this day, create a home block for the whole day
+            if not regular_blocks:
+                regular_blocks.append((step, step + steps_in_day, home_station, "home", 0.0, True))
+            
             # Process short trips (random trips during blocks)
             final_blocks = []
             for start, end, loc, loc_type, energy, is_plugged_in in regular_blocks:
@@ -160,7 +164,7 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                     # Find original block name by matching start time
                     # Reverse the offset calculation to find the original offset from midnight
                     original_start_ofs = (start - step) + start_offset_steps
-
+                    
                     blk_name = next((name for name, cfg in day_sched.items() 
                                      if _hm_to_offset(cfg["start_time"]) == original_start_ofs), None)
                     
@@ -251,18 +255,15 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
         for i, blk in enumerate(presence_blocks[:5]):
             print(f"DEBUG: Block {i}: location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}, start={blk.start_step}, end={blk.end_step}")
             
-        # Collect all plugged-in blocks (home/work) for this profile
-        plugged_blocks = [b for b in presence_blocks if b.is_plugged_in]
-
-        if not plugged_blocks:
-            continue  # nothing to generate
-
         # Create one EV profile per vehicle count, each with its own schedule.
         for _ in range(v_count):
             ev_id_counter += 1
 
-            first_block = plugged_blocks[0]
-            last_block = plugged_blocks[-1]
+            if not presence_blocks:
+                continue # Skip if no blocks were generated for this profile
+
+            first_block = presence_blocks[0]
+            last_block = presence_blocks[-1]
 
             # If the first block starts before the simulation, set start time to 0.
             if first_block.start_step < 0:
@@ -298,21 +299,28 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 charge_efficiency=ev_spec["charge_efficiency"],
                 discharge_efficiency=ev_spec["discharge_efficiency"],
                 timescale=timestep_minutes,
-                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in plugged_blocks]},
+                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in presence_blocks]},
                 location_state=0 if first_block.location_type == "home" else 1,
             )
 
-            # Build full transition list: for each consecutive block pair, add depart & arrive.
-            for idx, blk in enumerate(plugged_blocks[:-1]):
-                next_blk = plugged_blocks[idx + 1]
-                # end of current block -> commuting
-                ev_profile.add_schedule_transition(blk.end_step, 2)
-                # start of next block -> new location state (home=0, work=1)
-                new_state = 0 if next_blk.location_type == "home" else 1
+            # Build full transition list from the detailed presence_blocks.
+            ev_profile.clear_schedule_transitions() # Clear any default transitions
+            for idx, blk in enumerate(presence_blocks[:-1]):
+                next_blk = presence_blocks[idx + 1]
+                # At the end of any block, a transition occurs.
+                # The new state is determined by the type of the *next* block.
+                if next_blk.location_type == "home":
+                    new_state = 0
+                elif next_blk.location_type == "work":
+                    new_state = 1
+                else: # away
+                    new_state = 2 # Commuting/Away
+
+                # The transition happens at the start of the next block.
                 ev_profile.add_schedule_transition(next_blk.start_step, new_state)
 
             # Extend overall availability so EV object exists until after final block
-            ev_profile.time_of_departure = last_block.end_step
+            ev_profile.time_of_departure = presence_blocks[-1].end_step
 
             all_ev_profiles.append(ev_profile)
 

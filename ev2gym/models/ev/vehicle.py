@@ -548,6 +548,10 @@ class EV():
         self._schedule_transitions.append((timestep, new_state))
         self._schedule_transitions.sort()  # Keep sorted by timestep
 
+    def clear_schedule_transitions(self):
+        """Clear all scheduled transitions."""
+        self._schedule_transitions = []
+
     def update_location_state(self, current_step: int):
         """Update location state based on schedule transitions."""
         while self._schedule_transitions and self._schedule_transitions[0][0] <= current_step:
