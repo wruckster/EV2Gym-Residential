@@ -191,10 +191,14 @@ class Transformer():
         '''
         if env.config['solar_power']['include']:
             mult = env.config['solar_power']['solar_power_capacity_multiplier_mean']
-            mult = env.tr_rng.normal(mult, 0.1)
+            # mult = env.tr_rng.normal(mult, 0.1)
 
+        # check the mean of solar power
             # Solar power is negated as it's generation.
-            self.solar_power = -self.solar_power * mult
+            if self.solar_power.mean() < 0:
+                self.solar_power = self.solar_power * mult
+            else:
+                self.solar_power = -self.solar_power * mult
 
             # Conditionally scale to max power if the flag is true
             if env.config['solar_power'].get('scale_to_max_power', True):
@@ -226,7 +230,7 @@ class Transformer():
 
         if env.config['inflexible_loads']['include']:
             mult = env.config['inflexible_loads']['inflexible_loads_capacity_multiplier_mean']
-            mult = env.tr_rng.normal(mult, 0.1)
+            # mult = env.tr_rng.normal(mult, 0.1)
 
             self.inflexible_load = self.inflexible_load * mult
 
@@ -246,7 +250,7 @@ class Transformer():
                 elif self.inflexible_load[j] < self.min_power[j]:
                     self.inflexible_load[j] = self.min_power[j]
 
-        self.generate_inflexible_loads_forecast(env)
+        # self.generate_inflexible_loads_forecast(env)
 
     def generate_inflexible_loads_forecast(self, env) -> None:
         '''
@@ -282,7 +286,11 @@ class Transformer():
     def step(self, amps, power) -> None:
         '''
         Update current power of the transformer
+        Args:
+            amps: Additional amperage from EVs
+            power: Additional power from EVs
         '''
+        # Track EV contribution separately
         self.current_amps += amps
         self.current_power += power
 

@@ -193,7 +193,25 @@ def main(config_path: str):
     dist_fn = None
     if isinstance(env.action_space, gym.spaces.Box):
         def dist_fn_wrapper(x):
-            return torch.distributions.Normal(loc=x[0], scale=x[1])
+            """Return an Independent Normal so that log_prob is scalar per sample."""
+            mean, std = x  # unpack first
+            # Ensure leading batch dimension exists when batch size == 1
+            if mean.dim() == 1:
+                mean = mean.unsqueeze(0)
+                std = std.unsqueeze(0)
+            
+            # Replace NaNs/Infs to keep distribution valid
+            if torch.isnan(mean).any() or torch.isinf(mean).any():
+                logging.warning("NaNs or Infs detected in action mean – replacing with zeros.")
+                mean = torch.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            if torch.isnan(std).any() or torch.isinf(std).any() or (std <= 0).any():
+                logging.warning("Invalid std detected (NaN/Inf/<=0) – applying fallback clamp.")
+                std = torch.nan_to_num(std, nan=1.0, posinf=7.0, neginf=1e-3)
+                std = torch.clamp(std, min=1e-3, max=7.0)
+            normal = torch.distributions.Normal(mean, std)
+            return torch.distributions.Independent(normal, 1)
+        
         dist_fn = dist_fn_wrapper
 
     # Get policy args from config
@@ -240,7 +258,7 @@ def main(config_path: str):
     try:
         logging.info("Starting training...")
         result = trainer.run()
-        logging.info(f"Finished training: {result}")
+        logging.info(f"\n\n!!!CELEBRATE!!!!\n\nFinished training: {result}\n\n")
 
     except KeyboardInterrupt:
         logging.warning("Training interrupted by user.")
@@ -287,13 +305,18 @@ def main(config_path: str):
             collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
             logging.info(f"Evaluation complete: {collect_result}")
             
-            # Log episode details
-            unwrapped_env = eval_env.unwrapped
-            logging.info(f"Episode completed at step {unwrapped_env.current_step}/{unwrapped_env.simulation_length}")
-            logging.info(f"Total EVs spawned: {unwrapped_env.total_evs_spawned}")
-            logging.info(f"Episode done: {unwrapped_env.done}")
+            # Log episode details from the single environment inside the vector env
+            # Since we have only one environment, we can get its attributes by indexing at 0
+            current_step = eval_collector.env.get_env_attr('current_step')[0]
+            sim_length = eval_collector.env.get_env_attr('simulation_length')[0]
+            evs_spawned = eval_collector.env.get_env_attr('total_evs_spawned')[0]
+            is_done = eval_collector.env.get_env_attr('done')[0]
 
-            eval_env.close()  # Ensure replay file is saved
+            logging.info(f"Episode completed at step {current_step}/{sim_length}")
+            logging.info(f"Total EVs spawned: {evs_spawned}")
+            logging.info(f"Episode done: {is_done}")
+
+            eval_collector.env.close()  # This will call close on the underlying environment
 
             # Generate plots from the replay files
             if os.path.exists(eval_replay_path):
@@ -333,11 +356,19 @@ def main(config_path: str):
                     plot_type="details",
                 )
 
-                # EV-city rich multi-panel plot
+                # # EV-city rich multi-panel plot
+                # evaluator_plot.plot_from_replay(
+                #     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                #     save_path=os.path.join(run_dir, "evaluation_city.png"),
+                #     plot_type="city",
+                # )
+
+                # EV trajectory plot
                 evaluator_plot.plot_from_replay(
                     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                    save_path=os.path.join(run_dir, "evaluation_city.png"),
-                    plot_type="city",
+                    save_path=os.path.join(run_dir, "evaluation_replays.png"),
+                    labels=["Evaluation"],
+                    plot_type="replays",
                 )
 
         except Exception as e:

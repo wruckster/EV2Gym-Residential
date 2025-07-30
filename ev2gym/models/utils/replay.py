@@ -45,6 +45,24 @@ class EvCityReplay():
             self.tr_solar_power = env.tr_solar_power
         if hasattr(env, 'port_energy_level'):
             self.port_energy_level = env.port_energy_level
+            
+        # Add EV location data for plug-in status visualization
+        if hasattr(env, 'ev_location_data'):
+            self.ev_location_data = env.ev_location_data
+
+        # Add detailed energy and cost data for residential plotting
+        if hasattr(env, 'energy_flow_breakdown'):
+            self.energy_flow_breakdown = env.energy_flow_breakdown
+        if hasattr(env, 'cost_history'):
+            self.cost_history = env.cost_history
+
+        # Add location tracking arrays
+        self.location_states = {
+            -1: 'No EV',
+            0: 'Home',
+            1: 'Work',
+            2: 'Commuting'
+        }
 
         self.transformers = env.transformers
         self.charging_stations = env.charging_stations
@@ -158,8 +176,18 @@ class EvCityReplay():
                                                 self.sim_length])  # max energy of ev when only charging
 
         for i, ev in enumerate(env.EVs):
-            port = ev.id
-            cs_id = ev.location
+            cs_id = ev.location  # charging station id
+
+            # Determine the port index this EV was connected to at its charging station.
+            port = 0  # fallback if not found
+            if 0 <= cs_id < len(env.charging_stations):
+                cs = env.charging_stations[cs_id]
+                if ev in cs.evs_connected:
+                    port = cs.evs_connected.index(ev)
+            # Ensure port does not exceed max_n_ports
+            if port >= self.max_n_ports:
+                continue  # skip EVs assigned to non-existent port index
+
             t_arr = ev.time_of_arrival
             original_t_dep = ev.time_of_departure
             # print(f'EV {i} is at port {port} of CS {cs_id} from {t_arr} to {original_t_dep}')            
@@ -186,16 +214,22 @@ class EvCityReplay():
                                    t_arr] = ev.battery_capacity_at_arrival
             self.ev_arrival[port, cs_id, t_arr] = 1
             if original_t_dep < self.sim_length:
+                # Safe index within bounds
                 self.t_dep[port, cs_id, t_dep] = 1            
-                if ev.prev_capacity < ev.battery_capacity:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.prev_capacity #-5
-                else:
-                    self.max_energy_at_departure[port, cs_id, t_dep] = ev.battery_capacity
+                idx_safe = t_dep
             else:
+                # EV departs after simulation ends; record at last in-bounds step
                 self.t_dep[port, cs_id, t_dep-1] = 1                            
-                self.max_energy_at_departure[port, cs_id, t_dep-1] = ev.prev_capacity
-            
-            self.ev_des_energy[port, cs_id, t_dep] = ev.desired_capacity
+                idx_safe = t_dep - 1
+
+            # max energy at departure
+            if ev.prev_capacity < ev.battery_capacity:
+                self.max_energy_at_departure[port, cs_id, idx_safe] = ev.prev_capacity
+            else:
+                self.max_energy_at_departure[port, cs_id, idx_safe] = ev.battery_capacity
+
+            # desired energy at departure
+            self.ev_des_energy[port, cs_id, idx_safe] = ev.desired_capacity
 
         # print(f'u: {self.u}')
         # print(f'ev_arrival: {self.ev_arrival}')
@@ -204,3 +238,59 @@ class EvCityReplay():
         # print(f'ev_max_energy: {self.ev_max_energy}')
         # print(f'ev_max_ch_power: {self.ev_max_ch_power}')
         # print(f'ev_max_dis_power: {self.ev_max_dis_power}')
+
+    def save(self):
+        '''Save the replay data to a pickle file'''
+        data = {
+            'sim_name': self.sim_name,
+            'sim_length': self.sim_length,
+            'n_cs': self.n_cs,
+            'max_n_ports': self.max_n_ports,
+            'current_power_usage': self.current_power_usage,
+            'port_energy_level': self.port_energy_level,
+            'tr_solar_power': self.tr_solar_power,
+            'cs_power': self.cs_power,
+            'cs_current': self.cs_current,
+            'ev_location_data': self.ev_location_data,  # Add location data
+            'location_states': self.location_states,  # Add state mapping
+            'transformers': self.transformers,
+            'charging_stations': self.charging_stations,
+            'EVs': self.EVs,
+            'unstirred_EVs': self.unstirred_EVs,
+            'unstirred_stats': self.unstirred_stats,
+            'optimal_EVs': self.optimal_EVs,
+            'optimal_stats': self.optimal_stats,
+            'power_setpoints': self.power_setpoints,
+            'scenario': self.scenario,
+            'heterogeneous_specs': self.heterogeneous_specs,
+            'simulate_grid': self.simulate_grid,
+            'charge_prices': self.charge_prices,
+            'discharge_prices': self.discharge_prices,
+            'tra_max_amps': self.tra_max_amps,
+            'tra_min_amps': self.tra_min_amps,
+            'port_max_charge_current': self.port_max_charge_current,
+            'port_min_charge_current': self.port_min_charge_current,
+            'port_max_discharge_current': self.port_max_discharge_current,
+            'port_min_discharge_current': self.port_min_discharge_current,
+            'voltages': self.voltages,
+            'phases': self.phases,
+            'cs_ch_efficiency': self.cs_ch_efficiency,
+            'cs_dis_efficiency': self.cs_dis_efficiency,
+            'cs_transformer': self.cs_transformer,
+            'ev_max_energy': self.ev_max_energy,
+            'ev_min_energy': self.ev_min_energy,
+            'ev_max_ch_power': self.ev_max_ch_power,
+            'ev_max_dis_power': self.ev_max_dis_power,
+            'u': self.u,
+            'energy_at_arrival': self.energy_at_arrival,
+            'ev_arrival': self.ev_arrival,
+            't_dep': self.t_dep,
+            'ev_des_energy': self.ev_des_energy,
+            'max_energy_at_departure': self.max_energy_at_departure,
+            'energy_flow_breakdown': self.energy_flow_breakdown,
+            'cost_history': self.cost_history,
+            'reward_history': self.reward_history,
+        }
+        import pickle
+        with open(self.replay_path, 'wb') as f:
+            pickle.dump(data, f)

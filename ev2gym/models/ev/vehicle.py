@@ -63,11 +63,17 @@ class EV():
                  charge_efficiency=1, # can be a list of charge efficiencies for different current levels
                  discharge_efficiency=1, # can be a list of discharge efficiencies for different current levels
                  timescale=5,
+                 metadata=None,  # Added metadata parameter for storing location type and plug-in status
+                 location_state=0,  # Default to home charging station
+                 commuting_consumption_kwh_km=0.18, # Consumption per km
                  ):
 
         self.id = id
         self.location = location
         self.timescale = timescale
+        
+        # Store metadata for enhanced scheduling and plug-in status tracking
+        self.metadata = metadata if metadata is not None else {}
 
         # EV simulation characteristics
         self.time_of_arrival = time_of_arrival
@@ -90,6 +96,11 @@ class EV():
 
         self.charge_efficiency = charge_efficiency
         self.discharge_efficiency = discharge_efficiency
+        self.commuting_consumption_kwh_km = commuting_consumption_kwh_km
+
+        # Track location state (0=home, 1=work, 2=commuting)
+        self.location_state = 0 if location_state == 0 else (1 if location_state == 1 else 2)
+        self._schedule_transitions = []  # List of (timestep, new_state) tuples
 
         # EV status
         self.current_capacity = battery_capacity_at_arrival  # kWh
@@ -289,7 +300,6 @@ class EV():
         else:
             charge_efficiency = self.charge_efficiency
         
-        
         assert charge_efficiency > 0, f'charge_efficiency: {charge_efficiency}'
         
         pilot_dsoc = charge_efficiency * pilot * voltage / 1000 / \
@@ -439,6 +449,14 @@ class EV():
                 self.max_energy_AFAP = self.battery_capacity
                 break
 
+    def drain_commuting_battery(self, distance_km: float):
+        """Drain battery when EV is commuting."""
+        if self.location_state == 2:  # Commuting
+            energy_consumed = self.commuting_consumption_kwh_km * distance_km
+            self.current_capacity -= energy_consumed
+            if self.current_capacity < 0:
+                self.current_capacity = 0
+
     def get_battery_degradation(self) -> Tuple[float, float]:
         '''
         A function that returns the capacity loss of the EV.
@@ -519,3 +537,23 @@ class EV():
         self.cyclic_loss = d_cyc
 
         return d_cal, d_cyc
+
+    def add_schedule_transition(self, timestep: int, new_state: int):
+        """Add a scheduled location state transition.
+        
+        Args:
+            timestep: When the transition should occur
+            new_state: New location state (0=home, 1=work, 2=commuting)
+        """
+        self._schedule_transitions.append((timestep, new_state))
+        self._schedule_transitions.sort()  # Keep sorted by timestep
+
+    def clear_schedule_transitions(self):
+        """Clear all scheduled transitions."""
+        self._schedule_transitions = []
+
+    def update_location_state(self, current_step: int):
+        """Update location state based on schedule transitions."""
+        while self._schedule_transitions and self._schedule_transitions[0][0] <= current_step:
+            _, new_state = self._schedule_transitions.pop(0)
+            self.location_state = new_state

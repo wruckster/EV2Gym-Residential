@@ -62,6 +62,16 @@ def get_statistics(env) -> Dict:
         energy_user_satisfaction[i] = (e_actual / e_max) * 100
         total_steps_min_emergency_battery_capacity_violation += ev.min_emergency_battery_capacity_metric
 
+    # Add safety checks for empty arrays
+    if len(energy_user_satisfaction) == 0:
+        mean_energy_user_satisfaction = 0.0
+        std_energy_user_satisfaction = 0.0
+        min_energy_user_satisfaction = 0.0
+    else:
+        mean_energy_user_satisfaction = np.mean(energy_user_satisfaction)
+        std_energy_user_satisfaction = np.std(energy_user_satisfaction)
+        min_energy_user_satisfaction = np.min(energy_user_satisfaction)
+
     stats = {'total_ev_served': total_ev_served,
              'total_profits': total_profits,
              'total_energy_charged': total_energy_charged,
@@ -70,9 +80,9 @@ def get_statistics(env) -> Dict:
              'power_tracker_violation': power_tracker_violation,
              'tracking_error': tracking_error,
              'energy_tracking_error': energy_tracking_error,
-             'energy_user_satisfaction': np.mean(energy_user_satisfaction),
-             'std_energy_user_satisfaction': np.std(energy_user_satisfaction),
-             'min_energy_user_satisfaction': np.min(energy_user_satisfaction),
+             'energy_user_satisfaction': mean_energy_user_satisfaction,
+             'std_energy_user_satisfaction': std_energy_user_satisfaction,
+             'min_energy_user_satisfaction': min_energy_user_satisfaction,
              'total_steps_min_emergency_battery_capacity_violation': total_steps_min_emergency_battery_capacity_violation,
              'total_transformer_overload': total_transformer_overload,
              'battery_degradation': battery_degradation,
@@ -269,47 +279,28 @@ def spawn_single_EV(env,
                   location=cs_id,
                   battery_capacity_at_arrival=initial_battery_capacity,
                   max_ac_charge_power=env.ev_specs[sampled_ev]["max_ac_charge_power"],
+                  min_ac_charge_power=env.ev_specs[sampled_ev]["min_ac_charge_power"],
                   max_dc_charge_power=env.ev_specs[sampled_ev]["max_dc_charge_power"],
-                  max_discharge_power=-
-                  env.ev_specs[sampled_ev]["max_dc_discharge_power"],
-                  min_emergency_battery_capacity=min_emergency_battery_capacity,
+                  max_discharge_power=env.ev_specs[sampled_ev]["max_discharge_power"],
+                  min_discharge_power=env.ev_specs[sampled_ev]["min_discharge_power"],
+                  battery_capacity=env.ev_specs[sampled_ev]["battery_capacity"],
+                  time_of_arrival=step,
+                  time_of_departure=step + int(time_of_stay),
+                  desired_capacity=env.ev_specs[sampled_ev]["battery_capacity"],
                   charge_efficiency=charge_efficiency,
                   discharge_efficiency=discharge_efficiency,
-
-                  transition_soc=np.round(0.9 -
-                                          (np.random.rand()+0.00001)/5, 3),  # [0.7-0.9]
+                  min_emergency_battery_capacity=min_emergency_battery_capacity,
                   transition_soc_multiplier=transition_soc_multiplier,
-                  battery_capacity=battery_capacity,
-                  desired_capacity=env.config["ev"]['desired_capacity'] *
-                  battery_capacity,
-                  time_of_arrival=step+1,
-                  time_of_departure=int(
-                      time_of_stay + step + 3),
-                  ev_phases=3,
-                  timescale=env.timescale,
+                  **env.ev_parameters
                   )
+
     else:
         return EV(id=port,
                   location=cs_id,
                   battery_capacity_at_arrival=initial_battery_capacity,
-                  battery_capacity=battery_capacity,
-                  desired_capacity=env.config["ev"]['desired_capacity'] *
-                  battery_capacity,
-                  min_emergency_battery_capacity=min_emergency_battery_capacity,
-                  max_ac_charge_power=env.config["ev"]['max_ac_charge_power'],
-                  min_ac_charge_power=env.config["ev"]['min_ac_charge_power'],
-                  max_dc_charge_power=env.config["ev"]['max_dc_charge_power'],
-                  max_discharge_power=env.config["ev"]['max_discharge_power'],
-                  min_discharge_power=env.config["ev"]['min_discharge_power'],
-                  time_of_arrival=step+1,
-                  time_of_departure=int(
-                      time_of_stay + step + 3),
-                  ev_phases=env.config["ev"]['ev_phases'],
-                  transition_soc=env.config["ev"]['transition_soc'],
-                  transition_soc_multiplier=transition_soc_multiplier,
-                  charge_efficiency=env.config["ev"]['charge_efficiency'],
-                  discharge_efficiency=env.config["ev"]['discharge_efficiency'],
-                  timescale=env.timescale,
+                  time_of_arrival=step,
+                  time_of_departure=step + int(time_of_stay),
+                  **env.ev_parameters
                   )
 
 
