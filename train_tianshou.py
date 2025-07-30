@@ -258,7 +258,7 @@ def main(config_path: str):
     try:
         logging.info("Starting training...")
         result = trainer.run()
-        logging.info(f"Finished training: {result}")
+        logging.info(f"\n\n!!!CELEBRATE!!!!\n\nFinished training: {result}\n\n")
 
     except KeyboardInterrupt:
         logging.warning("Training interrupted by user.")
@@ -305,13 +305,18 @@ def main(config_path: str):
             collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
             logging.info(f"Evaluation complete: {collect_result}")
             
-            # Log episode details
-            unwrapped_env = eval_env.unwrapped
-            logging.info(f"Episode completed at step {unwrapped_env.current_step}/{unwrapped_env.simulation_length}")
-            logging.info(f"Total EVs spawned: {unwrapped_env.total_evs_spawned}")
-            logging.info(f"Episode done: {unwrapped_env.done}")
+            # Log episode details from the single environment inside the vector env
+            # Since we have only one environment, we can get its attributes by indexing at 0
+            current_step = eval_collector.env.get_env_attr('current_step')[0]
+            sim_length = eval_collector.env.get_env_attr('simulation_length')[0]
+            evs_spawned = eval_collector.env.get_env_attr('total_evs_spawned')[0]
+            is_done = eval_collector.env.get_env_attr('done')[0]
 
-            eval_env.close()  # Ensure replay file is saved
+            logging.info(f"Episode completed at step {current_step}/{sim_length}")
+            logging.info(f"Total EVs spawned: {evs_spawned}")
+            logging.info(f"Episode done: {is_done}")
+
+            eval_collector.env.close()  # This will call close on the underlying environment
 
             # Generate plots from the replay files
             if os.path.exists(eval_replay_path):
@@ -351,11 +356,19 @@ def main(config_path: str):
                     plot_type="details",
                 )
 
-                # EV-city rich multi-panel plot
+                # # EV-city rich multi-panel plot
+                # evaluator_plot.plot_from_replay(
+                #     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
+                #     save_path=os.path.join(run_dir, "evaluation_city.png"),
+                #     plot_type="city",
+                # )
+
+                # EV trajectory plot
                 evaluator_plot.plot_from_replay(
                     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                    save_path=os.path.join(run_dir, "evaluation_city.png"),
-                    plot_type="city",
+                    save_path=os.path.join(run_dir, "evaluation_replays.png"),
+                    labels=["Evaluation"],
+                    plot_type="replays",
                 )
 
         except Exception as e:

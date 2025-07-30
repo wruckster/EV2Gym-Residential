@@ -559,7 +559,7 @@ class EV2Gym(gym.Env):
         self._step_date()
         self.timestamps.append(self.sim_date)
 
-        if self.current_step < self.simulation_length:
+        if self.current_step < self.simulation_length - 1:
             self.charge_power_potential[self.current_step] = calculate_charge_power_potential(
                 self)
 
@@ -627,17 +627,8 @@ class EV2Gym(gym.Env):
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
 
-        # Determine if the episode is done
-        done = self.current_step >= self.simulation_length
-        if done and self.verbose:
-            print(f"Episode done: {self.done}")
-            print(f"Total EVs spawned: {self.total_evs_spawned}")
-            print(f"Episode done: {self.done}")
-
-        self.done = done
-
-        # Return the observation, reward, done flag, and info dictionary
-        return self._get_observation(), reward, self.done, False, info
+        # Check termination conditions and return the appropriate values
+        return self._check_termination(reward, info)
 
     def render(self):
         '''Renders the simulation'''
@@ -764,7 +755,7 @@ class EV2Gym(gym.Env):
                     action_mask[i*cs.n_ports + j] = 1
 
         # Check if the episode is done or any constraint is violated
-        if self.current_step >= self.simulation_length or \
+        if self.current_step >= self.simulation_length - 1 or \
             (any(tr.is_overloaded() > 0 for tr in self.transformers)
              and not self.generate_rnd_game):
             """Terminate if:

@@ -549,7 +549,7 @@ def _plot_ev_city(replay, save_path):
     # Generate plots
     for i in range(sim_len):
         dt = start_dt + _dt.timedelta(minutes=timescale * i)
-        _ev_city_plot(replay, dt, save_path=f"{save_path}_{i:03d}.png", lightweight_plots=False)
+        _plot_details(replay, save_path=f"{save_path}_{i:03d}.png")
 
 
 # ----------------------------------------------------------------------
