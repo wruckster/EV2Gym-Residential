@@ -107,6 +107,14 @@ def main(config_path: str):
                 plot_type="details",
             )
 
+            # Replays plot
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_replays.png"),
+                labels=["Evaluation"],
+                plot_type="replays",
+            )
+
             return
             
         except Exception as e:

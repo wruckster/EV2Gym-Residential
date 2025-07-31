@@ -190,7 +190,7 @@ def _plot_main(replays, labels, save_path):
 
     # 4.2 EV Trajectory
     ax2 = fig.add_subplot(grid[0, 1])
-    _plot_ev_trajectory(ax2, replays[0], np.arange(len(replays[0].reward_history)))
+    plot_ev_trajectories(replays[0], ax2)
 
     # 4.3 Total EVs parked
     ax3 = fig.add_subplot(grid[1, 0])
@@ -233,7 +233,7 @@ def _plot_replays(replays, labels, save_path):
     """Generate the 4-panel residential simulation plot."""
     plt.close("all")
     plt.style.use("seaborn-v0_8")
-    fig = plt.figure(figsize=(12, 12))  
+    fig = plt.figure(figsize=(20, 12))  
 
     # ------------------------------------------------------------------
     # 3. Extract data series from replays
@@ -278,7 +278,7 @@ def _plot_replays(replays, labels, save_path):
     # ------------------------------------------------------------------
     # 4. Create subplots
     # ------------------------------------------------------------------
-    grid = plt.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
+    grid = plt.GridSpec(3, 1, figure=fig, hspace=0.6)
 
     # Extract a common time_steps array for plotting
     time_steps = np.arange(len(replays[0].reward_history))
@@ -287,27 +287,23 @@ def _plot_replays(replays, labels, save_path):
     ax1 = fig.add_subplot(grid[0, 0])
     _plot_energy_flow_breakdown(ax1, replays[0], time_steps)
 
-    # 4.2 EV SoC vs. Price
-    ax2 = fig.add_subplot(grid[0, 1])
-    _plot_ev_soc_vs_price(ax2, replays[0], time_steps)
+    # 4.2 Consolidated EV Details Plot
+    ax2 = fig.add_subplot(grid[1, 0])
+    _plot_ev_details(ax2, replays[0], time_steps)
 
-    # 4.3 EV Trajectory (SoC and Location)
-    ax3 = fig.add_subplot(grid[1, 0])
-    _plot_ev_trajectory(ax3, replays[0], time_steps)
-
-    # 4.4 Cumulative Reward/Cost
-    ax4 = fig.add_subplot(grid[1, 1])
-    _plot_cumulative_reward_cost(ax4, replays[0], time_steps)
+    # 4.3 Cumulative Reward/Cost
+    ax3 = fig.add_subplot(grid[2, 0])
+    _plot_cumulative_reward_cost(ax3, replays[0], time_steps)
 
     # Apply step + datetime formatter to all time-series axes
-    for ax in [ax1, ax2, ax3, ax4]:
+    for ax in [ax1, ax2, ax3]:
         _apply_time_formatter(ax, replays[0])
 
     # ------------------------------------------------------------------
     # 5. Finalize and save
     # ------------------------------------------------------------------
     fig.suptitle('Residential Simulation Evaluation', fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=120)
@@ -736,55 +732,6 @@ def _plot_energy_flow_breakdown(ax, replay, time_steps):
         ax.text(0.5, 0.5, 'Energy flow data not available in replay.', 
                 horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
 
-def _plot_ev_soc_vs_price(ax, replay, time_steps):
-    # Plot average EV SoC on the primary y-axis
-    if hasattr(replay, 'port_energy_level') and replay.port_energy_level.size > 0:
-        soc_data = replay.port_energy_level[:, :, :len(time_steps)]
-        
-        # Mask out zero values to only average over active ports
-        masked_soc = np.ma.masked_equal(soc_data, 0)
-        avg_soc = np.ma.mean(masked_soc, axis=(0, 1)).filled(0) # Use masked mean
-
-        # Convert SoC from ratio (0-1) to percentage (0-100)
-        ax.plot(time_steps, avg_soc * 100, 'b-', label='Average EV SoC')
-        ax.set_ylabel("SoC [%]", color='b')
-        ax.tick_params(axis='y', labelcolor='b')
-        ax.set_ylim(0, 100)  # Update y-axis limits to match percentage scale
-    
-    # Plot EV power (charging/discharging) on the secondary y-axis
-    ax2 = ax.twinx()
-    if hasattr(replay, 'energy_flow_breakdown'):
-        # New convention: use 'ev_power'
-        if 'ev_power' in replay.energy_flow_breakdown:
-            ev_power = np.array(replay.energy_flow_breakdown['ev_power'][:len(time_steps)])
-            charging = np.where(ev_power > 0, ev_power, 0)
-            discharging = np.where(ev_power < 0, ev_power, 0)
-
-            ax2.bar(time_steps, charging, width=1.0, color='lightblue', label='EV Charging', alpha=0.6, align='edge')
-            ax2.bar(time_steps, discharging, width=1.0, color='green', label='Battery Discharge', alpha=0.6, align='edge')
-
-        # Backward compatibility for old replay files
-        elif 'battery_discharge' in replay.energy_flow_breakdown and 'ev_charge_demand' in replay.energy_flow_breakdown:
-            battery_discharge = replay.energy_flow_breakdown['battery_discharge'][:len(time_steps)]
-            ev_charge_demand = replay.energy_flow_breakdown['ev_charge_demand'][:len(time_steps)]
-            
-            ax2.bar(time_steps, ev_charge_demand, width=1.0, color='lightblue', label='EV Charging', alpha=0.6, align='edge')
-            ax2.bar(time_steps, -np.array(battery_discharge), width=1.0, color='green', label='Battery Discharge', alpha=0.6, align='edge')
-
-        ax2.set_ylabel("Power [kW]", color='darkgreen')
-        ax2.tick_params(axis='y', labelcolor='darkgreen')
-        
-    ax.set_title("EV SoC & Energy Flows")
-    ax.set_xlabel("Timestep")
-    ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
-    
-    # Combine legends
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    
-    ax.grid(True, which="both", ls=":", lw=0.5)
-
 def _plot_cumulative_reward_cost(ax, replay, time_steps):
     # Plot cumulative reward and cost on separate y-axes for clarity
     sim_steps = len(time_steps)
@@ -871,69 +818,64 @@ def plot_ev_trajectories(replay_data, ax=None):
     
     return ax
 
-
-def _plot_ev_trajectory(ax, replay, time_steps):
-    """Plot EV SoC and location trajectory.
-    
-    Priority of data sources:
-    1. `ev_soc` and `ev_locations` arrays if they exist (legacy / explicit tracking)
-    2. Derive from `port_energy_level` and `ev_location_data` which are always
-       present in residential simulations. We use port 0 of charging station 0
-       as a proxy for the "first EV". This keeps the plot informative even if
-       detailed per-EV arrays were not saved.
-    """
+def _plot_ev_details(ax, replay, time_steps):
+    """Plot consolidated EV details: SoC, power, and location."""
     sim_steps = len(time_steps)
-
-    if hasattr(replay, 'ev_soc') and hasattr(replay, 'ev_locations') and replay.ev_soc.shape[1] > 0:
-        ev_soc = replay.ev_soc[:sim_steps, 0] * 100  # percentage
-        locations = replay.ev_locations[:sim_steps, 0]
-    elif hasattr(replay, 'port_energy_level') and hasattr(replay, 'ev_location_data'):
-        # Use port 0 @ CS 0 as representative trajectory
-        soc_raw = replay.port_energy_level[0, 0, :sim_steps]
-        max_cap = np.nanmax(soc_raw) if np.nanmax(soc_raw) > 0 else 1.0
-        ev_soc = (soc_raw / max_cap) * 100  # normalise to percentage
-        locations = replay.ev_location_data[0, 0, :sim_steps]
-    else:
-        ax.text(0.5, 0.5, 'EV Trajectory data not available in replay.',
-                horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
-        ax.set_title("EV Trajectory: SoC & Location")
-        return
- 
-    # Plot location bars
-    ax_loc = ax.twinx()
-    ax_loc.set_ylim(0, 1)
-    ax_loc.set_yticks([]) # Hide y-ticks for the location axis
-
-    # Define location colors and labels
-    location_map = {
-        0: {'label': 'Home', 'color': '#AAAAAA'},
-        1: {'label': 'Work', 'color': '#CCCCCC'},
-        2: {'label': 'Driving', 'color': '#666666'}
-    }
-
-    # Plot location bars
-    for loc_id, props in location_map.items():
-        ax_loc.fill_between(time_steps, 0, 1, where=(locations == loc_id),
-                             color=props['color'], alpha=0.6, label=props['label'], step='mid')
-
-    # Plot SoC line on the primary axis
-    ax.plot(time_steps, ev_soc, label='EV SoC', color='#007ACC')
-    ax.set_ylabel('State of Charge (%)')
-    ax.set_zorder(ax_loc.get_zorder() + 1)  # Bring ax to the front
-    ax.patch.set_alpha(0)  # Make ax background transparent
-
-    # Set plot titles and labels
-    ax.set_title("EV Trajectory: SoC & Location")
+    ax.set_title("EV Details: SoC, Power & Location")
     ax.set_xlabel("Timestep")
     ax.tick_params(axis='x', labelrotation=30, which='major', length=5, labelsize=8)
 
-   # Combine legends from both axes
+    # 1. Plot Location Bars (Background)
+    ax_loc = ax.twinx()
+    ax_loc.set_ylim(0, 1)
+    ax_loc.set_yticks([])
+    location_map = {
+        0: {'label': 'Home', 'color': '#DDDDDD'},
+        1: {'label': 'Work', 'color': '#AAAAAA'},
+        2: {'label': 'Driving', 'color': '#666666'}
+    }
+    if hasattr(replay, 'ev_location_data'):
+        locations = replay.ev_location_data[0, 0, :sim_steps]
+        for loc_id, props in location_map.items():
+            ax_loc.fill_between(time_steps, 0, 1, where=(locations == loc_id),
+                                color=props['color'], alpha=0.6, label=props['label'], step='mid')
+
+    # 2. Plot SoC on Primary Axis (Left)
+    ax.set_ylabel("State of Charge (%)", color='b')
+    ax.tick_params(axis='y', labelcolor='b')
+    ax.set_ylim(0, 100)
+    ax.set_zorder(ax_loc.get_zorder() + 1)
+    ax.patch.set_alpha(0)
+
+    # Average SoC
+    if hasattr(replay, 'port_energy_level') and replay.port_energy_level.size > 0:
+        soc_data = replay.port_energy_level[:, :, :len(time_steps)]
+        masked_soc = np.ma.masked_equal(soc_data, 0)
+        avg_soc = np.ma.mean(masked_soc, axis=(0, 1)).filled(0)
+        ax.plot(time_steps, avg_soc * 100, 'b-', label='Average SoC', alpha=0.8)
+
+    # Individual EV SoC Trajectory
+    if hasattr(replay, 'port_energy_level'):
+        soc_raw = replay.port_energy_level[0, 0, :sim_steps]
+        max_cap = np.nanmax(soc_raw) if np.nanmax(soc_raw) > 0 else 1.0
+        ev_soc = (soc_raw / max_cap) * 100
+        ax.plot(time_steps, ev_soc, label='EV-1 SoC', color='#007ACC', linestyle='--')
+
+    # 3. Plot Power on Secondary Axis (Right)
+    ax_power = ax.twinx()
+    if hasattr(replay, 'energy_flow_breakdown') and 'ev_power' in replay.energy_flow_breakdown:
+        ev_power = np.array(replay.energy_flow_breakdown['ev_power'][:len(time_steps)])
+        charging = np.where(ev_power > 0, ev_power, 0)
+        discharging = np.where(ev_power < 0, ev_power, 0)
+        ax_power.bar(time_steps, charging, width=1.0, color='lightblue', label='EV Charging', alpha=0.6, align='edge')
+        ax_power.bar(time_steps, discharging, width=1.0, color='green', label='V2G Discharge', alpha=0.6, align='edge')
+    ax_power.set_ylabel("Power [kW]", color='darkgreen')
+    ax_power.tick_params(axis='y', labelcolor='darkgreen')
+
+    # 4. Combine Legends
     lines, labels = ax.get_legend_handles_labels()
     patches, patch_labels = ax_loc.get_legend_handles_labels()
-    legend = ax.legend(lines + patches, labels + patch_labels, loc='best', fancybox=True, shadow=True)
-    frame = legend.get_frame()
-    frame.set_facecolor('white')
-    frame.set_edgecolor('#CCCCCC')
-    frame.set_alpha(0.95)
-    frame.set_linewidth(0.8)
-    ax.grid(True, which="both", ls=":", lw=0.5, zorder=0) # Draw grid behind everything
+    bars, bar_labels = ax_power.get_legend_handles_labels()
+    ax.legend(lines + bars + patches, labels + bar_labels + patch_labels, loc='upper left', fancybox=True, shadow=True, fontsize='small')
+
+    ax.grid(True, which="both", ls=":", lw=0.5, zorder=0)
