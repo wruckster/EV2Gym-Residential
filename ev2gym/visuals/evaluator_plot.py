@@ -847,19 +847,10 @@ def _plot_ev_details(ax, replay, time_steps):
     ax.set_zorder(ax_loc.get_zorder() + 1)
     ax.patch.set_alpha(0)
 
-    # Average SoC
-    if hasattr(replay, 'port_energy_level') and replay.port_energy_level.size > 0:
-        soc_data = replay.port_energy_level[:, :, :len(time_steps)]
-        masked_soc = np.ma.masked_equal(soc_data, 0)
-        avg_soc = np.ma.mean(masked_soc, axis=(0, 1)).filled(0)
-        ax.plot(time_steps, avg_soc * 100, 'b-', label='Average SoC', alpha=0.8)
-
     # Individual EV SoC Trajectory
     if hasattr(replay, 'port_energy_level'):
-        soc_raw = replay.port_energy_level[0, 0, :sim_steps]
-        max_cap = np.nanmax(soc_raw) if np.nanmax(soc_raw) > 0 else 1.0
-        ev_soc = (soc_raw / max_cap) * 100
-        ax.plot(time_steps, ev_soc, label='EV-1 SoC', color='#007ACC', linestyle='--')
+        soc_raw = replay.port_energy_level[0, 0, :sim_steps] * 100
+        ax.plot(time_steps, soc_raw, label='EV-1 SoC', color='#007ACC', linestyle='--')
 
     # 3. Plot Power on Secondary Axis (Right)
     ax_power = ax.twinx()
