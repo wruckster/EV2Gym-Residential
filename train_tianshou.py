@@ -364,14 +364,6 @@ def main(config_path: str):
                     plot_type="details",
                 )
 
-                # # EV-city rich multi-panel plot
-                # evaluator_plot.plot_from_replay(
-                #     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                #     save_path=os.path.join(run_dir, "evaluation_city.png"),
-                #     plot_type="city",
-                # )
-
-                # EV trajectory plot
                 evaluator_plot.plot_from_replay(
                     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
                     save_path=os.path.join(run_dir, "evaluation_replays.png"),

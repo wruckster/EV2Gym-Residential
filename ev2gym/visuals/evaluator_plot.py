@@ -698,14 +698,19 @@ def _plot_ev_status(replay, save_path):
 # ----------------------------------------------------------------------
 
 def _plot_energy_flow_breakdown(ax, replay, time_steps):
-    # Plot energy flow breakdown - simplified to show only grid draw and solar production
+    # Plot energy flow breakdown - show inflexible load as bars, grid draw as line, solar as bars
     if hasattr(replay, 'energy_flow_breakdown'):
-        # Plot grid draw and solar production as contiguous bars
-        grid_vals = replay.energy_flow_breakdown['grid_draw'][:len(time_steps)]
+        # Get series
+        inflexible_vals = replay.energy_flow_breakdown['inflexible_load'][:len(time_steps)]
         solar_vals = replay.energy_flow_breakdown['solar_production'][:len(time_steps)]
+        grid_vals = replay.energy_flow_breakdown['grid_draw'][:len(time_steps)]
         
-        ax.bar(time_steps, grid_vals, width=1.0, color='red', label='Grid Draw', alpha=0.6, align='edge')
-        ax.bar(time_steps, solar_vals, width=1.0, color='orange', label='Solar Production', alpha=0.6, align='edge')
+        # Plot inflexible load and solar as bars
+        ax.bar(time_steps, inflexible_vals, width=1.0, color='orange', label='Inflexible Load', alpha=0.6, align='edge')
+        ax.bar(time_steps, solar_vals, width=1.0, color='yellow', label='Solar Production', alpha=0.6, align='edge')
+        
+        # Plot grid draw as line
+        ax.plot(time_steps, grid_vals, color='red', label='Grid Draw', linewidth=0.6, alpha=0.8)
         
         ax.set_title("Energy Flow & Price")
         ax.set_xlabel("Timestep")
@@ -716,9 +721,8 @@ def _plot_energy_flow_breakdown(ax, replay, time_steps):
         # Add energy price as a line plot on secondary y-axis
         ax2 = ax.twinx()
         if hasattr(replay, 'charge_prices') and replay.charge_prices.shape[0] > 0:
-            # Use average price across charging stations
             avg_prices = np.mean(replay.charge_prices, axis=0)[:len(time_steps)]
-            ax2.plot(time_steps, avg_prices, 'g-', linewidth=2, label='Energy Price', alpha=0.8)
+            ax2.plot(time_steps, avg_prices, 'g-', linewidth=1, label='Energy Price', alpha=0.8)
             ax2.set_ylabel("Price [$/kWh]", color='green')
             ax2.tick_params(axis='y', labelcolor='green')
         
