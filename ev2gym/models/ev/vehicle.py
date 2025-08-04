@@ -286,6 +286,15 @@ class EV():
 
         """
 
+        # Enforce desired_capacity: do not charge above this value
+        if self.current_capacity >= self.desired_capacity:
+            # Already at or above target, do not charge
+            self.current_energy = 0
+            return 0
+
+        # Compute the maximum allowable charge for this step
+        max_charge_this_step = self.desired_capacity - self.current_capacity
+
         pilot = amps
         voltage = voltage * math.sqrt(phases)
         period = self.timescale
@@ -354,6 +363,12 @@ class EV():
                 curr_soc = new_soc
 
         dsoc = curr_soc - self.get_soc()
+        # Cap dsoc so that we do not exceed desired_capacity
+        max_dsoc_allowed = max_charge_this_step / self.battery_capacity
+        if dsoc > max_dsoc_allowed:
+            dsoc = max_dsoc_allowed
+            curr_soc = self.get_soc() + dsoc
+
         self.prev_capacity = self.current_capacity
         self.current_capacity = curr_soc * self.battery_capacity
 

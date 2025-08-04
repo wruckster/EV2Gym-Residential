@@ -418,6 +418,8 @@ class EV2Gym(gym.Env):
             'grid_draw': np.zeros(self.simulation_length, dtype=np.float32),
             'solar_production': np.zeros(self.simulation_length, dtype=np.float32),
             'ev_power': np.zeros(self.simulation_length, dtype=np.float32),
+            'inflexible_load': np.zeros(self.simulation_length, dtype=np.float32), 
+
         }
         self.cost_history = np.zeros(self.simulation_length, dtype=np.float32)
 
@@ -696,6 +698,10 @@ class EV2Gym(gym.Env):
         # port-level array updates that rely on integer indices.
 
         # Update the energy flow breakdown for the current step
+        # Sum inflexible loads for this timestep
+        self.energy_flow_breakdown['inflexible_load'][self.current_step] = sum(
+            tr.inflexible_load[self.current_step] for tr in self.transformers
+        )
         self.energy_flow_breakdown['grid_draw'][self.current_step] = self.current_power_usage[self.current_step]
         self.energy_flow_breakdown['ev_power'][self.current_step] = total_ev_power
 

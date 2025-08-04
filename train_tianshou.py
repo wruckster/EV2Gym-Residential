@@ -107,6 +107,14 @@ def main(config_path: str):
                 plot_type="details",
             )
 
+            # Replays plot
+            evaluator_plot.plot_from_replay(
+                [latest_replay],
+                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_replays.png"),
+                labels=["Evaluation"],
+                plot_type="replays",
+            )
+
             return
             
         except Exception as e:
@@ -356,14 +364,6 @@ def main(config_path: str):
                     plot_type="details",
                 )
 
-                # # EV-city rich multi-panel plot
-                # evaluator_plot.plot_from_replay(
-                #     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                #     save_path=os.path.join(run_dir, "evaluation_city.png"),
-                #     plot_type="city",
-                # )
-
-                # EV trajectory plot
                 evaluator_plot.plot_from_replay(
                     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
                     save_path=os.path.join(run_dir, "evaluation_replays.png"),
