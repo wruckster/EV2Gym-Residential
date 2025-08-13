@@ -60,9 +60,10 @@ class EV2Gym(gym.Env):
         if verbose:
             print(f'Initializing EV2Gym environment...')
 
-        # read yaml config file
+        # read yaml config file (ensure file is closed and use safe loader)
         assert config_file is not None, "Please provide a config file!!!"
-        self.config = yaml.load(open(config_file, 'r'), Loader=yaml.FullLoader)
+        with open(config_file, 'r', encoding='utf-8') as f:
+            self.config = yaml.safe_load(f)
 
         self.ev_parameters = self.config.get('ev', {})
 

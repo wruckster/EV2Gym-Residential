@@ -396,16 +396,39 @@ def main(config_path: str):
 
             # Sanitize advantages/returns to avoid propagating non-finite values into update
             try:
-                for field in ("adv", "returns"):
-                    if hasattr(processed, field):
-                        tensor = getattr(processed, field)
-                        if isinstance(tensor, torch.Tensor):
-                            if torch.logical_not(torch.isfinite(tensor)).any():
-                                n_bad = int(torch.logical_not(torch.isfinite(tensor)).sum().item())
-                                logging.warning(f"[PPO-Batch] Sanitizing non-finite {field} in processed batch: {n_bad} bad values")
-                                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e6, neginf=-1e6)
-                            tensor = torch.clamp(tensor, -1e6, 1e6)
-                            setattr(processed, field, tensor)
+                # 1) Robust advantage normalization using only finite entries
+                if hasattr(processed, "adv") and isinstance(processed.adv, torch.Tensor):
+                    adv = processed.adv
+                    finite_mask = torch.isfinite(adv)
+                    n_total = adv.numel()
+                    n_finite = int(finite_mask.sum().item())
+                    if n_finite > 0:
+                        mean = adv[finite_mask].mean()
+                        std = adv[finite_mask].std(unbiased=False)
+                        eps = torch.tensor(1e-8, dtype=adv.dtype, device=adv.device)
+                        norm = (adv - mean) / torch.clamp(std, min=eps)
+                        # Replace non-finite results of normalization with 0
+                        norm = torch.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
+                        adv = torch.clamp(norm, -1e6, 1e6)
+                        processed.adv = adv
+                        if n_finite < n_total:
+                            logging.warning(
+                                f"[PPO-Batch] adv normalized with finite subset: {n_finite}/{n_total} finite"
+                            )
+                    else:
+                        logging.warning("[PPO-Batch] adv has 0 finite entries; zeroing out adv")
+                        processed.adv = torch.zeros_like(adv)
+
+                # 2) Ensure returns are finite and clamped
+                if hasattr(processed, "returns") and isinstance(processed.returns, torch.Tensor):
+                    ret = processed.returns
+                    if torch.logical_not(torch.isfinite(ret)).any():
+                        n_bad = int((~torch.isfinite(ret)).sum().item())
+                        logging.warning(
+                            f"[PPO-Batch] Sanitizing non-finite returns in processed batch: {n_bad} bad values"
+                        )
+                        ret = torch.nan_to_num(ret, nan=0.0, posinf=1e6, neginf=-1e6)
+                    processed.returns = torch.clamp(ret, -1e6, 1e6)
             except Exception as e:
                 logging.warning(f"[PPO-Batch] Failed to sanitize adv/returns: {e}")
 
