@@ -25,9 +25,10 @@ from tianshou.utils import TensorboardLogger
 
 # --- EV2Gym Core Imports ---
 from ev2gym.models.ev2gym_env import EV2Gym
-from ev2gym.rl_agent import state, reward, cost, action_wrappers, noise_wrappers
+from ev2gym.rl_agent import state, reward, cost, action_wrappers, noise_wrappers, monitor_wrappers
 from ev2gym.rl_agent.networks import PolicyNet
 from ev2gym.visuals import evaluator_plot
+from ev2gym.rl_agent.monitor_wrappers import ActionMonitor
 
 # --- Utility Functions ---
 def get_component(module: Any, component_name: str) -> Optional[Callable]:
@@ -153,6 +154,72 @@ def main(config_path: str):
     verbosity = env_params['is_verbose']
     logging.info(f"-> State: {rl_params.get('state_function', 'Default')}, Reward: {rl_params.get('reward_function', 'Default')}, Action Wrapper: {env_params.get('action_wrapper', 'None')}")
 
+    # --- 3.5 Configure Logging Handlers (file + console) and capture warnings ---
+    try:
+        import warnings as _warnings
+        # Ensure we have a file handler to run_dir/training.log
+        root_logger = logging.getLogger()
+        has_file = any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
+        if not has_file:
+            log_path = os.path.join(run_dir, "training.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            fh = logging.FileHandler(log_path)
+            fh.setLevel(logging.DEBUG)
+            fmt = logging.Formatter(fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            fh.setFormatter(fmt)
+            root_logger.addHandler(fh)
+        # Ensure a console/stream handler exists (useful if not redirected)
+        has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root_logger.handlers)
+        if not has_stream:
+            sh = logging.StreamHandler()
+            sh.setLevel(logging.INFO)
+            sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            root_logger.addHandler(sh)
+        root_logger.setLevel(logging.INFO)
+        # Route Python warnings (including numpy RuntimeWarning) into logging
+        logging.captureWarnings(True)
+        _warnings.filterwarnings("default")
+        logging.info(f"Logging configured. File: {os.path.join(run_dir, 'training.log')}")
+    except Exception:
+        pass
+
+    # Monkey-patch PPOPolicy at class level to ensure our inspection runs even if trainer bypasses instance attributes
+    try:
+        if not hasattr(PPOPolicy, "_class_update_wrapped"):
+            PPOPolicy._orig_update = PPOPolicy.update  # type: ignore[attr-defined]
+
+            def _class_wrapped_update(self, *args, **kwargs):  # type: ignore[no-redef]
+                batch = None
+                if len(args) >= 2:
+                    batch = args[1]
+                elif "batch" in kwargs:
+                    batch = kwargs["batch"]
+                logging.info("[PPO-Batch] (class) update() called. Has batch: %s", str(batch is not None))
+                if batch is not None:
+                    _inspect_batch_tensors("batch", batch)
+                return PPOPolicy._orig_update(self, *args, **kwargs)  # type: ignore[attr-defined]
+
+            PPOPolicy.update = _class_wrapped_update  # type: ignore[method-assign]
+            PPOPolicy._class_update_wrapped = True  # type: ignore[attr-defined]
+            logging.info("[PPO-Batch] Class-level update() inspection ENABLED.")
+
+        if not hasattr(PPOPolicy, "_class_process_wrapped"):
+            PPOPolicy._orig_process = PPOPolicy.process_fn  # type: ignore[attr-defined]
+
+            def _class_wrapped_process(self, batch, buffer, indices):  # type: ignore[no-redef]
+                try:
+                    logging.info("[PPO-Batch] (class) process_fn() inspecting batch...")
+                    _inspect_batch_tensors("batch", batch)
+                except Exception as e:
+                    logging.warning(f"[PPO-Batch] (class) process_fn inspect failed: {e}")
+                return PPOPolicy._orig_process(self, batch, buffer, indices)  # type: ignore[attr-defined]
+
+            PPOPolicy.process_fn = _class_wrapped_process  # type: ignore[method-assign]
+            PPOPolicy._class_process_wrapped = True  # type: ignore[attr-defined]
+            logging.info("[PPO-Batch] Class-level process_fn() inspection ENABLED.")
+    except Exception:
+        logging.warning("[PPO-Batch] Failed to enable class-level monkey patches.")
+
     # --- 4. Create Vectorized Environments ---
     logging.info("Creating vectorized environments...")
     
@@ -160,7 +227,7 @@ def main(config_path: str):
     replay_dir = os.path.join(run_dir, "replay_files")
     os.makedirs(replay_dir, exist_ok=True)
     
-    def make_env(seed_offset: int = 0):
+    def make_env(seed_offset: int = 0, role: str = "train"):
         def _init():
             env = EV2Gym(
                 config_file=env_params.get('config_file'),
@@ -168,21 +235,31 @@ def main(config_path: str):
                 reward_function=reward_fn,
                 cost_function=cost_fn,
                 verbose=verbosity,
-                save_plots=False, # Plots handled by this script
-                replay_save_path=replay_dir
+                save_plots=False,
+                replay_save_path=replay_dir,
             )
             if action_wrapper_cls:
                 env = action_wrapper_cls(env)
             if noise_wrapper_cls:
                 env = noise_wrapper_cls(env)
+
+            # Attach ActionMonitor
+            if role == "train":
+                # Don’t write CSV for every worker; keep it lightweight
+                env = ActionMonitor(env, log_every_n_steps=0, write_csv_path=None)
+            else:
+                # Write a single CSV for eval to the run directory
+                eval_csv = os.path.join(run_dir, "eval_actions.csv")
+                env = ActionMonitor(env, log_every_n_steps=50, write_csv_path=eval_csv)
+
             env.reset(seed=exp_params.get('seed', 42) + seed_offset)
             return env
         return _init
 
     training_num = rl_params.get('training_num', 4)
     test_num = rl_params.get('test_num', 1)
-    train_envs = DummyVectorEnv([make_env(seed_offset=i) for i in range(training_num)])
-    test_envs = DummyVectorEnv([make_env(seed_offset=i + training_num) for i in range(test_num)])
+    train_envs = DummyVectorEnv([make_env(seed_offset=i, role="train") for i in range(training_num)])
+    test_envs = DummyVectorEnv([make_env(seed_offset=i + training_num, role="test") for i in range(test_num)])
     logging.info(f"-> {training_num} training environments and {test_num} testing environments created.")
 
     # --- 5. Instantiate Policy and Network ---
@@ -215,8 +292,8 @@ def main(config_path: str):
             
             if torch.isnan(std).any() or torch.isinf(std).any() or (std <= 0).any():
                 logging.warning("Invalid std detected (NaN/Inf/<=0) – applying fallback clamp.")
-                std = torch.nan_to_num(std, nan=1.0, posinf=7.0, neginf=1e-3)
-                std = torch.clamp(std, min=1e-3, max=7.0)
+                std = torch.nan_to_num(std, nan=1.0, posinf=7.0, neginf=0.05)
+                std = torch.clamp(std, min=0.05, max=7.0)
             normal = torch.distributions.Normal(mean, std)
             return torch.distributions.Independent(normal, 1)
         
@@ -235,6 +312,108 @@ def main(config_path: str):
         **policy_args
     )
     logging.info("PPO policy created successfully.")
+
+    # --- 5.1 Instrument PPO update with pre-batch finiteness checks ---
+    def _inspect_batch_tensors(name_prefix: str, obj: Any) -> None:
+        """Recursively inspect a tianshou Batch/dict/list/tuple for non-finite tensors."""
+        # try:
+        #     import torch
+        #     import numpy as np
+        # except Exception:
+        #     return
+
+        def _log_stats(label: str, arr) -> None:
+            try:
+                if isinstance(arr, np.ndarray):
+                    a = arr
+                elif isinstance(arr, torch.Tensor):
+                    a = arr.detach().cpu().numpy()
+                else:
+                    return
+                if a.size == 0:
+                    return
+                finite = np.isfinite(a)
+                if not finite.all():
+                    n_total = a.size
+                    n_bad = int((~finite).sum())
+                    max_abs = float(np.nanmax(np.abs(a))) if n_bad < n_total else float('nan')
+                    logging.warning(f"[PPO-Batch] Non-finite values in {label}: bad={n_bad}/{n_total}, max_abs={max_abs:.3e}")
+            except Exception:
+                pass
+
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _inspect_batch_tensors(f"{name_prefix}.{k}" if name_prefix else str(k), v)
+        else:
+            # Try tianshou Batch API
+            try:
+                keys = list(obj.keys())  # type: ignore[attr-defined]
+                for k in keys:
+                    v = obj[k]
+                    _inspect_batch_tensors(f"{name_prefix}.{k}" if name_prefix else str(k), v)
+                return
+            except Exception:
+                pass
+
+            if isinstance(obj, (list, tuple)):
+                for i, v in enumerate(obj):
+                    _inspect_batch_tensors(f"{name_prefix}[{i}]", v)
+            else:
+                _log_stats(name_prefix or "batch", obj)
+
+    if not hasattr(policy, "_update_wrapped"):
+        _orig_update = policy.update
+
+        def _wrapped_update(*args, **kwargs):
+            # Tianshou calls update(self, sample_size, batch)
+            batch = None
+            if len(args) >= 2:
+                batch = args[1]
+            elif "batch" in kwargs:
+                batch = kwargs["batch"]
+            logging.info("[PPO-Batch] update() called. Has batch: %s", str(batch is not None))
+            if batch is not None:
+                logging.info("[PPO-Batch] Inspecting batch before update...")
+                _inspect_batch_tensors("batch", batch)
+            return _orig_update(*args, **kwargs)
+
+        policy.update = _wrapped_update  # type: ignore[assignment]
+        policy._update_wrapped = True  # type: ignore[attr-defined]
+        logging.info("[PPO-Batch] Pre-update batch inspection ENABLED.")
+
+    # Additionally, wrap process_fn to reliably access the training batch
+    if not hasattr(policy, "_process_wrapped") and hasattr(policy, "process_fn"):
+        _orig_process = policy.process_fn
+
+        def _wrapped_process(batch, buffer, indices):  # type: ignore[override]
+            try:
+                logging.info("[PPO-Batch] process_fn() inspecting batch...")
+                _inspect_batch_tensors("batch", batch)
+            except Exception as e:
+                logging.warning(f"[PPO-Batch] process_fn inspect failed: {e}")
+
+            processed = _orig_process(batch, buffer, indices)
+
+            # Sanitize advantages/returns to avoid propagating non-finite values into update
+            try:
+                for field in ("adv", "returns"):
+                    if hasattr(processed, field):
+                        tensor = getattr(processed, field)
+                        if isinstance(tensor, torch.Tensor):
+                            if torch.logical_not(torch.isfinite(tensor)).any():
+                                n_bad = int(torch.logical_not(torch.isfinite(tensor)).sum().item())
+                                logging.warning(f"[PPO-Batch] Sanitizing non-finite {field} in processed batch: {n_bad} bad values")
+                                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e6, neginf=-1e6)
+                            tensor = torch.clamp(tensor, -1e6, 1e6)
+                            setattr(processed, field, tensor)
+            except Exception as e:
+                logging.warning(f"[PPO-Batch] Failed to sanitize adv/returns: {e}")
+
+            return processed
+
+        policy.process_fn = _wrapped_process  # type: ignore[assignment]
+        policy._process_wrapped = True  # type: ignore[attr-defined]
+        logging.info("[PPO-Batch] process_fn batch inspection ENABLED.")
 
     # --- 6. Setup Collectors ---
     train_collector = Collector(

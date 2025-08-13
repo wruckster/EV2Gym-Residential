@@ -264,20 +264,41 @@ class Rescale_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
         Returns:
             numpy array: Rescaled actions in the interval (min_action, 1) for each corresponding action.
         """
-        actions = np.array(actions)  # Ensure actions is a numpy array
-        min_action = np.array(min_action)  # Ensure min_action is a numpy array
+        import warnings
+        actions = np.array(actions, dtype=float)  # Ensure actions is a numpy array
+        min_action = np.array(min_action, dtype=float)  # Ensure min_action is a numpy array
         if len(actions) != len(min_action):
             raise ValueError(
                 "actions and min_action must be of the same length")
 
+        # Sanitize inputs
+        if not np.all(np.isfinite(actions)):
+            warnings.warn("Non-finite values in actions before rescale; applying nan_to_num.")
+            actions = np.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=0.0)
+        if not np.all(np.isfinite(min_action)):
+            warnings.warn("Non-finite values in min_action; applying nan_to_num.")
+            min_action = np.nan_to_num(min_action, nan=0.0, posinf=0.99, neginf=-1.0)
+
+        # Constrain inputs to reasonable ranges to avoid pathological values
+        actions = np.clip(actions, -1.0, 1.0)
+        # min_action may be negative when V2G is allowed; cap to [-1, 0.99]
+        min_action = np.clip(min_action, -1.0, 0.99)
+
         # Apply the rescaling transformation element-wise
         rescaled_actions = actions * (1 - min_action) + min_action
+
+        # Final sanitation
+        if not np.all(np.isfinite(rescaled_actions)):
+            warnings.warn("Non-finite values after rescale; applying nan_to_num and clipping.")
+            rescaled_actions = np.nan_to_num(rescaled_actions, nan=0.0, posinf=1.0, neginf=-1.0)
+        rescaled_actions = np.clip(rescaled_actions, -1.0, 1.0)
         return rescaled_actions
 
     def action(self, action: np.ndarray) -> np.ndarray:
 
         # this function returns the action list based on the round robin algorithm
 
+        import warnings
         # in W
         power_setpoint = self.env.power_setpoints[self.env.current_step]
 
@@ -291,8 +312,17 @@ class Rescale_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
             print(
                 f' min action:     { [round(a, 2) for a in self.min_action]}')
 
+        # Input sanitation
+        if not np.all(np.isfinite(action)):
+            warnings.warn("Non-finite action input to Rescale_RepairLayer.action(); applying nan_to_num.")
+            action = np.nan_to_num(np.asarray(action, dtype=float), nan=0.0, posinf=1.0, neginf=-1.0)
         # rescaled actions
         action = self.rescale_actions(action, self.min_action)
+        # Ensure finiteness
+        if not np.all(np.isfinite(action)):
+            warnings.warn("Non-finite action after rescale; applying nan_to_num and clipping.")
+            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+        action = np.clip(action, -1.0, 1.0)
 
         if self.verbose:
             print(f'Rescaled actions:{[round(a, 2) for a in action]}')

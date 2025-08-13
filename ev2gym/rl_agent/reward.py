@@ -2,6 +2,7 @@
 '''
 
 import math
+import warnings
 
 def SquaredTrackingErrorReward(env,*args):
     '''This reward function is the squared tracking error that uses the minimum of the power setpoints and the charge power potential
@@ -82,7 +83,11 @@ def profit_maximization(env, total_costs, user_satisfaction_list, *args):
     for score in user_satisfaction_list:
         # reward -= 100 * (1 - score)
         reward -= 100 * math.exp(-10*score)
-    
+
+    # Numerical safety: ensure finite reward
+    if not math.isfinite(reward):
+        warnings.warn("Non-finite reward detected in profit_maximization; replacing with 0.0")
+        reward = 0.0
     return reward
 
 

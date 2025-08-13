@@ -139,14 +139,7 @@ class EV_Charger:
                 actions[i] = 0
                 invalid_action_punishment += 1
 
-        # normalize actions to sum to 1 for charging surplass or -1 for discharging surplass
-        if sum(actions) > 1:
-            normalized_actions = [action / sum(actions) for action in actions]
-        elif sum(actions) < -1:
-            normalized_actions = [- action /
-                                  sum(actions) for action in actions]
-        else:
-            normalized_actions = actions
+        normalized_actions = actions
 
         if self.verbose:
             print(f'CS {self.id} normalized actions: {normalized_actions}')
@@ -168,9 +161,11 @@ class EV_Charger:
                 if amps < self.min_charge_current - 0.01:
                     amps = 0
             elif action < 0:
+                # V2G is enabled, allow discharging
                 amps = action * abs(self.max_discharge_current)
+                # Clip to zero if the action is too small to avoid non-linear jumps
                 if amps > self.min_discharge_current - 0.01:
-                    amps = self.min_discharge_current
+                    amps = 0
 
             actual_energy, actual_amps = self.evs_connected[i].step(
                 amps,
@@ -258,10 +253,20 @@ class EV_Charger:
         '''Adds an EV to the list of EVs connected to the EV charger
         Inputs:
             - ev: the EV to be added to the list of EVs connected to the EV charger
+        Returns:
+            - index (int): The port index where the EV was spawned.
+            - None: If the charger is full and the EV could not be spawned.
         '''
-        assert (self.n_evs_connected < self.n_ports)
+        if self.n_evs_connected >= self.n_ports:
+            return None
 
-        index = self.evs_connected.index(None)
+        try:
+            index = self.evs_connected.index(None)
+        except ValueError:
+            # This case should not be reached if n_evs_connected is accurate,
+            # but as a safeguard, we handle it.
+            return None
+
         # Do not modify ev.id - it should be unique and assigned by the environment
         self.evs_connected[index] = ev
         self.n_evs_connected += 1

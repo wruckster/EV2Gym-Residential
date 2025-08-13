@@ -215,7 +215,7 @@ ev:
 charging_station:
   min_charge_current: 6  # Amperes (minimum current for Level 2 charging)
   max_charge_current: 45  # Amperes (11 kW @ 240V)
-  min_discharge_current: 0  # Amperes (actual value <=0)
+  min_discharge_current: -6  # Amperes (must be non-zero to enable V2G)
   max_discharge_current: -45  # Amperes (11 kW @ 240V, negative for discharge)
   voltage: 240  # Single-phase voltage for residential
   phases: 1  # Most residential chargers are single-phase

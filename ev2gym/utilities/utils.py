@@ -18,9 +18,14 @@ def get_statistics(env) -> Dict:
         [cs.total_energy_charged for cs in env.charging_stations]).sum()
     total_energy_discharged = np.array(
         [cs.total_energy_discharged for cs in env.charging_stations]).sum()
-    average_user_satisfaction = np.array(
-        [cs.get_avg_user_satisfaction() for cs in env.charging_stations
-         if cs.total_evs_served > 0]).mean()
+    _aus_list = [
+        cs.get_avg_user_satisfaction() for cs in env.charging_stations
+        if cs.total_evs_served > 0
+    ]
+    if len(_aus_list) == 0:
+        average_user_satisfaction = 0.0
+    else:
+        average_user_satisfaction = float(np.mean(np.asarray(_aus_list, dtype=float)))
 
     # get transformer overload from env.tr_overload
     total_transformer_overload = np.array(env.tr_overload).sum()

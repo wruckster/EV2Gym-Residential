@@ -121,6 +121,7 @@ class EV2Gym(gym.Env):
             self.number_of_ports_per_cs = self.replay.max_n_ports
             self.scenario = self.replay.scenario
             self.heterogeneous_specs = self.replay.heterogeneous_specs
+            self.charging_stations = load_ev_charger_profiles(self)
 
         else:
             assert cs is not None, "Please provide the number of charging stations"
@@ -228,7 +229,8 @@ class EV2Gym(gym.Env):
             tr.reset(step=0)
 
         # Instantiate Charging Stations
-        self.charging_stations = load_ev_charger_profiles(self)
+        if load_from_replay_path is None:
+            self.charging_stations = load_ev_charger_profiles(self)
         for cs in self.charging_stations:
             cs.reset()
 
@@ -531,24 +533,35 @@ class EV2Gym(gym.Env):
 
         # Spawn EVs
         counter = self.total_evs_spawned
+        
         for i, ev in enumerate(self.EVs_profiles[counter:]):
-            if ev.time_of_arrival == self.current_step + 1:
+            if ev.time_of_arrival == self.current_step:
                 ev = deepcopy(ev)
                 ev.reset()
                 ev.simulation_length = self.simulation_length
                 
                 # Spawn the new EV at its designated charging station
                 cs_index = ev.location
-                if 0 <= cs_index < len(self.charging_stations):
-                    self.charging_stations[cs_index].spawn_ev(ev)
-                    self.total_evs_spawned += 1
-                    self.current_ev_arrived += 1
-                    self.EVs.append(ev)
-
+                if 0 <= cs_index < len(self.charging_stations):     # verifies that the EV is assigned to a valid charging station
+                    target_cs = self.charging_stations[cs_index]
+                    # Only connect if EV isn't already connected somewhere else
+                    if (target_cs.n_evs_connected < target_cs.n_ports and 
+                        ev.id not in [ev.id for ev in self.EVs]):
+                        spawn_result = target_cs.spawn_ev(ev)
+                        if spawn_result is not None:  # Spawn successful
+                            self.EVs.append(ev)
+                            self.total_evs_spawned += 1
+                            self.current_ev_arrived += 1
+                        else:
+                            if self.verbose:
+                                print(f"⚠️ EV {ev.id} could not spawn at station {cs_index}: charger is full.")
+                    else:
+                        if self.verbose:
+                            print(f"⚠️ EV {ev.id} could not spawn at station {cs_index}: charger is full.")
                 else:
                     print(f"Warning: EV {ev.id} has invalid location {cs_index} and was not spawned.")
 
-            elif ev.time_of_arrival > self.current_step + 1:
+            elif ev.time_of_arrival > self.current_step:
                 break
 
         # Update EV location states based on schedule transitions
@@ -617,19 +630,12 @@ class EV2Gym(gym.Env):
                     else:
                         self.port_energy_level[j, i, self.current_step] = 0
 
-            # --- DEBUGGING PRINTS ---
-            if self.verbose and self.current_step % 10 == 0: # Print every 10 steps
-                print(f"\n\n--- Step {self.current_step} Data: at {self.sim_date} ---")
-                print(f"Power Usage: {self.current_power_usage[self.current_step]}")
-                print(f"PV Generation: {np.sum(self.tr_solar_power[:, self.current_step])}")
-                soc_mean = np.mean(self.port_energy_level[:, :, self.current_step][self.port_energy_level[:, :, self.current_step] > 0]) if np.any(self.port_energy_level[:, :, self.current_step] > 0) else 0
-                print(f"Mean SoC: {soc_mean}")
-                print("---------------------")
-
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
 
         # Check termination conditions and return the appropriate values
+        obs = self._get_observation()
+        
         return self._check_termination(reward, info)
 
     def render(self):
@@ -733,9 +739,6 @@ class EV2Gym(gym.Env):
 
     def _get_observation(self):
         obs = self.state_function(self)
-        if np.isnan(obs).any():
-            print("!!! WARNING: NaN detected in observation !!!")
-            print(obs)
         return obs
 
     def _calculate_reward(self, total_costs, user_satisfaction_list, invalid_action_punishment):
@@ -743,9 +746,6 @@ class EV2Gym(gym.Env):
 
         reward = self.reward_function(
             self, total_costs, user_satisfaction_list, invalid_action_punishment)
-        if np.isnan(reward):
-            print("!!! WARNING: NaN detected in reward !!!")
-            print(f"Reward: {reward}")
         self.total_reward += reward
 
         return reward
@@ -857,9 +857,16 @@ class EV2Gym(gym.Env):
         # Track which EVs have already been connected to avoid duplicates
         connected_evs = set()
         
+        # Get IDs of EVs already in the system to avoid duplicates
+        existing_ev_ids = {ev.id for ev in self.EVs}
+        
         for ev_profile in self.EVs_profiles:
             # Check if this EV should spawn at current step
             if ev_profile.time_of_arrival == self.current_step:
+                # Skip if this EV is already spawned
+                if ev_profile.id in existing_ev_ids:
+                    continue
+                    
                 # Use deepcopy to create a new EV instance from the profile
                 new_ev = deepcopy(ev_profile)
                 new_ev.reset()
@@ -872,11 +879,16 @@ class EV2Gym(gym.Env):
                     # Only connect if EV isn't already connected somewhere else
                     if (target_cs.n_evs_connected < target_cs.n_ports and 
                         new_ev.id not in connected_evs):
-                        target_cs.spawn_ev(new_ev)
-                        self.EVs.append(new_ev)
-                        connected_evs.add(new_ev.id)
+                        spawn_result = target_cs.spawn_ev(new_ev)
+                        if spawn_result is not None:  # Spawn successful
+                            self.EVs.append(new_ev)
+                            connected_evs.add(new_ev.id)
+                            existing_ev_ids.add(new_ev.id)  # Update the set
+                        else:
+                            if self.verbose:
+                                print(f"⚠️ EV {new_ev.id} could not spawn at station {cs_index}: charger is full.")
                     else:
                         if self.verbose:
-                            print(f"[EV2Gym] - Skipping EV {new_ev.id}: Charger {cs_index} is full at step {self.current_step}.")
+                            print(f"⚠️ EV {new_ev.id} could not spawn at station {cs_index}: charger is full.")
                 else:
                     print(f"Warning: EV {new_ev.id} has invalid location {cs_index} and was not spawned.")

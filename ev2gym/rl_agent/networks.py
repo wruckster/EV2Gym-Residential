@@ -4,6 +4,7 @@ Network architectures for RL agents, designed for Tianshou compatibility.
 """
 
 import numpy as np
+import logging
 import torch
 import torch.nn as nn
 
@@ -22,6 +23,10 @@ class Actor(nn.Module):
         )
         self.mean_layer = nn.Linear(128, self.action_dim)
         self.log_std_layer = nn.Linear(128, self.action_dim)
+        # Logging rate-limit helpers
+        self._warn_count = 0
+        self._warn_interval = 1000  # log every N occurrences
+        self._obs_indices_logged = False
 
     def forward(self, obs, state=None, info={}):
         """
@@ -37,11 +42,51 @@ class Actor(nn.Module):
         if len(obs.shape) == 1:
             obs = obs.unsqueeze(0)
 
+        # Sanitize observations to avoid propagating NaN/Inf into the network
+        if torch.logical_not(torch.isfinite(obs)).any():
+            self._warn_count += 1
+            if not self._obs_indices_logged:
+                # Log indices of non-finite in first sample only (diagnostic)
+                try:
+                    sample0 = obs[0]
+                    bad_mask = torch.logical_not(torch.isfinite(sample0))
+                    idx = torch.nonzero(bad_mask, as_tuple=False).flatten().tolist()
+                    logging.warning(f"[Actor] Non-finite observation detected; first-sample bad indices: {idx}")
+                except Exception:
+                    pass
+                self._obs_indices_logged = True
+            elif self._warn_count % self._warn_interval == 0:
+                logging.warning("[Actor] Non-finite observation detected (rate-limited).")
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clip extreme magnitudes
+        obs = torch.clamp(obs, -1e6, 1e6)
+
         features = self.model(obs)
+        # Sanitize features to avoid propagating NaN/Inf
+        if torch.logical_not(torch.isfinite(features)).any():
+            self._warn_count += 1
+            if self._warn_count % self._warn_interval == 0:
+                logging.warning("[Actor] Non-finite features detected (rate-limited); applying nan_to_num.")
+            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
         mean = self.mean_layer(features)
-        
+        # Sanitize mean
+        if torch.logical_not(torch.isfinite(mean)).any():
+            self._warn_count += 1
+            if self._warn_count % self._warn_interval == 0:
+                logging.warning("[Actor] Non-finite action mean detected (rate-limited); applying nan_to_num.")
+            mean = torch.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clamp mean to a reasonable range to prevent blow-ups
+        mean = torch.clamp(mean, -10.0, 10.0)
+
         # We learn the log of the standard deviation for stability
         log_std = self.log_std_layer(features)
+        # Sanitize log_std
+        if torch.logical_not(torch.isfinite(log_std)).any():
+            self._warn_count += 1
+            if self._warn_count % self._warn_interval == 0:
+                logging.warning("[Actor] Non-finite log_std detected (rate-limited); applying nan_to_num.")
+            log_std = torch.nan_to_num(log_std, nan=0.0, posinf=0.0, neginf=0.0)
         # Clamp the log_std to prevent it from becoming too large or too small
         log_std = torch.clamp(log_std, -20, 2)
         std = torch.exp(log_std)
@@ -73,6 +118,11 @@ class Critic(nn.Module):
             obs = obs['obs']
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32)
+        # Sanitize observations similar to Actor
+        if torch.logical_not(torch.isfinite(obs)).any():
+            logging.warning("[Critic] Non-finite observation detected; applying nan_to_num.")
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        obs = torch.clamp(obs, -1e6, 1e6)
 
         return self.model(obs)
 
