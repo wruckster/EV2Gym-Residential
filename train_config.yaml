@@ -15,7 +15,7 @@ experiment:
 # 2. Environment settings
 environment:
   config_file: 'ev2gym/example_config_files/residential_v2g.yaml'
-  action_wrapper: 'Rescale_RepairLayer' # From ev2gym.rl_agent.action_wrappers
+  action_wrapper: 'Rescale_RepairLayer_V2G' # From ev2gym.rl_agent.action_wrappers
   noise_wrapper: ''                     # Optional: from ev2gym.rl_agent.noise_wrappers
   is_verbose: False
 

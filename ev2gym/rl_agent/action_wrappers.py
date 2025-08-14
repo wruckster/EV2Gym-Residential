@@ -481,6 +481,62 @@ class Rescale_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
             return action * self.occupied_ports
 
 
+class Rescale_RepairLayer_V2G(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
+    '''
+    V2G-capable action wrapper that preserves negative actions (discharging) and
+    masks actions for unavailable ports (no EV connected or commuting). It does
+    not reshape actions towards positive-only power setpoints, letting the policy
+    decide when to charge or discharge.
+    '''
+
+    def __init__(self, env: gym.Env):
+        assert isinstance(env.action_space, Box)
+
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ActionWrapper.__init__(self, env)
+
+        self.env = env
+        self.verbose = False
+
+    def action(self, action: np.ndarray) -> np.ndarray:
+        """Pass-through of actions with masking for unavailable ports.
+
+        - Clips actions to [-1, 1].
+        - Sets action to 0 if no EV is connected at the port or if the EV is commuting.
+        - Preserves negative values to allow discharging in `EV_Charger.step()`.
+        """
+        import warnings
+
+        # Sanitize input
+        if not isinstance(action, np.ndarray):
+            action = np.asarray(action, dtype=float)
+        if not np.all(np.isfinite(action)):
+            warnings.warn("Non-finite action input to Rescale_RepairLayer_V2G; applying nan_to_num.")
+            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+        action = np.clip(action, -1.0, 1.0)
+
+        # Build occupancy mask (1 if port has an EV that is not commuting, else 0)
+        mask = np.zeros_like(action, dtype=float)
+        idx = 0
+        for cs in self.env.charging_stations:
+            for port in range(cs.n_ports):
+                ev = cs.evs_connected[port]
+                if ev is not None:
+                    # If EV is commuting, it cannot charge/discharge this step
+                    if getattr(ev, 'location_state', 0) != 2:
+                        mask[idx] = 1.0
+                idx += 1
+
+        out = action * mask
+
+        if self.verbose:
+            print(f"[V2G Wrapper] in:  {np.round(action, 3)}")
+            print(f"[V2G Wrapper] msk: {mask}")
+            print(f"[V2G Wrapper] out: {np.round(out, 3)}")
+
+        return out
+
+
 class MinMax_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
     '''
     This class is used to rescale the actions to the valid range of the charging stations

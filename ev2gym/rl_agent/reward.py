@@ -77,9 +77,17 @@ def MinimizeTrackerSurplusWithChargeRewards(env,*args):
 
 def profit_maximization(env, total_costs, user_satisfaction_list, *args):
     ''' This reward function is used for the profit maximization case '''
-    
-    reward = total_costs
-    
+    # Prefer net grid cost at the meter as the objective signal.
+    # env.cost_history includes: grid import cost + charging cost - discharge credit.
+    # We maximize profit by minimizing cost: reward = - net_cost.
+    try:
+        idx = max(0, env.current_step - 1)
+        net_cost = float(env.cost_history[idx])
+        reward = -net_cost
+    except Exception:
+        # Fallback to legacy total_costs if cost_history is unavailable
+        reward = float(total_costs)
+
     for score in user_satisfaction_list:
         # reward -= 100 * (1 - score)
         reward -= 100 * math.exp(-10*score)
