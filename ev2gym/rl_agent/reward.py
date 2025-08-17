@@ -88,6 +88,22 @@ def profit_maximization(env, total_costs, user_satisfaction_list, *args):
         # Fallback to legacy total_costs if cost_history is unavailable
         reward = float(total_costs)
 
+    # Per-step penalty when EV is below its emergency SoC threshold
+    try:
+        coeff = float(getattr(env, 'emergency_soc_penalty_kwh', 2.0))  # reward units per kWh deficit
+        below_penalty = 0.0
+        for cs in getattr(env, 'charging_stations', []):
+            for ev in getattr(cs, 'evs_connected', []):
+                if ev is None:
+                    continue
+                deficit = ev.min_emergency_battery_capacity - ev.current_capacity
+                if deficit > 1e-9:
+                    below_penalty += deficit * coeff
+        reward -= below_penalty
+    except Exception:
+        # Be robust: ignore penalty calculation errors
+        pass
+
     for score in user_satisfaction_list:
         # reward -= 100 * (1 - score)
         reward -= 100 * math.exp(-10*score)
