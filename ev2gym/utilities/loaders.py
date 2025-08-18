@@ -441,8 +441,9 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
     # Try to load prices from external features first
     external_features = _load_external_features(env)
     price_col = None
+    forecast_cols = []
     if external_features is not None:
-        # Look for 'rrp' (for AUD) or 'price' columns
+        # Look for 'rrp' (for AUD) or any 'price' column as spot price
         if 'rrp' in [c.lower() for c in external_features.columns]:
             price_col = 'RRP' if 'RRP' in external_features.columns else 'rrp'
         else:
@@ -451,11 +452,42 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
                     price_col = col
                     break
 
+        # Detect forecast columns like rrp_h01, rrp_h02, ... (case-insensitive)
+        lower_cols = {c.lower(): c for c in external_features.columns}
+        # Collect keys that match pattern rrp_h\d+
+        import re
+        pattern = re.compile(r"^rrp_h(\d+)$")
+        numbered = []
+        for lc, orig in lower_cols.items():
+            m = pattern.match(lc)
+            if m:
+                numbered.append((int(m.group(1)), orig))
+        numbered.sort(key=lambda t: t[0])
+        forecast_cols = [orig for _, orig in numbered]
+
     if price_col:
         # Prices are assumed to be in $/MWh, converting to $/kWh
         prices = external_features[price_col].values / 1000
         charge_prices = np.tile(prices, (env.cs, 1))
         discharge_prices = np.tile(prices, (env.cs, 1))
+
+        # Attach forecast matrix to env if available: shape (simulation_length, H)
+        if forecast_cols:
+            try:
+                forecast_df = external_features[forecast_cols]
+                # Convert $/MWh to $/kWh
+                forecast_matrix = forecast_df.values / 1000
+                # Ensure length matches simulation_length; truncate or pad if needed
+                if len(forecast_matrix) >= env.simulation_length:
+                    env.price_forecast = forecast_matrix[:env.simulation_length, :]
+                else:
+                    reps = math.ceil(env.simulation_length / len(forecast_matrix)) + 1
+                    tiled = np.vstack([forecast_matrix] * reps)
+                    env.price_forecast = tiled[:env.simulation_length, :]
+                # Provide spot price vector for convenience
+                env.spot_price = prices[:env.simulation_length]
+            except Exception as e:
+                print(f"Warning: failed to build price forecast from external features: {e}")
     else:
         # Fallback to original method if external features don't contain prices
         if env.price_data is None:

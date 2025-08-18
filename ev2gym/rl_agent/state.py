@@ -73,12 +73,18 @@ def V2G_profit_max(env, *args):
 
     state.append(env.current_power_usage[env.current_step-1])
 
-    charge_prices = abs(env.charge_prices[0, env.current_step:
-        env.current_step+20])
-    
-    if len(charge_prices) < 20:
-        charge_prices = np.append(charge_prices, np.zeros(20-len(charge_prices)))
-    
+    horizon = 20
+    # Prefer rrp_hxx forecast if available
+    if hasattr(env, 'price_forecast') and env.price_forecast is not None:
+        # price_forecast shape: (simulation_length, H)
+        fc_slice = env.price_forecast[env.current_step] if env.current_step < len(env.price_forecast) else np.array([])
+        charge_prices = np.array(fc_slice[:horizon])
+    else:
+        charge_prices = abs(env.charge_prices[0, env.current_step: env.current_step + horizon])
+
+    if len(charge_prices) < horizon:
+        charge_prices = np.append(charge_prices, np.zeros(horizon - len(charge_prices)))
+
     state.append(charge_prices)
     
     # For every transformer

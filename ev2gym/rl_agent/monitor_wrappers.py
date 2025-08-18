@@ -49,8 +49,8 @@ class ActionMonitor(gym.Wrapper):
         else:
             # Classic Gym compatibility: only obs returned
             obs, info = out, {}
-        # Build labels once if not provided
-        if not self._labels_built:
+        # Build labels once if not provided, but only when env is verbose
+        if not self._labels_built and getattr(self.env, "verbose", False):
             self._auto_build_labels()
         # Sanitize observations
         obs = self._sanitize_obs(obs)
@@ -86,8 +86,9 @@ class ActionMonitor(gym.Wrapper):
             terminated, truncated = bool(done), False
         else:
             raise RuntimeError("Unexpected env.step() return format: expected 4 or 5-tuple")
-        # Build labels if still missing (e.g., if reset didn't run in vector env context)
-        if not self._labels_built:
+        # Build labels if still missing (e.g., if reset didn't run in vector env context),
+        # but only when env is verbose
+        if not self._labels_built and getattr(self.env, "verbose", False):
             self._auto_build_labels()
         # Sanitize observations before returning to policy
         obs = self._sanitize_obs(obs)
