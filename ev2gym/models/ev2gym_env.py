@@ -21,6 +21,7 @@ from ev2gym.models.utils.replay import EvCityReplay
 from ev2gym.visuals.plots import ev_city_plot, visualize_step
 from ev2gym.utilities.utils import get_statistics, print_statistics, calculate_charge_power_potential
 from ev2gym.utilities.loaders import load_ev_spawn_scenarios, load_power_setpoints, load_transformers, load_ev_charger_profiles, load_ev_profiles, load_electricity_prices, _load_household_profiles
+from ev2gym.models.utils.forecasting import create_lookahead_forecast
 from ev2gym.visuals.render import Renderer
 
 from ev2gym.rl_agent.reward import SquaredTrackingErrorReward
@@ -64,6 +65,10 @@ class EV2Gym(gym.Env):
         assert config_file is not None, "Please provide a config file!!!"
         with open(config_file, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
+
+        self.forecasting_config = self.config.get('forecasting', {'enabled': False})
+        self.demand_forecast = None
+        self.solar_forecast = None
 
         self.ev_parameters = self.config.get('ev', {})
 
@@ -263,6 +268,12 @@ class EV2Gym(gym.Env):
         self.current_power_usage = np.zeros(self.simulation_length)
         self.charge_power_potential = np.zeros(self.simulation_length)
 
+        # Store full series for forecasting if enabled
+        if self.forecasting_config.get('enabled'):
+            # This assumes _load_household_profiles returns a DataFrame with all data
+            # which can be used for lookaheads.
+            self.full_timeseries_data = _load_household_profiles(self, ignore_date_filter=True)
+
         # --- FINAL INITIALIZATION ---
         # Initialize statistics and replay object now that all dependencies are loaded
         self.init_statistic_variables()
@@ -293,7 +304,10 @@ class EV2Gym(gym.Env):
             lows = np.zeros([self.number_of_ports])
         self.action_space = spaces.Box(low=lows, high=high, dtype=np.float64)
 
-        # Observation space: is a matrix of size ("Sum of all ports of all charging stations",n_features)
+        # Ensure forecasts are up-to-date BEFORE building observation space, so obs_dim matches actual obs length
+        self._update_forecasts()
+
+        # Observation space: vector length of current observation (which may include forecasts)
         obs_dim = len(self._get_observation())
 
         high = np.inf*np.ones([obs_dim])
@@ -377,6 +391,7 @@ class EV2Gym(gym.Env):
         self.init_statistic_variables()
 
         self._log_initial_state()
+        self._update_forecasts()
 
         return self._get_observation(), {}
 
@@ -516,11 +531,7 @@ class EV2Gym(gym.Env):
             for u in user_satisfaction:
                 user_satisfaction_list.append(u)
 
-            if self.verbose:
-                print(f"DEBUG: CS {cs.id} power output: {cs.current_power_output}")
             self.current_power_usage[self.current_step] += cs.current_power_output
-            if self.verbose:
-                print(f"DEBUG_AFTER_ADD: Power usage at step {self.current_step} is now {self.current_power_usage[self.current_step]}")
 
             # Update transformer variables for this timestep
             self.transformers[cs.connected_transformer].step(
@@ -634,6 +645,9 @@ class EV2Gym(gym.Env):
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
 
+        # Update forecasts for the current timestep
+        self._update_forecasts()
+
         # Check termination conditions and return the appropriate values
         obs = self._get_observation()
         
@@ -738,8 +752,37 @@ class EV2Gym(gym.Env):
         self.sim_date = self.sim_date + \
             datetime.timedelta(minutes=self.timescale)
 
+    def _update_forecasts(self):
+        """Generates forecasts for all configured targets."""
+        if not self.forecasting_config.get('enabled'):
+            return
+
+        targets = self.forecasting_config.get('targets', [])
+        params = self.forecasting_config.get('params', {})
+
+        for target in targets:
+            if target == 'household_demand' and 'demand' in self.full_timeseries_data.columns:
+                self.demand_forecast = create_lookahead_forecast(
+                    data=self.full_timeseries_data['demand'],
+                    start_time=self.sim_date,
+                    **params
+                )
+            elif target == 'solar_production' and 'solar' in self.full_timeseries_data.columns:
+                self.solar_forecast = create_lookahead_forecast(
+                    data=self.full_timeseries_data['solar'],
+                    start_time=self.sim_date,
+                    **params
+                )
+
     def _get_observation(self):
         obs = self.state_function(self)
+
+        # Append forecasts to the observation if they exist
+        if self.demand_forecast is not None:
+            obs = np.concatenate([obs, self.demand_forecast])
+        if self.solar_forecast is not None:
+            obs = np.concatenate([obs, self.solar_forecast])
+
         return obs
 
     def _calculate_reward(self, total_costs, user_satisfaction_list, invalid_action_punishment):

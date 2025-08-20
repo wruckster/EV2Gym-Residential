@@ -141,7 +141,7 @@ class EV_Charger:
 
         normalized_actions = actions
 
-        if self.verbose:
+        if self.verbose and self.current_step % 10 == 0:
             print(f'CS {self.id} normalized actions: {normalized_actions}')
 
         # Update EVs connected to the EV charger and get profits/costs

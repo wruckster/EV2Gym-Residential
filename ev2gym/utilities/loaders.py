@@ -546,15 +546,24 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
 # ------------------------------------------------------------------------
 # NSW household demand & solar helper
 # ------------------------------------------------------------------------
-def _load_household_profiles(env):
+def _load_household_profiles(env, ignore_date_filter: bool = False):
     """
     Load NSW household CSV traces specified in the YAML config
     (`inflexible_loads.data_files`) and resample them to the environment's
     timestep. Returns a DataFrame with at least the columns
     ['demand', 'solar'] **or** None if the config does not provide any files.
-    
-    Uses the environment's year, month, day, hour, minute, timescale, and simulation_length
-    to filter and resample the data.
+
+    If ignore_date_filter is False (default):
+      - Filter by the simulation window derived from env.year/month/day/hour/minute
+      - Resample to env.timescale
+      - Ensure length == env.simulation_length by repeating/truncating
+      - Reset index to a simple RangeIndex (backward compatible with existing usage)
+
+    If ignore_date_filter is True (for forecasting use-cases):
+      - Do NOT filter by date; use the entire dataset
+      - Resample to env.timescale
+      - Preserve DatetimeIndex and DO NOT truncate/pad to simulation_length
+        (needed so forecasting can slice by actual timestamps and look ahead)
     """
     cfg = env.config.get('inflexible_loads', {})
     file_paths = cfg.get('data_files', [])
@@ -568,10 +577,8 @@ def _load_household_profiles(env):
     hour = env.config.get('hour', 0)
     minute = env.config.get('minute', 0)
 
-    # Create start and end dates for filtering
+    # Create start and end dates for filtering (used when ignore_date_filter=False)
     start_date = pd.Timestamp(year=year, month=month, day=day, hour=hour, minute=minute)
-
-    # Calculate end date based on simulation_length and timescale
     minutes_to_add = env.timescale * env.simulation_length
     end_date = start_date + pd.Timedelta(minutes=minutes_to_add)
 
@@ -583,20 +590,21 @@ def _load_household_profiles(env):
             if not {'demand', 'solar'}.issubset(df.columns):
                 raise ValueError(f"{p} must contain 'demand' and 'solar' columns")
 
-            # Filter by date range
+            # Prepare index and optionally filter by date range
             df = df.set_index('interval_start')
-            filtered_df = df[(df.index >= start_date) & (df.index <= end_date)]
-            
-            # If filtered data is empty, use the original data with a warning
-            if filtered_df.empty:
-                print(f"Warning: No data in {p} for date range {start_date} to {end_date}. Using full dataset.")
-                filtered_df = df
-            else:
-                df = filtered_df
-                
+            if not ignore_date_filter:
+                filtered_df = df[(df.index >= start_date) & (df.index <= end_date)]
+                # If filtered data is empty, use the original data with a warning
+                if filtered_df.empty:
+                    print(f"Warning: No data in {p} for date range {start_date} to {end_date}. Using full dataset.")
+                    df = df
+                else:
+                    df = filtered_df
             # Resample to the simulation time-step and fill gaps by interpolation
             df = df.resample(f"{env.timescale}min").mean().interpolate(method='time')
-            df = df.reset_index(drop=False)
+            if not ignore_date_filter:
+                # Backward compatibility: return RangeIndex for consumers that expect it
+                df = df.reset_index(drop=False)
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {p}: {e}")
@@ -606,15 +614,20 @@ def _load_household_profiles(env):
         raise ValueError("No valid household data files could be loaded")
 
     # Average multiple households if more than one file supplied
-    data = pd.concat(dfs).groupby(level=0).mean()
-
-    # Ensure we have at least env.simulation_length rows
-    reps = math.ceil(env.simulation_length / len(data)) + 1
-    data = pd.concat([data] * reps).iloc[:env.simulation_length]
-    data.reset_index(drop=True, inplace=True)
-    assert len(data) == env.simulation_length, \
-        f"Household profile data length ({len(data)}) does not match simulation length ({env.simulation_length})"
-    return data
+    if ignore_date_filter:
+        # DatetimeIndex preserved when ignore_date_filter=True
+        data = pd.concat(dfs).groupby(level=0).mean()
+        # Do NOT truncate/pad; keep full resampled history for forecasting
+        return data
+    else:
+        data = pd.concat(dfs).groupby(level=0).mean()
+        # Ensure we have at least env.simulation_length rows
+        reps = math.ceil(env.simulation_length / len(data)) + 1
+        data = pd.concat([data] * reps).iloc[:env.simulation_length]
+        data.reset_index(drop=True, inplace=True)
+        assert len(data) == env.simulation_length, \
+            f"Household profile data length ({len(data)}) does not match simulation length ({env.simulation_length})"
+        return data
 
 
 def _load_external_features(env):
@@ -640,27 +653,49 @@ def _load_external_features(env):
     try:
         # Load the parquet file
         df = pd.read_parquet(external_file)
-        
+
+        # Ensure we have a DatetimeIndex for filtering/resampling
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # Try common datetime column names
+            datetime_candidates = [
+                'interval_start', 'timestamp', 'Datetime (UTC)', 'DatetimeUTC', 'datetime_utc', 'datetime'
+            ]
+            dt_col = None
+            for c in datetime_candidates:
+                if c in df.columns:
+                    dt_col = c
+                    break
+            if dt_col is None:
+                raise ValueError("External features file must have a DatetimeIndex or a recognizable datetime column")
+            df[dt_col] = pd.to_datetime(df[dt_col], errors='coerce', utc=True)
+            df = df.set_index(dt_col)
+
+        # Normalize index to timezone-naive for consistency with env timestamps
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert('UTC').tz_localize(None)
+
         # Create start and end dates for filtering
-        start_date = pd.Timestamp(year=env.config.get('year', 2019), 
-                                month=env.config.get('month', 1), 
-                                day=env.config.get('day', 1))
-        
+        start_date = pd.Timestamp(year=env.config.get('year', 2019),
+                                  month=env.config.get('month', 1),
+                                  day=env.config.get('day', 1),
+                                  hour=env.config.get('hour', 0),
+                                  minute=env.config.get('minute', 0))
+
         # Calculate end date based on simulation_length and timescale
         minutes_to_add = env.timescale * env.simulation_length
         end_date = start_date + pd.Timedelta(minutes=minutes_to_add)
-        
+
         # Filter by date range
         filtered_df = df[(df.index >= start_date) & (df.index <= end_date)]
-        
+
         # If filtered data is empty, use the original data with a warning
         if filtered_df.empty:
             print(f"Warning: No data in external features for date range {start_date} to {end_date}. Using full dataset.")
             filtered_df = df
-            
+
         # Resample to the simulation time-step and fill gaps by interpolation
         filtered_df = filtered_df.resample(f"{env.timescale}min").mean().interpolate(method='time')
-        
+
         # Ensure we have at least env.simulation_length rows
         if len(filtered_df) < env.simulation_length:
             print(f"Warning: Not enough external data rows ({len(filtered_df)}) for simulation length ({env.simulation_length}). Repeating data.")
@@ -669,10 +704,61 @@ def _load_external_features(env):
         else:
             # If we have more than enough data, just take what we need
             filtered_df = filtered_df.iloc[:env.simulation_length]
-            
-        filtered_df.reset_index(drop=False, inplace=True)
+
+        # Keep DatetimeIndex for downstream alignment/forecasting
         return filtered_df
-        
+
     except Exception as e:
         print(f"Error loading external features: {e}")
         return None
+
+
+def load_weather_data(env) -> pd.DataFrame | None:
+    """
+    Extract temperature and wind features from the external dataset, aligned to the
+    current simulation window and timescale.
+
+    Returns a DataFrame indexed by time with available columns among:
+    - 'temperature' (or closest match)
+    - 'wind_speed' (or closest match)
+
+    Also stores the result on `env.weather_data` for convenience.
+    """
+    external = _load_external_features(env)
+    if external is None:
+        env.weather_data = None
+        return None
+
+    # Case-insensitive column lookup helpers
+    def pick_col(cands):
+        lower_map = {c.lower(): c for c in external.columns}
+        for key in cands:
+            if key in lower_map:
+                return lower_map[key]
+        # fallback: substring search
+        for lc, orig in lower_map.items():
+            for key in cands:
+                if key in lc:
+                    return orig
+        return None
+
+    temp_col = pick_col(['temperature', 'temp', 't2m'])
+    wind_col = pick_col(['wind_speed', 'windspeed', 'wind', 'ws'])
+
+    cols = []
+    rename = {}
+    if temp_col:
+        cols.append(temp_col)
+        rename[temp_col] = 'temperature'
+    if wind_col:
+        cols.append(wind_col)
+        rename[wind_col] = 'wind_speed'
+
+    if not cols:
+        print("Warning: No temperature/wind columns found in external features.")
+        env.weather_data = None
+        return None
+
+    weather = external[cols].rename(columns=rename)
+    env.weather_data = weather
+    return weather
