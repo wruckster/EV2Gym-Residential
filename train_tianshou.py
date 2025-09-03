@@ -87,26 +87,26 @@ def main(config_path: str):
                 plot_type="main",
             )
 
-            # Prices plot
-            evaluator_plot.plot_from_replay(
-                [latest_replay],
-                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_prices.png"),
-                plot_type="prices",
-            )
+            # # Prices plot
+            # evaluator_plot.plot_from_replay(
+            #     [latest_replay],
+            #     save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_prices.png"),
+            #     plot_type="prices",
+            # )
 
-            # Solar plot
-            evaluator_plot.plot_from_replay(
-                [latest_replay],
-                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_solar.png"),
-                plot_type="solar",
-            )
+            # # Solar plot
+            # evaluator_plot.plot_from_replay(
+            #     [latest_replay],
+            #     save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_solar.png"),
+            #     plot_type="solar",
+            # )
 
-            # Details plot
-            evaluator_plot.plot_from_replay(
-                [latest_replay],
-                save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_details.png"),
-                plot_type="details",
-            )
+            # # Details plot
+            # evaluator_plot.plot_from_replay(
+            #     [latest_replay],
+            #     save_path=os.path.join(os.path.dirname(plot_save_path), "evaluation_details.png"),
+            #     plot_type="details",
+            # )
 
             # Replays plot
             evaluator_plot.plot_from_replay(
@@ -238,10 +238,25 @@ def main(config_path: str):
                 save_plots=False,
                 replay_save_path=replay_dir,
             )
+            # Ensure debug_setpoints follows the environment YAML flag, not global verbosity
+            try:
+                dbg = bool(getattr(env, "debug_setpoints", False))
+                setattr(env, "debug_setpoints", dbg)
+            except Exception:
+                pass
             if action_wrapper_cls:
                 env = action_wrapper_cls(env)
             if noise_wrapper_cls:
                 env = noise_wrapper_cls(env)
+
+            # Ensure wrappers and the base env both see the same debug_setpoints from YAML
+            try:
+                dbg = bool(getattr(env, "debug_setpoints", False))
+                setattr(env, "debug_setpoints", dbg)
+                if hasattr(env, "env"):
+                    setattr(env.env, "debug_setpoints", dbg)
+            except Exception:
+                pass
 
             # Attach ActionMonitor
             if role == "train":
@@ -498,8 +513,23 @@ def main(config_path: str):
                 save_plots=False,
                 lightweight_plots=False  # Ensure detailed statistics are collected
             )
+            # Propagate env YAML debug_setpoints for evaluation as well
+            try:
+                dbg = bool(getattr(eval_env, "debug_setpoints", False))
+                setattr(eval_env, "debug_setpoints", dbg)
+            except Exception:
+                pass
             if action_wrapper_cls:
                 eval_env = action_wrapper_cls(eval_env)
+
+            # Ensure wrappers and base env both see the same YAML-driven debug_setpoints in eval
+            try:
+                dbg = bool(getattr(eval_env, "debug_setpoints", False))
+                setattr(eval_env, "debug_setpoints", dbg)
+                if hasattr(eval_env, "env"):
+                    setattr(eval_env.env, "debug_setpoints", dbg)
+            except Exception:
+                pass
 
             # Load the best policy
             best_policy_path = os.path.join(run_dir, "best_policy.pth")
@@ -514,19 +544,49 @@ def main(config_path: str):
             logging.info("Starting evaluation episode...")
             collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
             logging.info(f"Evaluation complete: {collect_result}")
-            
-            # Log episode details from the single environment inside the vector env
-            # Since we have only one environment, we can get its attributes by indexing at 0
-            current_step = eval_collector.env.get_env_attr('current_step')[0]
-            sim_length = eval_collector.env.get_env_attr('simulation_length')[0]
-            evs_spawned = eval_collector.env.get_env_attr('total_evs_spawned')[0]
-            is_done = eval_collector.env.get_env_attr('done')[0]
 
-            logging.info(f"Episode completed at step {current_step}/{sim_length}")
-            logging.info(f"Total EVs spawned: {evs_spawned}")
-            logging.info(f"Episode done: {is_done}")
+            # Log episode details; support both vectorized and raw envs
+            try:
+                if hasattr(eval_collector.env, 'get_env_attr'):
+                    current_step = eval_collector.env.get_env_attr('current_step')[0]
+                    sim_length = eval_collector.env.get_env_attr('simulation_length')[0]
+                    evs_spawned = eval_collector.env.get_env_attr('total_evs_spawned')[0]
+                    is_done = eval_collector.env.get_env_attr('done')[0]
+                else:
+                    base_env = getattr(eval_collector.env, 'env', eval_collector.env)
+                    current_step = getattr(base_env, 'current_step', None)
+                    sim_length = getattr(base_env, 'simulation_length', None)
+                    evs_spawned = getattr(base_env, 'total_evs_spawned', None)
+                    is_done = getattr(base_env, 'done', None)
+                logging.info(f"Episode completed at step {current_step}/{sim_length}")
+                logging.info(f"Total EVs spawned: {evs_spawned}")
+                logging.info(f"Episode done: {is_done}")
+            except Exception:
+                logging.warning("Could not log episode details from evaluation environment.")
 
-            eval_collector.env.close()  # This will call close on the underlying environment
+            # Ensure a replay file exists; explicitly save if none was created
+            try:
+                # Count replays before forcing save
+                pre_files = [f for f in os.listdir(eval_replay_path) if f.endswith('.pkl')]
+                if not pre_files:
+                    logging.info("No replay files detected after evaluation; attempting explicit save...")
+                    base_env = getattr(eval_env, 'env', eval_env)
+                    if hasattr(base_env, '_save_sim_replay'):
+                        base_env._save_sim_replay()
+                        logging.info("Explicit replay save invoked.")
+                    else:
+                        logging.warning("Base evaluation env has no _save_sim_replay; skipping explicit save.")
+            except Exception:
+                logging.warning("Explicit replay save attempt failed.")
+
+            # Close evaluation env (and wrappers if vectorized)
+            try:
+                eval_collector.env.close()
+            except Exception:
+                try:
+                    eval_env.close()
+                except Exception:
+                    pass
 
             # Generate plots from the replay files
             if os.path.exists(eval_replay_path):
@@ -545,26 +605,6 @@ def main(config_path: str):
                     plot_type="main",
                 )
 
-                # Prices plot
-                evaluator_plot.plot_from_replay(
-                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                    save_path=os.path.join(run_dir, "evaluation_prices.png"),
-                    plot_type="prices",
-                )
-
-                # Solar plot
-                evaluator_plot.plot_from_replay(
-                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                    save_path=os.path.join(run_dir, "evaluation_solar.png"),
-                    plot_type="solar",
-                )
-
-                # Details plot
-                evaluator_plot.plot_from_replay(
-                    replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
-                    save_path=os.path.join(run_dir, "evaluation_details.png"),
-                    plot_type="details",
-                )
 
                 evaluator_plot.plot_from_replay(
                     replay_files=[os.path.join(eval_replay_path, replay_files[-1])],
@@ -572,6 +612,8 @@ def main(config_path: str):
                     labels=["Evaluation"],
                     plot_type="replays",
                 )
+            else:
+                logging.warning(f"No replay files found in {eval_replay_path} after evaluation.")
 
         except Exception as e:
             logging.error("An error occurred during evaluation and plotting:", exc_info=True)

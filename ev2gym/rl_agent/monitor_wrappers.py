@@ -169,23 +169,24 @@ class ActionMonitor(gym.Wrapper):
             # --- Base labels depending on state function ---
             if state_fn_name == "V2G_profit_max":
                 # Matches ev2gym/rl_agent/state.py::V2G_profit_max
-                labels.append("t")
-                labels.append("current_power_usage_prev")
-                H = infer_price_horizon(default_h=20)
-                labels.extend([f"price_h+{k}" for k in range(H)])
+                labels.extend([
+                    "Current Step",
+                    "Prev. Power Usage",
+                ])
+                # Price forecast
+                price_h = infer_price_horizon(default_h=20)
+                if price_h > 0:
+                    labels.extend([f"Price[t+{i}]" for i in range(price_h)])
 
-                # Per transformer -> charging station (connected) -> per-port
-                if hasattr(self.env, "transformers") and hasattr(self.env, "charging_stations"):
-                    for tr in getattr(self.env, "transformers", []):
-                        for cs_index, cs in enumerate(getattr(self.env, "charging_stations", [])):
-                            try:
-                                if getattr(cs, "connected_transformer", None) == getattr(tr, "id", None):
-                                    n_ports = int(getattr(cs, "n_ports", 0))
-                                    for p in range(n_ports):
-                                        labels.append(f"soc_tr{getattr(tr,'id','?')}_cs{cs_index}_port{p}")
-                                        labels.append(f"time_to_departure_tr{getattr(tr,'id','?')}_cs{cs_index}_port{p}")
-                            except Exception:
-                                continue
+                # Per-port EV information
+                if hasattr(self.env, "charging_stations"):
+                    for cs_idx, cs in enumerate(getattr(self.env, "charging_stations", [])):
+                        num_ports = int(getattr(cs, "number_of_ports", 0))
+                        for port_idx in range(num_ports):
+                            labels.extend([
+                                f"CS{cs_idx}-P{port_idx}_SoC",
+                                f"CS{cs_idx}-P{port_idx}_Time_Depart",
+                            ])
 
             elif state_fn_name == "V2G_profit_max_loads":
                 # Matches ev2gym/rl_agent/state.py::V2G_profit_max_loads

@@ -76,7 +76,7 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
     ev_id_counter = 0
 
     for profile_key, p_cfg in cfg.items():
-        print(f"DEBUG: Processing profile: {profile_key}")
+        # print(f"DEBUG: Processing profile: {profile_key}")
         v_count: int = int(p_cfg.get("vehicle_count", 1))
         home_station = int(p_cfg.get("default_station", 0))
         work_station = int(p_cfg.get("work_station", 1))
@@ -242,18 +242,18 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             presence_blocks.extend(final_blocks)
             
             # Debug the blocks we've generated so far
-            print(f"DEBUG: Day {current_dt.strftime('%Y-%m-%d')}, added {len(final_blocks)} blocks, total now: {len(presence_blocks)}")
+            # print(f"DEBUG: Day {current_dt.strftime('%Y-%m-%d')}, added {len(final_blocks)} blocks, total now: {len(presence_blocks)}")
                 
             # Advance to next day.
             step += (24 * 60) // timestep_minutes
             current_dt += _dt.timedelta(days=1)
 
-        # Convert presence blocks to EVs.
-        print(f"DEBUG: Generated {len(presence_blocks)} presence blocks for profile {profile_key}")
+        # # Convert presence blocks to EVs.
+        # print(f"DEBUG: Generated {len(presence_blocks)} presence blocks for profile {profile_key}")
         
-        # Debug the first few blocks to understand their properties
-        for i, blk in enumerate(presence_blocks[:5]):
-            print(f"DEBUG: Block {i}: location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}, start={blk.start_step}, end={blk.end_step}")
+        # # Debug the first few blocks to understand their properties
+        # for i, blk in enumerate(presence_blocks[:5]):
+        #     print(f"DEBUG: Block {i}: location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}, start={blk.start_step}, end={blk.end_step}")
             
         # Create one EV profile per vehicle count, each with its own schedule.
         for _ in range(v_count):

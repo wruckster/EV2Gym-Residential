@@ -33,6 +33,26 @@ class V2GProfitMaxOracle(MPC):
 
         self.actions = None
 
+        # Control filter config (defaults disabled to preserve behavior)
+        self.smoothing_enabled: bool = False
+        self.ema_alpha: float = 0.3
+        self.ramp_limit_enabled: bool = False
+        self.max_ramp_kw_per_step: float = 5.0
+
+        # Allow kwargs to override; fallback to env.config
+        filt = kwargs.get('control_filters', {}) if isinstance(kwargs, dict) else {}
+        if not filt:
+            try:
+                filt = getattr(env, 'config', {}).get('control_filters', {})
+            except Exception:
+                filt = {}
+        smoothing = filt.get('smoothing', {}) if isinstance(filt, dict) else {}
+        ramp = filt.get('ramp_limit', {}) if isinstance(filt, dict) else {}
+        self.smoothing_enabled = bool(smoothing.get('enabled', self.smoothing_enabled))
+        self.ema_alpha = float(smoothing.get('ema_alpha', self.ema_alpha))
+        self.ramp_limit_enabled = bool(ramp.get('enabled', self.ramp_limit_enabled))
+        self.max_ramp_kw_per_step = float(ramp.get('max_ramp_kw_per_step', self.max_ramp_kw_per_step))
+
     def get_action(self, env):
         """
         This function computes the MPC actions for the economic problem including V2G.
@@ -161,12 +181,67 @@ class V2GProfitMaxOracle(MPC):
                     actions[step, i//2] = -a[step, i+1] / \
                         abs(self.max_disch_power[i//2])
 
+        # Optional post-processing filter: apply per-port ramp limiting and EMA smoothing in kW
+        if self.ramp_limit_enabled or self.smoothing_enabled:
+            actions = self._filter_actions_per_port(actions)
+
         if self.verbose:
             print(f'actions: {actions.shape} \n {actions}')
 
         self.actions = actions
         
         return actions[t, :]
+
+    def _filter_actions_per_port(self, actions: np.ndarray) -> np.ndarray:
+        """
+        Apply per-port ramp limiting and EMA smoothing to normalized actions.
+        Operates in physical units (kW) then converts back to normalized per port.
+        """
+        filtered = np.zeros_like(actions)
+        # Initialize previous filtered kW per port
+        prev_kw = np.zeros(self.n_ports)
+        alpha = min(max(self.ema_alpha, 0.0), 1.0)
+        max_delta_kw = abs(self.max_ramp_kw_per_step)
+
+        for t in range(actions.shape[0]):
+            for p in range(self.n_ports):
+                a_norm = actions[t, p]
+                # Convert to kW based on sign
+                if a_norm >= 0:
+                    kw = a_norm * self.max_ch_power[p]
+                    denom = self.max_ch_power[p] if self.max_ch_power[p] != 0 else 1.0
+                else:
+                    kw = a_norm * abs(self.max_disch_power[p])
+                    denom = abs(self.max_disch_power[p]) if self.max_disch_power[p] != 0 else 1.0
+
+                x = kw
+                # Ramp limit
+                if self.ramp_limit_enabled:
+                    delta = x - prev_kw[p]
+                    if delta > max_delta_kw:
+                        x = prev_kw[p] + max_delta_kw
+                    elif delta < -max_delta_kw:
+                        x = prev_kw[p] - max_delta_kw
+
+                # EMA smoothing
+                if self.smoothing_enabled:
+                    x = alpha * x + (1 - alpha) * prev_kw[p]
+
+                prev_kw[p] = x
+
+                # Convert back to normalized
+                if x >= 0:
+                    filtered[t, p] = x / denom
+                else:
+                    filtered[t, p] = x / denom  # denom uses disch power when x < 0 above
+
+                # Clip to [-1, 1] to ensure feasibility
+                if filtered[t, p] > 1.0:
+                    filtered[t, p] = 1.0
+                elif filtered[t, p] < -1.0:
+                    filtered[t, p] = -1.0
+
+        return filtered
 
 
 class V2GProfitMaxLoadsOracle(MPC):

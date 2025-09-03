@@ -33,6 +33,7 @@ def get_statistics(env) -> Dict:
     tracking_error = 0
     energy_tracking_error = 0
     power_tracker_violation = 0
+
     for t in range(env.simulation_length):
         # tracking_error += (min(env.power_setpoints[t], env.charge_power_potential[t]) -
         #                    env.current_power_usage[t])**2
@@ -280,24 +281,61 @@ def spawn_single_EV(env,
             discharge_efficiency = np.round(1 -
                                             (np.random.rand()+0.00001)/20, 3)  # [0.95-1]
 
+        # Build robust parameter set with fallbacks to config when JSON lacks fields
+        _spec = env.ev_specs[sampled_ev]
+        max_ac_charge_power = _spec.get("max_ac_charge_power", env.ev_parameters.get("max_ac_charge_power", 0))
+        min_ac_charge_power = _spec.get("min_ac_charge_power", env.ev_parameters.get("min_ac_charge_power", 0))
+        max_dc_charge_power = _spec.get("max_dc_charge_power", env.ev_parameters.get("max_dc_charge_power", 0))
+        # Prefer DC discharge power if available, else AC, else fallback
+        max_discharge_power = _spec.get(
+            "max_dc_discharge_power",
+            _spec.get("max_ac_discharge_power", env.ev_parameters.get("max_discharge_power", 0))
+        )
+        min_discharge_power = _spec.get("min_discharge_power", env.ev_parameters.get("min_discharge_power", 0))
+
+        # desired_capacity in GF path is a fraction times battery_capacity; mirror that behavior here
+        desired_capacity_ratio = env.config.get("ev", {}).get('desired_capacity', 1)
+
+        # Whitelist of valid arguments for the EV constructor to prevent TypeErrors
+        valid_ev_args = {
+            'battery_capacity', 'min_battery_capacity', 'min_emergency_battery_capacity',
+            'max_ac_charge_power', 'min_ac_charge_power', 'max_dc_charge_power',
+            'max_discharge_power', 'min_discharge_power', 'ev_phases',
+            'transition_soc', 'transition_soc_multiplier', 'charge_efficiency',
+            'discharge_efficiency', 'timescale', 'metadata', 'location_state',
+            'commuting_consumption_kwh_km', 'desired_capacity'
+        }
+
+        # Filter the parameters from the config to only include valid EV constructor arguments
+        filtered_params = {k: v for k, v in env.ev_parameters.items() if k in valid_ev_args}
+
+        # Remove keys that are explicitly passed to avoid TypeError
+        explicit_keys = {
+            'battery_capacity', 'max_ac_charge_power', 'min_ac_charge_power',
+            'max_dc_charge_power', 'max_discharge_power', 'min_discharge_power',
+            'desired_capacity', 'charge_efficiency', 'discharge_efficiency',
+            'min_emergency_battery_capacity', 'transition_soc_multiplier'
+        }
+        for key in explicit_keys:
+            filtered_params.pop(key, None)
+
         return EV(id=port,
                   location=cs_id,
                   battery_capacity_at_arrival=initial_battery_capacity,
-                  max_ac_charge_power=env.ev_specs[sampled_ev]["max_ac_charge_power"],
-                  min_ac_charge_power=env.ev_specs[sampled_ev]["min_ac_charge_power"],
-                  max_dc_charge_power=env.ev_specs[sampled_ev]["max_dc_charge_power"],
-                  max_discharge_power=env.ev_specs[sampled_ev]["max_discharge_power"],
-                  min_discharge_power=env.ev_specs[sampled_ev]["min_discharge_power"],
-                  battery_capacity=env.ev_specs[sampled_ev]["battery_capacity"],
                   time_of_arrival=step,
                   time_of_departure=step + int(time_of_stay),
-                  desired_capacity=env.ev_specs[sampled_ev]["battery_capacity"],
+                  battery_capacity=_spec["battery_capacity"],
+                  max_ac_charge_power=max_ac_charge_power,
+                  min_ac_charge_power=min_ac_charge_power,
+                  max_dc_charge_power=max_dc_charge_power,
+                  max_discharge_power=max_discharge_power,
+                  min_discharge_power=min_discharge_power,
+                  desired_capacity=desired_capacity_ratio * _spec["battery_capacity"],
                   charge_efficiency=charge_efficiency,
                   discharge_efficiency=discharge_efficiency,
                   min_emergency_battery_capacity=min_emergency_battery_capacity,
                   transition_soc_multiplier=transition_soc_multiplier,
-                  **env.ev_parameters
-                  )
+                  **filtered_params)
 
     else:
         return EV(id=port,
@@ -305,8 +343,7 @@ def spawn_single_EV(env,
                   battery_capacity_at_arrival=initial_battery_capacity,
                   time_of_arrival=step,
                   time_of_departure=step + int(time_of_stay),
-                  **env.ev_parameters
-                  )
+                  **env.ev_parameters)
 
 
 def spawn_single_EV_GF(env,
@@ -635,10 +672,75 @@ def generate_power_setpoints(env) -> np.ndarray:
 
     '''
 
+    # Minimal gate for residential V2G setpoints (default-off)
+    cfg = getattr(env, 'config', {}).get('res_v2g_setpoints', {})
+    use_res_v2g = bool(cfg.get('enabled', False))
+
     power_setpoints = np.zeros(env.simulation_length)
-    # get normalized prices
-    prices = abs(env.charge_prices[0])
-    prices = prices / np.max(prices)
+    # Derive a 1D spot price vector from env.charge_prices (shape: [cs, T])
+    cp = np.asarray(env.charge_prices)
+    if cp.ndim == 2:
+        # Average across charging stations to get a single spot series
+        prices = np.mean(cp, axis=0)
+    else:
+        prices = cp
+    prices = np.abs(prices)
+    # Day-ahead normalization: use per-timestep max from env.price_forecast (shape: [T, 24])
+    zero_price_flag = 0  # debug: 1 if normalization denominator is zero anywhere
+    pf = getattr(env, 'price_forecast', None)
+    if pf is not None:
+        try:
+            pf_arr = np.asarray(pf)
+            if pf_arr.ndim == 2 and pf_arr.shape[0] == env.simulation_length and pf_arr.shape[1] == 24:
+                denom = np.max(np.abs(pf_arr), axis=1)
+                eps = 1e-9
+                zero_price_flag = 1 if np.any(denom <= eps) else 0
+                denom_safe = np.where(denom > eps, denom, 1.0)
+                prices = prices / denom_safe
+            else:
+                # Fallback to global max normalization if shape unexpected
+                price_max = float(np.max(prices)) if np.size(prices) > 0 else 0.0
+                zero_price_flag = 1 if price_max == 0 else 0
+                prices = prices / price_max if price_max > 0 else prices
+        except Exception:
+            # Fallback on any error
+            price_max = float(np.max(prices)) if np.size(prices) > 0 else 0.0
+            zero_price_flag = 1 if price_max == 0 else 0
+            prices = prices / price_max if price_max > 0 else prices
+    else:
+        # No forecast available -> fallback to global max normalization
+        price_max = float(np.max(prices)) if np.size(prices) > 0 else 0.0
+        zero_price_flag = 1 if price_max == 0 else 0
+        prices = prices / price_max if price_max > 0 else prices
+
+    # Optional full-series demand/solar from forecasting pipeline
+    demand_series = None
+    solar_series = None
+    if use_res_v2g:
+        full_df = getattr(env, 'full_timeseries_data', None)
+        if full_df is not None:
+            try:
+                if 'demand' in full_df.columns:
+                    demand_series = np.asarray(full_df['demand'].values[:env.simulation_length], dtype=float)
+                if 'solar' in full_df.columns:
+                    solar_series = np.asarray(full_df['solar'].values[:env.simulation_length], dtype=float)
+            except Exception as e:
+                print(f"[DBG setpts] failed to read full_timeseries_data: {e}")
+
+    # Normalize demand/solar to [0,1] if present
+    def _norm(x):
+        if x is None:
+            return None
+        xmax = float(np.max(x)) if np.size(x) > 0 else 0.0
+        return x / xmax if xmax > 0 else np.zeros_like(x)
+
+    demand_norm = _norm(demand_series)
+    solar_norm = _norm(solar_series)
+
+    # Weight parameters (tunable; keep conservative defaults)
+    alpha_price = float(cfg.get('alpha_price', 1.0))     # favor low price
+    beta_solar = float(cfg.get('beta_solar', 0.5))       # favor high PV
+    beta_load = float(cfg.get('beta_load', 0.2))         # favor low demand
 
     required_energy_multiplier = 100 + \
         env.config.get("power_setpoint_flexibility", 10) 
@@ -646,11 +748,20 @@ def generate_power_setpoints(env) -> np.ndarray:
     min_cs_power = env.charging_stations[0].get_min_charge_power()
     max_cs_power = env.charging_stations[0].get_max_power()
 
+    # Debug counters
+    dbg_enabled = bool(getattr(env, 'debug_setpoints', False))
     total_evs_spawned = 0
+    dbg = {
+        'profiles': len(getattr(env, 'EVs_profiles', []) or []),
+        'allocations': 0,
+        'short_stay_skips': 0,
+        'limit_inversions': 0,
+        'zero_price_denom': zero_price_flag,
+    }
     for t in range(env.simulation_length):
         counter = total_evs_spawned
         for _, ev in enumerate(env.EVs_profiles[counter:]):
-            if ev.time_of_arrival == t + 1:
+            if ev.time_of_arrival == t:
                 total_evs_spawned += 1
 
                 required_energy = ev.battery_capacity - ev.battery_capacity_at_arrival
@@ -658,14 +769,43 @@ def generate_power_setpoints(env) -> np.ndarray:
                 min_power_limit = max(ev.min_ac_charge_power, min_cs_power)
                 max_power_limit = min(ev.max_ac_charge_power, max_cs_power)
 
-                # Spread randomly the required energy over the time of stay using the prices as weights
-                shifted_load = np.random.normal(loc=1 - prices[t+2:ev.time_of_departure],
-                                                scale=min(
-                                                    prices[t+2:ev.time_of_departure]),
-                                                size=ev.time_of_departure - t - 2)
-                # make shifted load positive
-                shifted_load = np.abs(shifted_load)
-                shifted_load = shifted_load / np.sum(shifted_load)
+                if min_power_limit > max_power_limit:
+                    dbg['limit_inversions'] += 1
+                    continue
+
+                # Spread required energy over the time of stay using weights
+                horizon = ev.time_of_departure - (t + 1)
+                if horizon <= 0:
+                    dbg['short_stay_skips'] += 1
+                    continue
+                # Base weight from prices (prefer low price)
+                price_w = prices[t+1:ev.time_of_departure]
+
+                # Forecast-aware weighting if available and enabled
+                use_fc = bool(use_res_v2g and demand_norm is not None and solar_norm is not None)
+                if use_fc:
+                    d_w = demand_norm[t+1:ev.time_of_departure]
+                    s_w = solar_norm[t+1:ev.time_of_departure]
+                    # combined score: higher when price low, solar high, demand low
+                    combined = alpha_price*(1 - price_w) + beta_solar*s_w + beta_load*(1 - d_w)
+                    combined = np.clip(combined, 0, None)
+                    if np.all(combined == 0) or float(np.sum(combined)) == 0.0:
+                        combined = 1 - price_w  # fallback to price only
+                    weights = combined
+                else:
+                    weights = 1 - price_w
+
+                # Add a small jitter to avoid pathological concentration
+                eps = 1e-6
+                if np.size(weights) > 0:
+                    jitter = np.random.normal(loc=0.0, scale=max(eps, float(np.min(weights + eps))), size=horizon)
+                    proto = np.clip(weights + jitter, a_min=0, a_max=None)
+                    if float(np.sum(proto)) == 0.0:
+                        proto = np.ones_like(proto)
+                    shifted_load = proto / np.sum(proto)
+                else:
+                    shifted_load = np.ones(horizon) / max(1, horizon)
+
                 shifted_load = shifted_load * required_energy * 60 / env.timescale
 
                 # find power lower than min_power_limit and higher than max_power_limit
@@ -697,9 +837,10 @@ def generate_power_setpoints(env) -> np.ndarray:
                                 shifted_load[i+1] += load_to_shift
                     step += 1
 
-                power_setpoints[t+2:ev.time_of_departure] += shifted_load
+                power_setpoints[t+1:ev.time_of_departure] += shifted_load
+                dbg['allocations'] += 1
 
-            elif ev.time_of_arrival > t + 1:
+            elif ev.time_of_arrival > t:
                 break
 
     # return smooth_vector(power_setpoints)
@@ -716,7 +857,55 @@ def generate_power_setpoints(env) -> np.ndarray:
     multiplier = int(15 / env.timescale)
     if multiplier < 1:
         multiplier = 1
-    return median_smoothing(power_setpoints, 5 * multiplier)
+    out = median_smoothing(power_setpoints, 5 * multiplier)
+
+    # Optional aggregate setpoint filters: ramp limiting and EMA smoothing in kW
+    sp_filt = getattr(env, 'config', {}).get('setpoint_filters', {})
+    sp_ramp = (sp_filt or {}).get('ramp_limit', {})
+    sp_smooth = (sp_filt or {}).get('smoothing', {})
+
+    ramp_enabled = bool(sp_ramp.get('enabled', False))
+    max_ramp_kw = float(sp_ramp.get('max_ramp_kw_per_step', 5.0))
+    smooth_enabled = bool(sp_smooth.get('enabled', False))
+    ema_alpha = float(sp_smooth.get('ema_alpha', 0.3))
+
+    if ramp_enabled or smooth_enabled:
+        # Work on a copy to avoid mutating out during ramp checks
+        filt = np.array(out, dtype=float)
+        # Ramp limiting first
+        if ramp_enabled and len(filt) > 0:
+            prev = filt[0]
+            for i in range(1, len(filt)):
+                x = filt[i]
+                delta = x - prev
+                if delta > max_ramp_kw:
+                    x = prev + max_ramp_kw
+                elif delta < -max_ramp_kw:
+                    x = prev - max_ramp_kw
+                filt[i] = x
+                prev = x
+        # EMA smoothing next
+        if smooth_enabled and len(filt) > 0:
+            a = min(max(ema_alpha, 0.0), 1.0)
+            y_prev = filt[0]
+            for i in range(1, len(filt)):
+                y = a * filt[i] + (1 - a) * y_prev
+                filt[i] = y
+                y_prev = y
+        out = filt
+
+    if dbg_enabled:
+        try:
+            nz = int(np.count_nonzero(out))
+            first_nz = int(np.argmax(out != 0)) if nz > 0 else -1
+            last_nz = int(len(out) - 1 - np.argmax(out[::-1] != 0)) if nz > 0 else -1
+            print(f"[DBG setpts] profiles={dbg['profiles']} evs_seen={total_evs_spawned} allocs={dbg['allocations']} "
+                  f"short_stay={dbg['short_stay_skips']} lim_inv={dbg['limit_inversions']} price_denom_zero={dbg['zero_price_denom']} "
+                  f"nonzero={nz} span=[{first_nz},{last_nz}]")
+        except Exception as e:
+            print(f"[DBG setpts] summary error: {e}")
+
+    return out
 
 
 def calculate_charge_power_potential(env) -> float:

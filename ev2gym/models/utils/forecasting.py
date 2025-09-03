@@ -43,24 +43,27 @@ def create_lookahead_forecast(
     # Define the forecast period
     end_time = start_time + pd.Timedelta(hours=forecast_horizon_hours)
 
-    # Extract the actual future data for the forecast horizon
-    future_data = data[start_time:end_time]
+    # Resample to hourly first for consistent alignment
+    resampled = (
+        data
+        .resample('h', label='right', closed='right')
+        .mean()
+        .ffill()
+    )
 
-    # Resample to hourly if not already
-    if pd.infer_freq(future_data.index) != 'H':
-        # Ensure we have enough data to resample, forward fill if necessary
-        future_data = future_data.resample('H').mean().ffill()
+    # Select strictly future hours relative to start_time
+    horizon_series = resampled[(resampled.index > start_time) & (resampled.index <= end_time)]
 
     # Ensure the forecast has exactly the desired number of steps
-    if len(future_data) > forecast_horizon_hours:
-        future_data = future_data.iloc[:forecast_horizon_hours]
-    elif len(future_data) < forecast_horizon_hours:
+    if len(horizon_series) > forecast_horizon_hours:
+        horizon_series = horizon_series.iloc[:forecast_horizon_hours]
+    elif len(horizon_series) < forecast_horizon_hours:
         # If not enough data, pad with the last known value
-        padding_needed = forecast_horizon_hours - len(future_data)
-        last_value = future_data.iloc[-1] if not future_data.empty else 0
-        padding_index = pd.date_range(start=future_data.index[-1] + pd.Timedelta(hours=1), periods=padding_needed, freq='H')
+        padding_needed = forecast_horizon_hours - len(horizon_series)
+        last_value = horizon_series.iloc[-1] if not horizon_series.empty else 0
+        padding_index = pd.date_range(start=(horizon_series.index[-1] if not horizon_series.empty else pd.Timestamp(start_time)) + pd.Timedelta(hours=1), periods=padding_needed, freq='h')
         padding_series = pd.Series([last_value] * padding_needed, index=padding_index)
-        future_data = pd.concat([future_data, padding_series])
+        horizon_series = pd.concat([horizon_series, padding_series])
 
     # Generate smooth noise
     smooth_noise = generate_smooth_noise(
@@ -70,7 +73,7 @@ def create_lookahead_forecast(
     )
 
     # Apply noise to the forecast
-    forecast_values = future_data.values
+    forecast_values = horizon_series.values
     noise_to_apply = np.array(smooth_noise) * noise_level * np.mean(np.abs(forecast_values))
     
     forecast = forecast_values + noise_to_apply

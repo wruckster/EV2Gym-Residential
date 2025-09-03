@@ -339,6 +339,14 @@ class Rescale_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
             print(f'Min power: {[round(a, 2) for a in self.min_power]}')
             print(f'Max power: {[round(a, 2) for a in self.max_power]}')
 
+        # One-line debug when env.debug_setpoints is enabled
+        if getattr(self.env, 'debug_setpoints', False):
+            try:
+                print(f"[DBG action] step={self.env.current_step} setpt={power_setpoint:.3f} "
+                      f"in_sum={float(np.nansum(action)):.3f} buf={len(self.ev_buffer)} curP={current_action_power:.3f}")
+            except Exception as _:
+                pass
+
         if current_action_power < power_setpoint:
 
             total_power_potential = current_action_power
@@ -528,6 +536,14 @@ class Rescale_RepairLayer_V2G(gym.ActionWrapper, gym.utils.RecordConstructorArgs
                 idx += 1
 
         out = action * mask
+
+        # One-line debug when env.debug_setpoints is enabled (V2G wrapper)
+        if getattr(self.env, 'debug_setpoints', False):
+            try:
+                setpt = float(self.env.power_setpoints[self.env.current_step]) if hasattr(self.env, 'power_setpoints') else float('nan')
+                print(f"[DBG action V2G] step={self.env.current_step} setpt={setpt:.3f} in_sum={float(np.nansum(action)):.3f} out_sum={float(np.nansum(out)):.3f}")
+            except Exception:
+                pass
 
         if self.verbose:
             print(f"[V2G Wrapper] in:  {np.round(action, 3)}")

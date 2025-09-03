@@ -182,38 +182,39 @@ def _plot_main(replays, labels, save_path):
     # ------------------------------------------------------------------
     # 4. Create subplots
     # ------------------------------------------------------------------
-    grid = plt.GridSpec(4, 2, figure=fig)  
+    # Allocate 3 rows because we reference grid[2, 0] below (per-step reward panel)
+    grid = plt.GridSpec(3, 1, figure=fig, hspace=0.6)
 
     # 4.1 Total power usage (actual vs setpoint)
     ax1 = fig.add_subplot(grid[0, 0])
     _plot_power_usage(ax1, power_data, setpoint_data, demand_data, solar_data, labels)
 
-    # 4.2 EV Trajectory
-    ax2 = fig.add_subplot(grid[0, 1])
-    plot_ev_trajectories(replays[0], ax2)
+    # # 4.2 EV Trajectory
+    # ax2 = fig.add_subplot(grid[0, 1])
+    # plot_ev_trajectories(replays[0], ax2)
 
-    # 4.3 Total EVs parked
-    ax3 = fig.add_subplot(grid[1, 0])
-    _plot_ev_count(ax3, ev_count_data, labels)
+    # # 4.3 Total EVs parked
+    # ax3 = fig.add_subplot(grid[1, 0])
+    # _plot_ev_count(ax3, ev_count_data, labels)
 
-    # 4.4 Cumulative reward
-    ax4 = fig.add_subplot(grid[1, 1])
-    _plot_cumulative_reward(ax4, reward_data, labels)
+    # # 4.4 Cumulative reward
+    # ax4 = fig.add_subplot(grid[1, 1])
+    # _plot_cumulative_reward(ax4, reward_data, labels)
 
     # 4.5 Per-step reward
     ax5 = fig.add_subplot(grid[2, 0])
     _plot_per_step_reward(ax5, reward_data, labels)
     
-    # 4.6 EV plug-in status (NEW)
-    ax6 = fig.add_subplot(grid[2, 1])
-    _plot_ev_plug_status(ax6, ev_locations, labels, replays[0])
+    # # 4.6 EV plug-in status (NEW)
+    # ax6 = fig.add_subplot(grid[2, 1])
+    # _plot_ev_plug_status(ax6, ev_locations, labels, replays[0])
 
-    # 4.7 EV Trajectory
-    ax7 = fig.add_subplot(grid[3, 0:])
-    plot_ev_trajectories(replays[0], ax7)
+    # # 4.7 EV Trajectory
+    # ax7 = fig.add_subplot(grid[3, 0:])
+    # plot_ev_trajectories(replays[0], ax7)
 
     # Apply step + datetime formatter to all time-series axes
-    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
+    for ax in [ax1, ax5]:
         _apply_time_formatter(ax, replays[0])
 
     # ------------------------------------------------------------------
@@ -314,18 +315,32 @@ def _plot_replays(replays, labels, save_path):
 
 
 def _plot_power_usage(ax, power_data, setpoint_data, demand_data, solar_data, labels):
+    # Plot actual power usage
     for i, power in enumerate(power_data):
-        ax.plot(power, label=f"{labels[i]} – actual")
+        ax.plot(power, label=f"{labels[i]} – actual", linewidth=2, color='blue')
+    
+    # Plot power setpoints
     for i, setpoint in enumerate(setpoint_data):
-        ax.plot(setpoint, "--", label=f"{labels[i]} – set-point")
+        ax.plot(setpoint, "--", label=f"{labels[i]} – setpoint", linewidth=2, color='red', alpha=0.8)
+    
+    # Plot household demand with enhanced visibility
     for i, demand in enumerate(demand_data):
-        ax.plot(demand, label=f"{labels[i]} – demand", linestyle=":", alpha=0.8)
+        if demand is not None and len(demand) > 0:
+            ax.plot(demand, label=f"{labels[i]} – household demand", 
+                   linestyle=":", linewidth=2, color='green', alpha=0.9)
+    
+    # Plot solar generation
     for i, solar in enumerate(solar_data):
-        ax.plot(solar, label=f"{labels[i]} – solar", alpha=0.7)
-    ax.set_title("Total Power / Demand vs PV Generation [kW]")
+        if solar is not None and len(solar) > 0:
+            ax.plot(solar, label=f"{labels[i]} – solar", alpha=0.7, color='orange')
+    
+    # Add zero line for reference
+    ax.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
+    
+    ax.set_title("Power Usage vs Setpoints vs Household Demand [kW]")
     ax.set_xlabel("Timestep")
-    ax.set_ylabel("kW")
-    ax.legend()
+    ax.set_ylabel("Power [kW]")
+    ax.legend(loc='best')
     ax.grid(True, which="both", ls=":", lw=0.5)
 
 

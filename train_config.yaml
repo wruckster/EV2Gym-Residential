@@ -29,7 +29,7 @@ rl:
   # --- Tianshou OnpolicyTrainer arguments ---
   # See Tianshou docs for OnpolicyTrainer for all available options
   trainer_args:
-    max_epoch: 5
+    max_epoch: 1
     step_per_epoch: 1000
     step_per_collect: 2048
     repeat_per_collect: 4
@@ -38,7 +38,7 @@ rl:
     show_progress: True
 
   # --- Other RL settings ---
-  training_num: 2  # Number of parallel environments for training
+  training_num: 4  # Number of parallel environments for training
   test_num: 1      # Number of parallel environments for testing
   buffer_size: 200_000
 

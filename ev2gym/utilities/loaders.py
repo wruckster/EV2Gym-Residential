@@ -26,6 +26,44 @@ from ev2gym.profiles.schedule_generator import generate_ev_profiles
 from ev2gym.utilities.utils import EV_spawner, generate_power_setpoints, EV_spawner_GF
 
 
+def _ensure_filter_config_defaults(env) -> None:
+    """Ensure env.config has default blocks for filter-related options.
+
+    Adds the following keys with safe defaults if missing:
+      - setpoint_filters: controls aggregate setpoint smoothing/ramp limiting
+      - control_filters: controls controller post-processing filters
+      - pv_preference:   soft bias for using PV surplus in rule-based controller
+
+    Defaults keep behavior identical to previous versions (all disabled).
+    """
+    cfg = getattr(env, 'config', None)
+    if not isinstance(cfg, dict):
+        return
+
+    # Aggregate setpoint filters (used by generate_power_setpoints)
+    spf = cfg.setdefault('setpoint_filters', {})
+    sm = spf.setdefault('smoothing', {})
+    sm.setdefault('enabled', False)
+    sm.setdefault('ema_alpha', 0.3)
+    rl = spf.setdefault('ramp_limit', {})
+    rl.setdefault('enabled', False)
+    rl.setdefault('max_ramp_kw_per_step', 5.0)
+
+    # Controller post-filters (used by MPC and rule-based controller if they opt-in)
+    cf = cfg.setdefault('control_filters', {})
+    c_sm = cf.setdefault('smoothing', {})
+    c_sm.setdefault('enabled', False)
+    c_sm.setdefault('ema_alpha', 0.3)
+    c_rl = cf.setdefault('ramp_limit', {})
+    c_rl.setdefault('enabled', False)
+    c_rl.setdefault('max_ramp_kw_per_step', 5.0)
+
+    # PV surplus preference for rule-based controller
+    pvp = cfg.setdefault('pv_preference', {})
+    pvp.setdefault('enabled', False)
+    pvp.setdefault('weight', 0.0)
+
+
 def load_ev_spawn_scenarios(env) -> None:
     '''Loads the EV spawn scenarios of the simulation'''
 
@@ -96,6 +134,8 @@ def load_power_setpoints(env) -> np.ndarray:
     if env.load_from_replay_path:
         return env.replay.power_setpoints
     else:
+        # Ensure config blocks exist so utils can read them safely
+        _ensure_filter_config_defaults(env)
         return generate_power_setpoints(env)
 
 
@@ -494,9 +534,15 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
             # else load historical prices
             file_path = get_resource_path('ev2gym.data', 'Netherlands_day-ahead-2015-2024.csv')
             env.price_data = pd.read_csv(file_path, sep=',', header=0)
-            drop_columns = ['Country', 'Datetime (Local)']
+            # Standardize column name to 'price'
+            if 'Price (EUR/MWhe)' in env.price_data.columns:
+                env.price_data.rename(columns={'Price (EUR/MWhe)': 'price'}, inplace=True)
+            elif 'Price ($/MWhe)' in env.price_data.columns:
+                env.price_data.rename(columns={'Price ($/MWhe)': 'price'}, inplace=True)
 
-            env.price_data.drop(drop_columns, inplace=True, axis=1)
+            drop_columns = ['Country', 'Datetime (Local)']
+            env.price_data.drop(drop_columns, inplace=True, axis=1, errors='ignore')
+
             env.price_data['year'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).year
             env.price_data['month'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).month
             env.price_data['day'] = pd.DatetimeIndex(env.price_data['Datetime (UTC)']).day
@@ -519,7 +565,7 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
             # find the corresponding price
             try:
                 price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                       'Price ($/MWhe)'].iloc[0] / 1000  # price/kWh
+                                       'price'].iloc[0] / 1000  # price/kWh
                 charge_prices[:, i] = price_value
                 discharge_prices[:, i] = price_value
             except IndexError:
@@ -529,9 +575,8 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
                 year = 2022
                 if day > 28:
                     day -= 1
-                print("Debug:", year, month, day, hour)
                 price_value = data.loc[(data['year'] == year) & (data['month'] == month) & (data['day'] == day) & (data['hour'] == hour),
-                                       'Price ($/MWhe)'].iloc[0] / 1000  # price/kWh
+                                       'price'].iloc[0] / 1000  # price/kWh
                 charge_prices[:, i] = price_value
                 discharge_prices[:, i] = price_value
 

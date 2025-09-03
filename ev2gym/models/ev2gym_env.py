@@ -66,6 +66,9 @@ class EV2Gym(gym.Env):
         with open(config_file, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
 
+        # Debug flag: enable extra logging for setpoints/actions when True
+        self.debug_setpoints = bool(self.config.get('debug_setpoints', False))
+
         self.forecasting_config = self.config.get('forecasting', {'enabled': False})
         self.demand_forecast = None
         self.solar_forecast = None
@@ -263,8 +266,7 @@ class EV2Gym(gym.Env):
         self.charge_prices, self.discharge_prices = load_electricity_prices(
             self)
 
-        # Load power setpoint of simulation
-        self.power_setpoints = load_power_setpoints(self)
+        # Prepare arrays; setpoints will be generated after forecasts are updated
         self.current_power_usage = np.zeros(self.simulation_length)
         self.charge_power_potential = np.zeros(self.simulation_length)
 
@@ -275,10 +277,8 @@ class EV2Gym(gym.Env):
             self.full_timeseries_data = _load_household_profiles(self, ignore_date_filter=True)
 
         # --- FINAL INITIALIZATION ---
-        # Initialize statistics and replay object now that all dependencies are loaded
+        # Initialize statistics now that all dependencies are loaded
         self.init_statistic_variables()
-        if self.save_replay and self.replay is None:
-            self.replay = EvCityReplay(self)
 
         # Variable showing whether the simulation is done or not
         self.done = False
@@ -304,8 +304,15 @@ class EV2Gym(gym.Env):
             lows = np.zeros([self.number_of_ports])
         self.action_space = spaces.Box(low=lows, high=high, dtype=np.float64)
 
-        # Ensure forecasts are up-to-date BEFORE building observation space, so obs_dim matches actual obs length
+        # Ensure forecasts are up-to-date BEFORE using them for setpoints or building observation space
         self._update_forecasts()
+
+        # Now generate power setpoints (can use forecasts if enabled)
+        self.power_setpoints = load_power_setpoints(self)
+
+        # Create replay only after power_setpoints (and other fields) exist
+        if self.save_replay and self.replay is None:
+            self.replay = EvCityReplay(self)
 
         # Observation space: vector length of current observation (which may include forecasts)
         obs_dim = len(self._get_observation())
@@ -379,6 +386,21 @@ class EV2Gym(gym.Env):
         self.EVs_profiles = load_ev_profiles(self)
         self.power_setpoints = load_power_setpoints(self)
         self.EVs = []
+
+        # Optional concise debug: summarize EV profiles and power setpoints
+        if getattr(self, 'debug_setpoints', False):
+            try:
+                ev_count = len(self.EVs_profiles) if self.EVs_profiles is not None else 0
+                arr_times = [ev.time_of_arrival for ev in self.EVs_profiles] if ev_count > 0 else []
+                dep_times = [ev.time_of_departure for ev in self.EVs_profiles] if ev_count > 0 else []
+                nonzero = int(np.count_nonzero(self.power_setpoints)) if self.power_setpoints is not None else 0
+                max_price = float(np.max(np.abs(self.charge_prices[0]))) if hasattr(self, 'charge_prices') else float('nan')
+                preview = np.round(self.power_setpoints[:20], 3) if self.power_setpoints is not None else []
+                print(f"[DBG reset] EVs={ev_count} arrivals=[{min(arr_times) if arr_times else 'NA'},{max(arr_times) if arr_times else 'NA'}] "
+                      f"deps=[{min(dep_times) if dep_times else 'NA'},{max(dep_times) if dep_times else 'NA'}] "
+                      f"nonzero_setpoints={nonzero} max_price={max_price:.4f} preview(20)={preview}")
+            except Exception as e:
+                print(f"[DBG reset] summary error: {e}")
 
         # print(f'Simulation starting date: {self.sim_date}')
 
@@ -773,6 +795,21 @@ class EV2Gym(gym.Env):
                     start_time=self.sim_date,
                     **params
                 )
+
+        # Optional concise debug to report forecast signal availability
+        try:
+            if getattr(self, 'debug_setpoints', False) and self.config.get('res_v2g_setpoints', {}).get('enabled', False):
+                pf = getattr(self, 'price_forecast', None)
+                sp = getattr(self, 'spot_price', None)
+                df = getattr(self, 'demand_forecast', None)
+                sf = getattr(self, 'solar_forecast', None)
+                pf_shape = tuple(pf.shape) if pf is not None else None
+                sp_len = len(sp) if sp is not None else None
+                df_len = len(df) if df is not None else None
+                sf_len = len(sf) if sf is not None else None
+                print(f"[DBG fcst] price_forecast={pf_shape} spot_price_len={sp_len} demand_fc_len={df_len} solar_fc_len={sf_len}")
+        except Exception as e:
+            print(f"[DBG fcst] summary error: {e}")
 
     def _get_observation(self):
         obs = self.state_function(self)

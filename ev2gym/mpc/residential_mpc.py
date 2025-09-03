@@ -7,7 +7,22 @@ from datetime import datetime, time
 @dataclass
 class RuleBasedController:
     mode: Literal['self_consumption', 'cost_optimization', 'peak_shaving'] = 'self_consumption'
-    peak_shaving_threshold_kW: float = 2.0 # Default, can be overridden by config
+    peak_shaving_threshold_kW: float = 2.0  # Default, can be overridden by config
+
+    # Filtering config (defaults disabled to avoid behavior changes unless enabled)
+    smoothing_enabled: bool = False
+    smoothing_method: Literal['ema', 'sma'] = 'ema'
+    ema_alpha: float = 0.3  # EMA weight if smoothing is enabled
+    ramp_limit_enabled: bool = False
+    max_ramp_kw_per_step: float = 5.0
+
+    # Internal state for online filtering
+    _last_action_kw: Optional[float] = None
+    _last_filtered_kw: Optional[float] = None
+
+    # PV surplus soft preference
+    pv_pref_enabled: bool = False
+    pv_pref_weight: float = 1.0  # fraction of surplus to prefer (0..1)
 
     def compute_battery_action(
         self,
@@ -78,7 +93,32 @@ class RuleBasedController:
             max_power_to_empty_kW = (current_soc_kWh - min_soc_kWh) / dt_hours if dt_hours > 0 else float('inf')
             actual_battery_power_kW = max(battery_power_target_kW, -max_discharge_rate_kW, -max_power_to_empty_kW)
         
-        return actual_battery_power_kW
+        # Apply optional post-processing: ramp limiting then smoothing (EMA)
+        filtered_kw = actual_battery_power_kW
+
+        # Ramp limiting relative to last filtered output
+        if self.ramp_limit_enabled and self._last_filtered_kw is not None:
+            max_delta = abs(self.max_ramp_kw_per_step)
+            delta = filtered_kw - self._last_filtered_kw
+            if delta > max_delta:
+                filtered_kw = self._last_filtered_kw + max_delta
+            elif delta < -max_delta:
+                filtered_kw = self._last_filtered_kw - max_delta
+
+        # Smoothing (EMA online)
+        if self.smoothing_enabled and self.smoothing_method == 'ema':
+            if self._last_filtered_kw is None:
+                ema_prev = 0.0
+            else:
+                ema_prev = self._last_filtered_kw
+            alpha = min(max(self.ema_alpha, 0.0), 1.0)
+            filtered_kw = alpha * filtered_kw + (1 - alpha) * ema_prev
+
+        # Save state for next step
+        self._last_action_kw = actual_battery_power_kW
+        self._last_filtered_kw = filtered_kw
+
+        return filtered_kw
 
     def _self_consumption_strategy(self, net_load_kW, current_soc_kWh, battery_capacity_kWh,
                                  max_charge_rate_kW, max_discharge_rate_kW, 
@@ -103,8 +143,13 @@ class RuleBasedController:
             target_discharge_kW = min(net_load_kW, max_discharge_rate_kW)
             return -target_discharge_kW
         else:
-            surplus_pv_kW = -net_load_kW 
-            target_charge_kW = min(surplus_pv_kW, max_charge_rate_kW)
+            surplus_pv_kW = -net_load_kW
+            # In self-consumption mode, we already favor PV; optionally scale by pv_pref_weight if enabled
+            if self.pv_pref_enabled:
+                surplus_target = max(0.0, min(surplus_pv_kW * max(0.0, min(1.0, self.pv_pref_weight)), max_charge_rate_kW))
+            else:
+                surplus_target = min(surplus_pv_kW, max_charge_rate_kW)
+            target_charge_kW = surplus_target
             return target_charge_kW
 
     def _cost_optimization_strategy(self, current_time_dt, net_load_kW, current_soc_kWh, battery_capacity_kWh,
@@ -141,6 +186,12 @@ class RuleBasedController:
             # If price is low, charge from grid up to max_charge_rate_kW,
             # irrespective of net_load (could be charging from grid even if load is low)
             return max_charge_rate_kW 
+        # If neither high nor low price conditions hit, gently prioritize PV surplus if enabled
+        if self.pv_pref_enabled and net_load_kW < 0:
+            surplus_pv_kW = -net_load_kW
+            pv_bias = max(0.0, min(1.0, self.pv_pref_weight))
+            return min(surplus_pv_kW * pv_bias, max_charge_rate_kW)
+
         return self._self_consumption_strategy(net_load_kW, current_soc_kWh, battery_capacity_kWh,
                                  max_charge_rate_kW, max_discharge_rate_kW, 
                                  min_soc_kWh, max_soc_kWh, dt_hours)
@@ -168,10 +219,14 @@ class RuleBasedController:
             power_to_shave_kW = net_load_kW - peak_threshold_kW
             target_discharge_kW = min(power_to_shave_kW, max_discharge_rate_kW)
             return -target_discharge_kW
-        elif net_load_kW < 0: 
+        elif net_load_kW < 0:
             surplus_pv_kW = -net_load_kW
-            target_charge_kW = min(surplus_pv_kW, max_charge_rate_kW)
-            return target_charge_kW
+            if self.pv_pref_enabled:
+                pv_bias = max(0.0, min(1.0, self.pv_pref_weight))
+                return min(surplus_pv_kW * pv_bias, max_charge_rate_kW)
+            else:
+                target_charge_kW = min(surplus_pv_kW, max_charge_rate_kW)
+                return target_charge_kW
         return 0.0
 
     def _get_current_price(self, current_time_dt: datetime, default_price: float, 
@@ -218,3 +273,21 @@ class RuleBasedController:
             self.mode = controller_config["mode"]
         if "peak_shaving_threshold_kW" in controller_config:
             self.peak_shaving_threshold_kW = float(controller_config["peak_shaving_threshold_kW"])
+        # Filtering options (optional)
+        filt = controller_config.get('control_filters', {}) if isinstance(controller_config, dict) else {}
+        smoothing = filt.get('smoothing', {}) if isinstance(filt, dict) else {}
+        ramp = filt.get('ramp_limit', {}) if isinstance(filt, dict) else {}
+
+        self.smoothing_enabled = bool(smoothing.get('enabled', self.smoothing_enabled))
+        method = smoothing.get('method', self.smoothing_method)
+        if method in ('ema', 'sma'):
+            self.smoothing_method = method
+        self.ema_alpha = float(smoothing.get('ema_alpha', self.ema_alpha))
+
+        self.ramp_limit_enabled = bool(ramp.get('enabled', self.ramp_limit_enabled))
+        self.max_ramp_kw_per_step = float(ramp.get('max_ramp_kw_per_step', self.max_ramp_kw_per_step))
+
+        # PV preference (optional)
+        pv_pref = controller_config.get('pv_preference', {}) if isinstance(controller_config, dict) else {}
+        self.pv_pref_enabled = bool(pv_pref.get('enabled', self.pv_pref_enabled))
+        self.pv_pref_weight = float(pv_pref.get('weight', self.pv_pref_weight))

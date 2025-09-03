@@ -1,10 +1,12 @@
+debug_setpoints: true
+
 # This yml file configures the residential V2G simulation
 
 ##############################################################################
 # Simulation Parameters
 ##############################################################################
 timescale: 5  # minutes per step
-simulation_length: 100  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+simulation_length: 500  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 # Path to external features
 data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet
@@ -140,6 +142,43 @@ charging_network_topology: None
 # How much the power setpoints can vary in percentage compared to the nominal power
 # The higher the number the easier it is to meet the power setpoints, the opposite for negative numbers
 power_setpoint_flexibility: 10  # (in percentage +/- %)
+
+# Residential V2G setpoint policy (default: disabled)
+# Minimal gate so existing runs are unchanged unless explicitly enabled
+res_v2g_setpoints:
+  enabled: true                 # Gate to avoid breaking existing runs
+  # Optional tuning (all optional):
+  # If omitted, reasonable defaults/derivations are used from transformer/CS/EV specs
+  export_limit_kw_per_site: 5.0  # If omitted, derive from transformer.max_power and station limits
+  ramp_kw_per_step: 1.0          # If omitted, derive from EV/CS power × a small fraction
+  smoothing_window_steps: 4      # If omitted, reuse existing median_smoothing window logic
+  # objective: self_sufficiency  # [profit|self_sufficiency|emissions] (to be used in Step 3)
+
+##############################################################################
+# Filters and Preferences (default-off; enable for experiments)
+##############################################################################
+# Post-processing filters for controllers (rule-based and MPC)
+control_filters:
+  smoothing:
+    enabled: false
+    ema_alpha: 0.3
+  ramp_limit:
+    enabled: false
+    max_ramp_kw_per_step: 5.0
+
+# Aggregate power setpoint filters for generated setpoints
+setpoint_filters:
+  smoothing:
+    enabled: false
+    ema_alpha: 0.3
+  ramp_limit:
+    enabled: false
+    max_ramp_kw_per_step: 5.0
+
+# Soft preference to charge from PV surplus (rule-based controller)
+pv_preference:
+  enabled: false
+  weight: 1.0  # fraction [0..1] of available PV surplus to prefer
 
 ##############################################################################
 # Transformer Configuration
