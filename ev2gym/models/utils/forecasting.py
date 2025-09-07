@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from perlin_noise import PerlinNoise
 from typing import List, Optional
+import pytz
 
 def generate_smooth_noise(timesteps: int, octaves: int, seed: Optional[int] = None) -> List[float]:
     """
@@ -17,6 +18,8 @@ def generate_smooth_noise(timesteps: int, octaves: int, seed: Optional[int] = No
     """
     noise = PerlinNoise(octaves=octaves, seed=seed)
     return [noise([i / timesteps]) for i in range(timesteps)]
+
+_clf_dbg_printed = False
 
 def create_lookahead_forecast(
     data: pd.Series,
@@ -40,42 +43,55 @@ def create_lookahead_forecast(
     Returns:
         np.ndarray: A numpy array containing the 24-hour forecast.
     """
-    # Define the forecast period
-    end_time = start_time + pd.Timedelta(hours=forecast_horizon_hours)
+    # Ensure timezone is fixed +10 (no DST) and index is tz-aware
+    fixed_tz = pytz.FixedOffset(600)  # +10 hours
+    series = data.copy()
+    # Force numeric and handle NaNs progressively
+    try:
+        series = pd.to_numeric(series, errors='coerce')
+    except Exception:
+        pass
+    if series.index.tz is None:
+        series.index = series.index.tz_localize(fixed_tz)
+    else:
+        series.index = series.index.tz_convert(fixed_tz)
+    s = pd.Timestamp(start_time)
+    if s.tzinfo is None:
+        s = s.tz_localize(series.index.tz)
+    else:
+        s = s.tz_convert(series.index.tz)
 
-    # Resample to hourly first for consistent alignment
-    resampled = (
-        data
-        .resample('h', label='right', closed='right')
-        .mean()
-        .ffill()
-    )
+    # Build target timestamps at exact hour offsets and sample nearest values from the original series
+    targets = pd.DatetimeIndex([s + pd.Timedelta(hours=h) for h in range(1, forecast_horizon_hours + 1)])
+    # Use indexer with nearest; robust fallbacks for missing values
+    idxpos = series.index.get_indexer(targets, method='nearest')
+    vals: list[float] = []
+    s_ff = series.ffill().bfill()
+    for pos, t in zip(idxpos, targets):
+        v = None
+        if pos != -1:
+            v = series.iloc[pos]
+        if v is None or pd.isna(v):
+            try:
+                v = s_ff.asof(t)
+            except Exception:
+                v = None
+        if v is None or pd.isna(v):
+            v = 0.0
+        vals.append(float(v))
+    base = np.asarray(vals, dtype=float)
 
-    # Select strictly future hours relative to start_time
-    horizon_series = resampled[(resampled.index > start_time) & (resampled.index <= end_time)]
-
-    # Ensure the forecast has exactly the desired number of steps
-    if len(horizon_series) > forecast_horizon_hours:
-        horizon_series = horizon_series.iloc[:forecast_horizon_hours]
-    elif len(horizon_series) < forecast_horizon_hours:
-        # If not enough data, pad with the last known value
-        padding_needed = forecast_horizon_hours - len(horizon_series)
-        last_value = horizon_series.iloc[-1] if not horizon_series.empty else 0
-        padding_index = pd.date_range(start=(horizon_series.index[-1] if not horizon_series.empty else pd.Timestamp(start_time)) + pd.Timedelta(hours=1), periods=padding_needed, freq='h')
-        padding_series = pd.Series([last_value] * padding_needed, index=padding_index)
-        horizon_series = pd.concat([horizon_series, padding_series])
-
-    # Generate smooth noise
-    smooth_noise = generate_smooth_noise(
-        timesteps=forecast_horizon_hours,
-        octaves=noise_octaves,
-        seed=noise_seed
-    )
-
-    # Apply noise to the forecast
-    forecast_values = horizon_series.values
-    noise_to_apply = np.array(smooth_noise) * noise_level * np.mean(np.abs(forecast_values))
-    
-    forecast = forecast_values + noise_to_apply
-
-    return forecast.astype(np.float32)
+    # Add smooth multiplicative noise around 1.0
+    if noise_level and noise_level > 0:
+        noise = np.array(generate_smooth_noise(len(base), noise_octaves, noise_seed))
+        base = base * (1.0 + noise_level * noise)
+    # One-time debug dump to help diagnose zero forecasts
+    global _clf_dbg_printed
+    if not _clf_dbg_printed:
+        try:
+            preview = ", ".join(f"{x:.4f}" for x in base[:6])
+            print(f"[DBG clf] horizon={forecast_horizon_hours} start={s} series_len={len(series)} preview=[{preview}] min={base.min():.4f} max={base.max():.4f}")
+        except Exception:
+            pass
+        _clf_dbg_printed = True
+    return base.astype(float)

@@ -2,6 +2,7 @@
 This file contains the loaders for the EV City environment.
 '''
 
+import os
 import numpy as np
 import pandas as pd
 import math
@@ -9,6 +10,7 @@ import datetime
 import importlib.resources
 import pathlib
 from importlib.resources.abc import Traversable
+import pytz
 
 def get_resource_path(package, resource):
     """Helper function to get resource path using importlib.resources"""
@@ -146,7 +148,7 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
     '''
 
     # Load the data
-    # --- Use NSW household CSVs if provided ---
+    # --- Use NSW household profiles if provided ---
     household_df = _load_household_profiles(env)
     if household_df is not None:
         scale = env.config['inflexible_loads'].get('scale_mean', 1.0)
@@ -154,7 +156,17 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
         new_data = pd.DataFrame()
         for i in range(env.number_of_transformers):
             new_data[f'tr_{i}'] = demand_series * env.tr_rng.uniform(0.9, 1.1)
-        return new_data.to_numpy().T
+        arr = new_data.to_numpy().T
+        try:
+            if not hasattr(env, '_dbg_inflex_once'):
+                env._dbg_inflex_once = True
+                src = env.config.get('inflexible_loads', {}).get('data_file') or env.config.get('inflexible_loads', {}).get('data_files')
+                print(f"[DBG inflex] source=household_file scale_mean={scale} transformers={env.number_of_transformers} len={arr.shape[1]} src_minmax=({float(demand_series.min()):.4f},{float(demand_series.max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f}) src={src}")
+                if np.allclose(arr, 0.0):
+                    print("[WARN inflex] Generated inflexible loads are all zeros from household path. Check scale_mean and input files/date filter.")
+        except Exception:
+            pass
+        return arr
 
     # If no NSW data available, fall back to the default dataset
     data_path = get_resource_path('ev2gym.data', 'residential_loads.csv')
@@ -199,11 +211,22 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
     new_data = pd.DataFrame()
 
     for i in range(number_of_transformers):
-        new_data['tr_'+str(i)] = data.sample(10, axis=1,
+        # Guard against small column counts
+        k = min(10, data.shape[1])
+        new_data['tr_'+str(i)] = data.sample(k, axis=1,
                                              random_state=env.tr_seed).sum(axis=1)
 
+    arr = new_data.to_numpy().T
+    try:
+        if not hasattr(env, '_dbg_inflex_once'):
+            env._dbg_inflex_once = True
+            print(f"[DBG inflex] source=fallback_csv file={data_path} transformers={number_of_transformers} len={arr.shape[1]} csv_minmax=({float(data.min(numeric_only=True).min()):.4f},{float(data.max(numeric_only=True).max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f})")
+            if np.allclose(arr, 0.0):
+                print("[WARN inflex] Generated inflexible loads are all zeros from fallback CSV. Check data file and scaling.")
+    except Exception:
+        pass
     # return the "tr_" columns
-    return new_data.to_numpy().T
+    return arr
 
 
 def generate_pv_generation(env) -> np.ndarray:
@@ -212,18 +235,19 @@ def generate_pv_generation(env) -> np.ndarray:
     and then adding minor variations to the data
     '''
 
-    # --- Load PV from household CSVs when requested ---
-    if env.config.get('solar_power', {}).get('data_from_household_csv', False):
+    # --- Load PV from household file (Parquet or CSVs) when requested ---
+    sp_cfg = env.config.get('solar_power', {})
+    use_household_file = bool(sp_cfg.get('data_from_household_file', False) or sp_cfg.get('data_from_household_csv', False))
+    if use_household_file:
         household_df = _load_household_profiles(env)
         if household_df is None:
-            raise ValueError("solar_power.data_from_household_csv is True but no household CSVs provided")
-        
+            raise ValueError("solar_power requested from household file but no household data available (check inflexible_loads.data_file or data_files)")
+
         # Check if solar column exists
         if 'solar' not in household_df.columns:
-            print("Warning: No solar data found in household profiles. Using zeros for solar generation.")
-            solar_series = pd.Series(0, index=range(env.simulation_length))
-        else:
-            solar_series = household_df['solar']
+            # If no solar column, create a zero series of appropriate length
+            household_df['solar'] = 0.0
+        solar_series = household_df['solar']
             
         new_data = pd.DataFrame()
         for i in range(env.number_of_transformers):
@@ -611,6 +635,93 @@ def _load_household_profiles(env, ignore_date_filter: bool = False):
         (needed so forecasting can slice by actual timestamps and look ahead)
     """
     cfg = env.config.get('inflexible_loads', {})
+    # New optional path: rolled-up Parquet with household_ids selection
+    data_file = cfg.get('data_file')  # may be str or [str]
+    household_ids = cfg.get('household_ids')
+    if data_file is not None:
+        # Normalize to string
+        if isinstance(data_file, list):
+            if len(data_file) == 0:
+                return None
+            data_file = data_file[0]
+        if not os.path.exists(data_file):
+            print(f"Error: Parquet file not found: {data_file}")
+            return None
+        if not isinstance(household_ids, (list, tuple)) or len(household_ids) == 0:
+            print("Warning: household_ids not provided; using all households in Parquet")
+        try:
+            df = pd.read_parquet(data_file)
+        except Exception as e:
+            print(f"Error reading Parquet {data_file}: {e}")
+            return None
+        # Expect columns: timestamp, household_id, demand, solar
+        required_cols = {"timestamp", "household_id", "demand", "solar"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            print(f"Error: Parquet missing columns {missing} in {data_file}")
+            return None
+        # Filter by household_ids if provided
+        if isinstance(household_ids, (list, tuple)) and len(household_ids) > 0:
+            df = df[df["household_id"].isin(household_ids)].copy()
+        # Prepare index
+        df["timestamp"] = pd.to_datetime(df["timestamp"])  # handles tz-aware too
+        df = df.set_index("timestamp").sort_index()
+        # Aggregate across households per timestamp (sum over selected ids)
+        df_agg = df.groupby(level=0)[["demand", "solar"]].sum()
+
+        # Construct start/end
+        year = env.config.get('year', 2019)
+        month = env.config.get('month', 1)
+        day = env.config.get('day', 1)
+        hour = env.config.get('hour', 0)
+        minute = env.config.get('minute', 0)
+        start_date = pd.Timestamp(year=year, month=month, day=day, hour=hour, minute=minute)
+        end_date = start_date + pd.Timedelta(minutes=env.timescale * env.simulation_length)
+
+        # Enforce constant GMT+10 (no DST) for the entire dataset
+        fixed_tz = pytz.FixedOffset(600)  # +10 hours
+        if df_agg.index.tz is None:
+            df_agg.index = df_agg.index.tz_localize(fixed_tz)
+        else:
+            # Convert any incoming tz (e.g., Australia/Sydney) to fixed +10
+            df_agg.index = df_agg.index.tz_convert(fixed_tz)
+
+        # Resample to env timescale
+        df_rs = df_agg.resample(f"{env.timescale}min").mean().interpolate(method='time')
+        if not ignore_date_filter:
+            # Align boundaries to fixed +10 tz
+            idx_tz = df_rs.index.tz
+            if start_date.tzinfo is None:
+                start_date = start_date.tz_localize(idx_tz)
+                end_date = end_date.tz_localize(idx_tz)
+            # Slice to [start_date, end_date] and then ensure exact length by pad/trunc
+            df_rs = df_rs[(df_rs.index >= start_date) & (df_rs.index <= end_date)]
+            # If empty, fallback to full resampled series
+            if df_rs.empty:
+                print(f"Warning: No data in {data_file} for date range {start_date} to {end_date}. Using full dataset.")
+                df_use = df_rs
+                df_use = df_agg.resample(f"{env.timescale}min").mean().interpolate(method='time')
+            else:
+                df_use = df_rs
+            # Align length
+            # If too short, repeat last value; if too long, truncate
+            desired = int(env.simulation_length)
+            if len(df_use) < desired and not df_use.empty:
+                last_val = df_use.iloc[-1]
+                need = desired - len(df_use)
+                pad_index = pd.date_range(start=df_use.index[-1] + pd.Timedelta(minutes=env.timescale), periods=need, freq=f"{env.timescale}min")
+                pad_df = pd.DataFrame([last_val.values] * need, index=pad_index, columns=df_use.columns)
+                df_use = pd.concat([df_use, pad_df])
+            if len(df_use) > desired:
+                df_use = df_use.iloc[:desired]
+            # Backward compatibility: return RangeIndex and only the needed columns
+            df_out = df_use.reset_index(drop=False)
+            return df_out[["timestamp", "demand", "solar"]] if "timestamp" in df_out.columns else df_out.rename_axis("timestamp").reset_index()[["timestamp", "demand", "solar"]]
+        else:
+            # Forecasting path: preserve DatetimeIndex, no truncation/padding
+            return df_rs
+
+    # Legacy path: list of CSVs in data_files
     file_paths = cfg.get('data_files', [])
     if not file_paths:
         return None

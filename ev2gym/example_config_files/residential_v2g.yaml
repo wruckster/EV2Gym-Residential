@@ -17,7 +17,7 @@ data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet
 # Year, month, day
 year: 2023  # 2015-2023
 month: 4    # 1-12
-day: 1     # 1-31
+day: 2     # 1-31
 # Whether to get a random date every time the environment is reset
 random_day: False  # True or False
 random_hour: False  # True or False
@@ -33,6 +33,9 @@ simulation_days: both  # weekdays, weekends, or both
 ##############################################################################
 # New user_profiles section that extends existing functionality
 ##############################################################################
+accounts:
+  roaming: true
+
 user_profiles:
   office_worker:
     profile_name: office_worker
@@ -177,7 +180,7 @@ setpoint_filters:
 
 # Soft preference to charge from PV surplus (rule-based controller)
 pv_preference:
-  enabled: false
+  enabled: true
   weight: 1.0  # fraction [0..1] of available PV surplus to prefer
 
 ##############################################################################
@@ -235,9 +238,9 @@ charging_station:
 ##############################################################################
 inflexible_loads: # Offices, homes
   include: True # True or False
-  data_files:                                    # one or more CSVs in nsw_dataset/households/
-    - ev2gym/data/nsw_dataset/households/SuRF-property_32.csv
-  #   # - ev2gym/data/nsw_dataset/households/SuRF-property_99.csv
+  data_file:                                    # one or more CSVs in nsw_dataset/households/
+    - ev2gym/data/nsw_dataset/households/households_combined.parquet
+  household_ids: [32] # only supports one household for now
   scale_mean: 1.0   
   scale_to_max_power: false # If true, scales the load to match transformer max power
   inflexible_loads_capacity_multiplier_mean: 1 # 1 is default, the higher the number the more inflexible loads
@@ -249,7 +252,7 @@ inflexible_loads: # Offices, homes
 ##############################################################################
 solar_power:
   include: true  # Enable solar power generation
-  data_from_household_csv: true                 # piggy-back on the same files
+  data_from_household_file: true                 # piggy-back on the same files
   scale_to_max_power: false # If true, scales the generation to match transformer max power
   solar_power_capacity_multiplier_mean: 1  # 1 is default, higher means more solar power
   forecast_mean: 80  # in percentage of load at time t%

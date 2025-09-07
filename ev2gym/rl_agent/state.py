@@ -1,6 +1,7 @@
 '''  This file contains various example state functions for the RL agent '''
 import math
 import numpy as np
+from typing import List, Tuple
 
 
 def PublicPST(env, *args):
@@ -61,6 +62,77 @@ def PublicPST(env, *args):
     np.set_printoptions(suppress=True)
 
     return state
+
+## Ledger-based observation API
+
+def _ledger_column_plan(env, account_id: int) -> tuple[list[str], list[str]]:
+    """Return ordered column lists from global and account ledgers.
+    Conservative, stable selection for observations.
+    """
+    # Global: time features, 24h price forecast, and key totals
+    g_pref = [
+        "step_ratio", "dow", "hour", "minute",
+        *[f"price_fc_h{h:02d}" for h in range(1, 25)],
+        "power_setpoint_kw", "total_power_usage_kw", "ev_power_kw",
+        "inflexible_load_kw", "solar_production_kw", "evs_parked",
+    ]
+    gcols = [c for c in g_pref if getattr(env, "global_buffers", None) is not None and c in env.global_buffers.columns]
+
+    # Account: charger-level and per-port core values, plus optional per-account forecasts
+    abuf = env.account_buffers.get(account_id) if getattr(env, "account_buffers", None) else None
+    if abuf is None:
+        return gcols, []
+    # Discover port indices present
+    port_indices: list[int] = []
+    for name in abuf.columns:
+        if name.startswith("port") and name.endswith("_soc"):
+            try:
+                idx = int(name.split("port")[1].split("_")[0])
+                port_indices.append(idx)
+            except Exception:
+                continue
+    port_indices = sorted(set(port_indices))
+
+    a_pref = ["cs_power_kw", "cs_amps", "evs_connected"]
+    for p in port_indices:
+        a_pref.append(f"port{p}_soc")
+        a_pref.append(f"port{p}_action_norm")
+    # Add per-account 24h forecasts if present
+    load_fc_cols = [f"load_fc_h{h:02d}" for h in range(1, 25)]
+    pv_fc_cols = [f"pv_fc_h{h:02d}" for h in range(1, 25)]
+    a_pref.extend([c for c in load_fc_cols if c in abuf.columns])
+    a_pref.extend([c for c in pv_fc_cols if c in abuf.columns])
+    acols = [c for c in a_pref if c in abuf.columns]
+    return gcols, acols
+
+
+def LedgersPublicState(env, account_id: int | None = None, *args) -> np.ndarray:
+    """Build observation purely from ledgers for the given account at current step.
+
+    If account_id is None, defaults to the first charging station's id.
+    """
+    assert getattr(env, "global_buffers", None) is not None, "global_buffers not initialized"
+    # Choose default account
+    if account_id is None:
+        account_id = env.charging_stations[0].id if getattr(env, "charging_stations", None) else 0
+
+    gcols, acols = _ledger_column_plan(env, account_id)
+    t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+
+    gvals: list[float] = []
+    for c in gcols:
+        arr = env.global_buffers._data.get(c)  # type: ignore[attr-defined]
+        gvals.append(float(arr[t]) if arr is not None else np.nan)
+
+    avals: list[float] = []
+    abuf = env.account_buffers.get(account_id)
+    if abuf is not None:
+        for c in acols:
+            arr = abuf._data.get(c)  # type: ignore[attr-defined]
+            avals.append(float(arr[t]) if arr is not None else np.nan)
+
+    obs = np.array(gvals + avals, dtype=float)
+    return obs
 
 def V2G_profit_max(env, *args):
     '''

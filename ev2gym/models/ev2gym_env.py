@@ -25,7 +25,12 @@ from ev2gym.models.utils.forecasting import create_lookahead_forecast
 from ev2gym.visuals.render import Renderer
 
 from ev2gym.rl_agent.reward import SquaredTrackingErrorReward
-from ev2gym.rl_agent.state import PublicPST
+from ev2gym.rl_agent.state import PublicPST, LedgersPublicState
+from ev2gym.rl_agent.ledgers import (
+    GlobalLedgerBuffers,
+    AccountLedgerBuffers,
+    ColumnSpec,
+)
 
 
 class EV2Gym(gym.Env):
@@ -38,7 +43,7 @@ class EV2Gym(gym.Env):
                  seed=None,
                  save_replay=False,
                  save_plots=False,
-                 state_function=PublicPST,
+                 state_function=LedgersPublicState,
                  reward_function=SquaredTrackingErrorReward,
                  cost_function=None,  # cost function to use in the simulation
                  eval_mode="Normal",  # eval mode can be "Normal", "Unstirred" or "Optimal" in order to save the correct statistics in the replay file
@@ -72,8 +77,18 @@ class EV2Gym(gym.Env):
         self.forecasting_config = self.config.get('forecasting', {'enabled': False})
         self.demand_forecast = None
         self.solar_forecast = None
+        self.temperature_forecast = None
+        self.wind_forecast = None
+        self.dr_event_forecast = None
+        # Optional per-account series and forecasts (residential 1:1 household mapping)
+        self.account_load_series = {}   # cs.id -> pd.Series at env timescale
+        self.account_pv_series = {}     # cs.id -> pd.Series at env timescale
+        self.account_load_forecast = {} # cs.id -> np.ndarray length 24
+        self.account_pv_forecast = {}   # cs.id -> np.ndarray length 24
 
         self.ev_parameters = self.config.get('ev', {})
+        # Accounts mode: roaming means a single account aggregates multiple CS/ports
+        self.roaming_accounts: bool = bool(self.config.get('accounts', {}).get('roaming', False))
 
         self.generate_rnd_game = generate_rnd_game
         self.load_from_replay_path = load_from_replay_path
@@ -92,6 +107,10 @@ class EV2Gym(gym.Env):
         self.simulation_length = self.config['simulation_length']
 
         self.timestamps = []
+
+        # Ledger scaffolding (initialized later in _init_ledgers)
+        self.global_buffers = None
+        self.account_buffers = {}
 
         # for backward compatibility
         self.replay_path = replay_save_path
@@ -266,6 +285,9 @@ class EV2Gym(gym.Env):
         self.charge_prices, self.discharge_prices = load_electricity_prices(
             self)
 
+        # Initialize global/account ledgers after topology and data are available
+        self._init_ledgers()
+
         # Prepare arrays; setpoints will be generated after forecasts are updated
         self.current_power_usage = np.zeros(self.simulation_length)
         self.charge_power_potential = np.zeros(self.simulation_length)
@@ -275,6 +297,13 @@ class EV2Gym(gym.Env):
             # This assumes _load_household_profiles returns a DataFrame with all data
             # which can be used for lookaheads.
             self.full_timeseries_data = _load_household_profiles(self, ignore_date_filter=True)
+
+        # Initialize per-account household series aligned to env timeline
+        try:
+            self._init_account_series()
+        except Exception:
+            # Non-fatal; account-level columns will be NaN if data is missing
+            pass
 
         # --- FINAL INITIALIZATION ---
         # Initialize statistics now that all dependencies are loaded
@@ -386,6 +415,19 @@ class EV2Gym(gym.Env):
         self.EVs_profiles = load_ev_profiles(self)
         self.power_setpoints = load_power_setpoints(self)
         self.EVs = []
+
+        # Re-initialize ledgers for the new episode (timestamps realign, schemas consistent)
+        self._init_ledgers()
+
+        # Populate initial row (t=0) with time features and any known values
+        # so consumers can access time columns immediately after reset.
+        self.current_step = 0
+        try:
+            self._update_global_ledger_row()
+            self._update_account_ledger_row()
+        except Exception:
+            # Keep reset robust; ledger rows will be populated on first step
+            pass
 
         # Optional concise debug: summarize EV profiles and power setpoints
         if getattr(self, 'debug_setpoints', False):
@@ -604,6 +646,12 @@ class EV2Gym(gym.Env):
 
         self._update_power_statistics(self.departing_evs)
 
+        # Stash invalid action punishment for this step so the global ledger can include it
+        self._pending_invalid_action_punishment = float(total_invalid_action_punishment)
+        # Ledger writes for current step
+        self._update_global_ledger_row()
+        self._update_account_ledger_row()
+
         self.current_step += 1
         self._step_date()
         self.timestamps.append(self.sim_date)
@@ -643,6 +691,11 @@ class EV2Gym(gym.Env):
         }
 
         self.reward_history.append(reward)
+        # Finalize reward-dependent fields for row t = current_step - 1
+        try:
+            self._finalize_reward_for_row(self.current_step - 1, float(reward))
+        except Exception:
+            pass
         self.total_evs_parked.append(len(self.EVs))
 
         if visualize:
@@ -680,6 +733,31 @@ class EV2Gym(gym.Env):
         if self.render_mode:
             self.renderer.render()
 
+    def save_ledgers_parquet(self, dir_path: str) -> dict:
+        """Export the global and per-account ledgers to Parquet files.
+
+        Files written:
+          - global.parquet
+          - account_{id}.parquet for each charging station/account
+
+        Returns a dict with keys 'global' and 'accounts' mapping to file paths.
+        """
+        assert self.global_buffers is not None, "global_buffers not initialized"
+        os.makedirs(dir_path, exist_ok=True)
+        out: dict = {"global": "", "accounts": {}}
+        global_path = os.path.join(dir_path, "global.parquet")
+        self.global_buffers.to_parquet(global_path)
+        out["global"] = global_path
+        # accounts
+        for cs in self.charging_stations:
+            buf = self.account_buffers.get(cs.id)
+            if buf is None:
+                continue
+            path = os.path.join(dir_path, f"account_{cs.id}.parquet")
+            buf.to_parquet(path)
+            out["accounts"][cs.id] = path
+        return out
+
     def _save_sim_replay(self):
         '''Saves the simulation data in a pickle file'''
         replay = EvCityReplay(self)
@@ -688,6 +766,554 @@ class EV2Gym(gym.Env):
             pickle.dump(replay, f)
 
         return replay.replay_path
+
+    def _init_ledgers(self) -> None:
+        """Initialize global and per-account ledgers with timestamp plus basic columns.
+        Columns are derived from current topology (chargers/ports).
+        """
+        try:
+            # Build a deterministic timestamp array across the full simulation
+            # Use pandas for convenience then convert to numpy datetime64[ns]
+            freq = pd.Timedelta(minutes=int(self.timescale))
+            ts = pd.date_range(start=self.sim_starting_date,
+                               periods=int(self.simulation_length),
+                               freq=freq)
+            timestamps_np = ts.to_numpy(dtype='datetime64[ns]')
+        except Exception:
+            # Fallback: compute via numpy from start date
+            start = np.datetime64(self.sim_starting_date, 'ns')
+            step = np.timedelta64(int(self.timescale), 'm')
+            timestamps_np = start + np.arange(int(self.simulation_length)) * step
+
+        # Build Global schema
+        global_cols: list[ColumnSpec] = []
+        # meta
+        global_cols.append(ColumnSpec("step", np.dtype(np.int32)))
+        global_cols.append(ColumnSpec("step_ratio", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("dow", np.dtype(np.int8)))
+        global_cols.append(ColumnSpec("hour", np.dtype(np.int8)))
+        global_cols.append(ColumnSpec("minute", np.dtype(np.int8)))
+        # forecasts (H=24) – price forecast horizon columns
+        for h in range(24):
+            global_cols.append(ColumnSpec(f"price_fc_h{h+1:02d}", np.dtype(np.float32)))
+        # weather/DR forecasts (H=24)
+        for h in range(24):
+            global_cols.append(ColumnSpec(f"temp_fc_h{h+1:02d}", np.dtype(np.float32)))
+        for h in range(24):
+            global_cols.append(ColumnSpec(f"wind_fc_h{h+1:02d}", np.dtype(np.float32)))
+        # totals
+        global_cols.append(ColumnSpec("total_power_usage_kw", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("power_setpoint_kw", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("ev_power_kw", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("inflexible_load_kw", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("solar_production_kw", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("evs_parked", np.dtype(np.int16)))
+        # tracking/cost/reward
+        global_cols.append(ColumnSpec("tracking_error", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("invalid_action_punishment", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("reward_step", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("reward_cumsum", np.dtype(np.float32)))
+        # No per-CS fields in global ledger to avoid mirroring; these live in account buffers.
+
+        self.global_buffers = GlobalLedgerBuffers(
+            timestamps=timestamps_np,
+            columns=global_cols,
+        )
+
+        # Account buffers: assume one account per charging station (subject to change later)
+        # Account schema (supports roaming single-account mode)
+        if self.roaming_accounts:
+            account_cols: list[ColumnSpec] = []
+            account_cols.append(ColumnSpec("step", np.dtype(np.int32)))
+            account_cols.append(ColumnSpec("cs_power_kw", np.dtype(np.float32)))  # aggregated over all CS
+            account_cols.append(ColumnSpec("cs_amps", np.dtype(np.float32)))      # aggregated over all CS
+            account_cols.append(ColumnSpec("account_power_setpoint_kw", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("charge_price", np.dtype(np.float32)))     # average across CS
+            account_cols.append(ColumnSpec("discharge_price", np.dtype(np.float32)))  # average across CS
+            account_cols.append(ColumnSpec("evs_connected", np.dtype(np.int16)))      # total across CS
+            account_cols.append(ColumnSpec("cs_kw_limit", np.dtype(np.float32)))      # total/aggregate
+            # simplified per-account EV status (single EV in residential roaming)
+            account_cols.append(ColumnSpec("soc", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("time_to_departure", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("time_since_arrival", np.dtype(np.float32)))
+            # per-account forecasts H=24
+            for h in range(24):
+                account_cols.append(ColumnSpec(f"load_fc_h{h+1:02d}", np.dtype(np.float32)))
+            for h in range(24):
+                account_cols.append(ColumnSpec(f"pv_fc_h{h+1:02d}", np.dtype(np.float32)))
+
+            self.account_buffers = {0: AccountLedgerBuffers(
+                account_id=0,
+                timestamps=timestamps_np,
+                columns=account_cols,
+            )}
+        else:
+            for cs in self.charging_stations:
+                account_cols: list[ColumnSpec] = []
+                account_cols.append(ColumnSpec("step", np.dtype(np.int32)))
+                account_cols.append(ColumnSpec("cs_power_kw", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("cs_amps", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("account_power_setpoint_kw", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("charge_price", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("discharge_price", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("evs_connected", np.dtype(np.int16)))
+                account_cols.append(ColumnSpec("cs_kw_limit", np.dtype(np.float32)))
+                for p in range(cs.n_ports):
+                    account_cols.append(ColumnSpec(f"port{p}_amps", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_soc", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_action_norm", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_amps_limit", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_connected", np.dtype(np.int8)))
+                    account_cols.append(ColumnSpec(f"port{p}_time_to_departure", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_time_since_arrival", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_action", np.dtype(np.float32)))
+                    account_cols.append(ColumnSpec(f"port{p}_is_charging", np.dtype(np.int8)))
+                    account_cols.append(ColumnSpec(f"port{p}_is_discharging", np.dtype(np.int8)))
+                for h in range(24):
+                    account_cols.append(ColumnSpec(f"load_fc_h{h+1:02d}", np.dtype(np.float32)))
+                for h in range(24):
+                    account_cols.append(ColumnSpec(f"pv_fc_h{h+1:02d}", np.dtype(np.float32)))
+                self.account_buffers[cs.id] = AccountLedgerBuffers(
+                    account_id=cs.id,
+                    timestamps=timestamps_np,
+                    columns=account_cols,
+                )
+
+    def _update_global_ledger_row(self) -> None:
+        """Write current-step global values into global_buffers."""
+        t = self.current_step
+        if self.global_buffers is None:
+            return
+        # time features for step t (before increment): use current sim_date
+        try:
+            dow = int(self.sim_date.weekday())
+            hour = int(self.sim_date.hour)
+            minute = int(self.sim_date.minute)
+        except Exception:
+            dow = -1
+            hour = -1
+            minute = -1
+        denom = max(1, int(self.simulation_length) - 1)
+        step_ratio = float(t / denom)
+        values = {
+            "step": int(t),
+            "step_ratio": step_ratio,
+            "dow": np.int8(dow),
+            "hour": np.int8(hour),
+            "minute": np.int8(minute),
+            "total_power_usage_kw": float(self.current_power_usage[t]) if t < self.simulation_length else np.nan,
+            "power_setpoint_kw": float(self.power_setpoints[t]) if self.power_setpoints is not None and t < len(self.power_setpoints) else np.nan,
+            "ev_power_kw": float(self.energy_flow_breakdown['ev_power'][t]) if 'ev_power' in self.energy_flow_breakdown else float(np.sum(self.cs_power[:, t])) if t < self.simulation_length else np.nan,
+            "inflexible_load_kw": float(self.energy_flow_breakdown['inflexible_load'][t]) if 'inflexible_load' in self.energy_flow_breakdown else np.nan,
+            "solar_production_kw": float(self.energy_flow_breakdown['solar_production'][t]) if 'solar_production' in self.energy_flow_breakdown else np.nan,
+            "evs_parked": int(self.current_evs_parked),
+            # Defaults for tracking/cost/reward; reward fields will be finalized after reward calculation
+            "tracking_error": np.nan,
+            "invalid_action_punishment": float(getattr(self, '_pending_invalid_action_punishment', np.nan)),
+            "reward_step": np.nan,
+            "reward_cumsum": np.nan,
+        }
+        # price forecast horizon values
+        try:
+            pf = getattr(self, 'price_forecast', None)
+            row = pf[t] if pf is not None and t < len(pf) else None
+        except Exception:
+            row = None
+        for h in range(24):
+            key = f"price_fc_h{h+1:02d}"
+            if row is not None and h < len(row):
+                try:
+                    values[key] = float(row[h])
+                except Exception:
+                    values[key] = np.nan
+            else:
+                values[key] = np.nan
+        # temperature forecast (vector length up to 24 at current step)
+        try:
+            tf = getattr(self, 'temperature_forecast', None)
+        except Exception:
+            tf = None
+        for h in range(24):
+            key = f"temp_fc_h{h+1:02d}"
+            if tf is not None and h < len(tf):
+                try:
+                    values[key] = float(tf[h])
+                except Exception:
+                    values[key] = np.nan
+            else:
+                values[key] = np.nan
+        # wind forecast
+        try:
+            wf = getattr(self, 'wind_forecast', None)
+        except Exception:
+            wf = None
+        for h in range(24):
+            key = f"wind_fc_h{h+1:02d}"
+            if wf is not None and h < len(wf):
+                try:
+                    values[key] = float(wf[h])
+                except Exception:
+                    values[key] = np.nan
+            else:
+                values[key] = np.nan
+        # DR forecast (binary/int8)
+        try:
+            dfc = getattr(self, 'dr_event_forecast', None)
+        except Exception:
+            dfc = None
+        for h in range(24):
+            key = f"dr_fc_h{h+1:02d}"
+            if dfc is not None and h < len(dfc):
+                try:
+                    values[key] = np.int8(int(dfc[h] > 0.5))
+                except Exception:
+                    values[key] = np.int8(0)
+            else:
+                values[key] = np.int8(0)
+        # No per-CS fields written into the global ledger.
+        self.global_buffers.set_row(t, values)
+
+    def _finalize_reward_for_row(self, t: int, reward_value: float) -> None:
+        """Fill in reward_step, reward_cumsum, and tracking_error for row t after reward is computed."""
+        if self.global_buffers is None or t < 0 or t >= int(self.simulation_length):
+            return
+        # compute tracking error at t using available series
+        try:
+            setpt = float(self.power_setpoints[t]) if self.power_setpoints is not None else np.nan
+            cpp = float(self.charge_power_potential[t]) if t < len(self.charge_power_potential) else np.nan
+            usage = float(self.current_power_usage[t]) if t < len(self.current_power_usage) else np.nan
+            if np.isfinite(setpt) and np.isfinite(cpp) and np.isfinite(usage):
+                target = min(setpt, cpp)
+                trk_err = float((target - usage) ** 2)
+            else:
+                trk_err = np.nan
+        except Exception:
+            trk_err = np.nan
+        # reward cumsum
+        try:
+            rc = float(np.nansum(self.reward_history[: t + 1])) if hasattr(self, 'reward_history') else reward_value
+        except Exception:
+            rc = reward_value
+        self.global_buffers.update_values(t, {
+            "tracking_error": trk_err,
+            "reward_step": float(reward_value),
+            "reward_cumsum": float(rc),
+        })
+
+    def _init_account_series(self) -> None:
+        """Populate per-account household demand/PV series aligned to env timeline.
+
+        Reads the filtered, resampled household profiles and stores:
+          - self.account_load_series[account_id] -> pd.Series (kW)
+          - self.account_pv_series[account_id] -> pd.Series (kW)
+
+        In roaming mode, uses account_id=0. Otherwise assigns per CS id.
+        """
+        try:
+            df = _load_household_profiles(self, ignore_date_filter=False)
+        except Exception:
+            return
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return
+        # Build a time-indexed frame from loader output. It may return a RangeIndex with a 'timestamp' column.
+        if 'timestamp' in df.columns:
+            dt_index = pd.to_datetime(df['timestamp'])
+            # Enforce fixed +10 tz to match loader behavior
+            if dt_index.tz is None:
+                try:
+                    import pytz
+                    dt_index = dt_index.tz_localize(pytz.FixedOffset(600))
+                except Exception:
+                    pass
+            ts_df = df[['demand', 'solar']].copy()
+            ts_df.index = dt_index
+        else:
+            # Already time-indexed
+            ts_df = df[['demand', 'solar']].copy()
+            dt_index = ts_df.index
+        # Determine target timeline aligned with env start and tz
+        start_date = pd.Timestamp(year=self.config.get('year', 2019),
+                                  month=self.config.get('month', 1),
+                                  day=self.config.get('day', 1),
+                                  hour=self.config.get('hour', 0),
+                                  minute=self.config.get('minute', 0))
+        if getattr(dt_index, 'tz', None) is not None and start_date.tzinfo is None:
+            start_date = start_date.tz_localize(dt_index.tz)
+        idx = pd.date_range(start=start_date,
+                            periods=int(self.simulation_length),
+                            freq=f"{self.timescale}min",
+                            tz=(dt_index.tz if getattr(dt_index, 'tz', None) is not None else None))
+        # Reindex to env timeline
+        load_series = ts_df['demand'].reindex(idx, method='nearest') if 'demand' in ts_df.columns else None
+        pv_series = ts_df['solar'].reindex(idx, method='nearest') if 'solar' in ts_df.columns else None
+
+        # Assign to accounts
+        if self.roaming_accounts:
+            if load_series is not None:
+                self.account_load_series[0] = load_series
+            if pv_series is not None:
+                self.account_pv_series[0] = pv_series
+        else:
+            for cs in self.charging_stations:
+                if load_series is not None:
+                    self.account_load_series[cs.id] = load_series
+                if pv_series is not None:
+                    self.account_pv_series[cs.id] = pv_series
+
+    def _update_account_ledger_row(self) -> None:
+        """Write current-step per-account values into account_buffers.
+        In roaming mode, a single account (id=0) aggregates over all charging stations/ports.
+        """
+        t = self.current_step
+        if self.roaming_accounts:
+            buf = self.account_buffers.get(0)
+            if buf is None:
+                return
+            # Default per-account setpoint split (can be overridden by user logic)
+            def _get_account_setpoint(step: int) -> float:
+                try:
+                    gsp = float(self.power_setpoints[step]) if self.power_setpoints is not None else np.nan
+                    return gsp if np.isfinite(gsp) else np.nan
+                except Exception:
+                    return np.nan
+            # Aggregate CS-levels
+            total_power_kw = float(np.nansum(self.cs_power[:, t]))
+            total_amps = float(np.nansum(self.cs_current[:, t]))
+            total_evs = int(np.nansum([cs.n_evs_connected for cs in self.charging_stations]))
+            avg_charge_price = float(np.nanmean(self.charge_prices[:, t]))
+            avg_discharge_price = float(np.nanmean(self.discharge_prices[:, t]))
+            agg_kw_limit = float(np.nansum([getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan for cs in self.charging_stations]))
+            values = {
+                "step": int(t),
+                "cs_power_kw": total_power_kw,
+                "cs_amps": total_amps,
+                "account_power_setpoint_kw": float(_get_account_setpoint(t)),
+                "household_inflexible_load_kw": np.nan,
+                "household_pv_kw": np.nan,
+                "tracking_error_account": np.nan,
+                "charge_price": avg_charge_price,
+                "discharge_price": avg_discharge_price,
+                "evs_connected": total_evs,
+                "cs_kw_limit": agg_kw_limit,
+            }
+            # Household series (shared) and forecasts (aggregate sum baseline for roaming)
+            try:
+                # Use aggregate sum across transformers as the roaming baseline
+                if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
+                    total_load = float(np.nansum(self.tr_inflexible_loads[:, t]))
+                    values["household_inflexible_load_kw"] = total_load
+                if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
+                    total_solar = float(np.nansum(self.tr_solar_power[:, t]))
+                    values["household_pv_kw"] = total_solar
+                lfc = getattr(self, 'account_load_forecast', {}).get(0)
+                if lfc is None and getattr(self, 'account_load_forecast', {}):
+                    lfc = next(iter(self.account_load_forecast.values()))
+                pfc = getattr(self, 'account_pv_forecast', {}).get(0)
+                if pfc is None and getattr(self, 'account_pv_forecast', {}):
+                    pfc = next(iter(self.account_pv_forecast.values()))
+                # Debug: show first 3 forecast values vs actual future aggregate signals
+                try:
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    # Compare to aggregate sum of full transformer series (not step-filled arrays)
+                    if hasattr(self, 'transformers') and self.transformers:
+                        base_load = None
+                        try:
+                            base_load = np.nansum([tr.inflexible_load for tr in self.transformers], axis=0)
+                        except Exception:
+                            pass
+                        if base_load is not None:
+                            f1 = float(base_load[t + step_per_hour]) if t + step_per_hour < len(base_load) else np.nan
+                            f2 = float(base_load[t + 2 * step_per_hour]) if t + 2 * step_per_hour < len(base_load) else np.nan
+                            lv = [float(lfc[i]) if lfc is not None and i < len(lfc) else np.nan for i in range(2)]
+                            print(f"[DBG ledger] load_fc_h01={lv[0]:.3f} h02={lv[1]:.3f} vs future actuals {f1:.3f}, {f2:.3f}")
+                    if hasattr(self, 'transformers') and self.transformers:
+                        base_pv = None
+                        try:
+                            base_pv = np.nansum([tr.solar_power for tr in self.transformers], axis=0)
+                        except Exception:
+                            pass
+                        if base_pv is not None:
+                            f1 = float(base_pv[t + step_per_hour]) if t + step_per_hour < len(base_pv) else np.nan
+                            f2 = float(base_pv[t + 2 * step_per_hour]) if t + 2 * step_per_hour < len(base_pv) else np.nan
+                            pv = [float(pfc[i]) if pfc is not None and i < len(pfc) else np.nan for i in range(2)]
+                            print(f"[DBG ledger] pv_fc_h01={pv[0]:.3f} h02={pv[1]:.3f} vs future actuals {f1:.3f}, {f2:.3f}")
+                except Exception:
+                    pass
+                for h in range(24):
+                    values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
+                for h in range(24):
+                    values[f"pv_fc_h{h+1:02d}"] = float(pfc[h]) if pfc is not None and h < len(pfc) else np.nan
+            except Exception:
+                pass
+            # Simplified EV status (pick the first connected EV across all CS)
+            ev_found = None
+            for cs in self.charging_stations:
+                for ev in cs.evs_connected:
+                    if ev is not None:
+                        ev_found = ev
+                        break
+                if ev_found is not None:
+                    break
+            if ev_found is not None:
+                try:
+                    values["soc"] = float(ev_found.get_soc())
+                except Exception:
+                    values["soc"] = np.nan
+                try:
+                    ttd = max(0, int(getattr(ev_found, 'time_of_departure', t) - t))
+                    tsa = max(0, int(t - getattr(ev_found, 'time_of_arrival', t)))
+                except Exception:
+                    ttd, tsa = np.nan, np.nan
+                values["time_to_departure"] = float(ttd) if np.isfinite(ttd) else np.nan
+                values["time_since_arrival"] = float(tsa) if np.isfinite(tsa) else np.nan
+            else:
+                values["soc"] = np.nan
+                values["time_to_departure"] = np.nan
+                values["time_since_arrival"] = np.nan
+            # Account-level tracking error (aggregate)
+            try:
+                setpt = float(values.get("account_power_setpoint_kw", np.nan))
+                ev_kw = float(values.get("cs_power_kw", np.nan))
+                load_kw = float(values.get("household_inflexible_load_kw", np.nan))
+                pv_kw = float(values.get("household_pv_kw", np.nan))
+                if np.isfinite(setpt) and np.isfinite(ev_kw) and np.isfinite(load_kw) and np.isfinite(pv_kw):
+                    net_meter = load_kw - pv_kw + ev_kw
+                    values["tracking_error_account"] = float((setpt - net_meter) ** 2)
+            except Exception:
+                pass
+            buf.set_row(t, values)
+            return
+
+        # Non-roaming per-CS path
+        for cs in self.charging_stations:
+            buf = self.account_buffers.get(cs.id)
+            if buf is None:
+                continue
+            def _get_account_setpoint(cs_id: int, step: int) -> float:
+                try:
+                    gsp = float(self.power_setpoints[step]) if self.power_setpoints is not None else np.nan
+                    n_acc = max(1, len(self.charging_stations))
+                    return gsp / n_acc if np.isfinite(gsp) else np.nan
+                except Exception:
+                    return np.nan
+            values = {
+                "step": int(t),
+                "cs_power_kw": float(self.cs_power[cs.id, t]),
+                "cs_amps": float(self.cs_current[cs.id, t]),
+                "account_power_setpoint_kw": float(_get_account_setpoint(cs.id, t)),
+                "household_inflexible_load_kw": np.nan,
+                "household_pv_kw": np.nan,
+                "tracking_error_account": np.nan,
+                "charge_price": float(self.charge_prices[cs.id, t]),
+                "discharge_price": float(self.discharge_prices[cs.id, t]),
+                "evs_connected": int(cs.n_evs_connected),
+                "cs_kw_limit": float(getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan),
+            }
+            # Optional per-account household signals if provided
+            try:
+                # Use transformer data for this CS's connected transformers
+                if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
+                    # Find transformers connected to this CS
+                    tr_ids = []
+                    for tr in self.transformers:
+                        if cs.id in tr.cs_ids:
+                            tr_ids.append(tr.id)
+                    if tr_ids:
+                        cs_load = float(np.nansum(self.tr_inflexible_loads[tr_ids, t]))
+                        values["household_inflexible_load_kw"] = cs_load
+                if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
+                    # Find transformers connected to this CS
+                    tr_ids = []
+                    for tr in self.transformers:
+                        if cs.id in tr.cs_ids:
+                            tr_ids.append(tr.id)
+                    if tr_ids:
+                        cs_solar = float(np.nansum(self.tr_solar_power[tr_ids, t]))
+                        values["household_pv_kw"] = cs_solar
+            except Exception:
+                pass
+            # per-port amps and soc
+            for p in range(cs.n_ports):
+                # current signal if available
+                if not self.lightweight_plots:
+                    try:
+                        values[f"port{p}_amps"] = float(self.port_current_signal[p, cs.id, t])
+                    except Exception:
+                        values[f"port{p}_amps"] = np.nan
+                    try:
+                        values[f"port{p}_soc"] = float(self.port_energy_level[p, cs.id, t])
+                    except Exception:
+                        values[f"port{p}_soc"] = np.nan
+                else:
+                    # In lightweight mode, approximate from cs.current_signal and ev.get_soc if available
+                    values[f"port{p}_amps"] = float(cs.current_signal[p]) if p < len(cs.current_signal) else np.nan
+                    if p < len(cs.evs_connected) and cs.evs_connected[p] is not None:
+                        values[f"port{p}_soc"] = float(cs.evs_connected[p].get_soc())
+                    else:
+                        values[f"port{p}_soc"] = np.nan
+
+                # Action (normalized) derived from amps and limits
+                try:
+                    amps_val = float(values.get(f"port{p}_amps", np.nan))
+                except Exception:
+                    amps_val = np.nan
+                max_ch = float(getattr(cs, 'max_charge_current', np.nan))
+                max_dis = float(abs(getattr(cs, 'max_discharge_current', 0)))
+                amp_limit = float(max(max_ch if np.isfinite(max_ch) else 0, max_dis if np.isfinite(max_dis) else 0))
+                values[f"port{p}_amps_limit"] = amp_limit if amp_limit > 0 else np.nan
+                if np.isfinite(amps_val) and amp_limit > 0:
+                    # Map to [-1,1] using appropriate side
+                    if amps_val >= 0 and np.isfinite(max_ch) and max_ch > 0:
+                        values[f"port{p}_action_norm"] = float(amps_val / max_ch)
+                    elif amps_val < 0 and np.isfinite(max_dis) and max_dis > 0:
+                        values[f"port{p}_action_norm"] = float(amps_val / max_dis)
+                    else:
+                        values[f"port{p}_action_norm"] = 0.0
+                else:
+                    values[f"port{p}_action_norm"] = np.nan
+
+                # Connection flag and timing features
+                connected = 1 if (p < len(cs.evs_connected) and cs.evs_connected[p] is not None) else 0
+                values[f"port{p}_connected"] = np.int8(connected)
+                if connected:
+                    ev = cs.evs_connected[p]
+                    try:
+                        ttd = max(0, int(getattr(ev, 'time_of_departure', t) - t))
+                        tsa = max(0, int(t - getattr(ev, 'time_of_arrival', t)))
+                    except Exception:
+                        ttd, tsa = np.nan, np.nan
+                else:
+                    ttd, tsa = np.nan, np.nan
+                values[f"port{p}_time_to_departure"] = float(ttd) if np.isfinite(ttd) else np.nan
+                values[f"port{p}_time_since_arrival"] = float(tsa) if np.isfinite(tsa) else np.nan
+            # Per-account forecasts (if present)
+            try:
+                lfc = getattr(self, 'account_load_forecast', {}).get(cs.id)
+                pfc = getattr(self, 'account_pv_forecast', {}).get(cs.id)
+                for h in range(24):
+                    values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
+                for h in range(24):
+                    values[f"pv_fc_h{h+1:02d}"] = float(pfc[h]) if pfc is not None and h < len(pfc) else np.nan
+            except Exception:
+                pass
+            # Account-level tracking error if we have sufficient pieces
+            try:
+                setpt = float(values.get("account_power_setpoint_kw", np.nan))
+                ev_kw = float(values.get("cs_power_kw", np.nan))
+                load_kw = float(values.get("household_inflexible_load_kw", np.nan))
+                pv_kw = float(values.get("household_pv_kw", np.nan))
+                if np.isfinite(setpt) and np.isfinite(ev_kw) and np.isfinite(load_kw) and np.isfinite(pv_kw):
+                    net_meter = load_kw - pv_kw + ev_kw
+                    values["tracking_error_account"] = float((setpt - net_meter) ** 2)
+            except Exception:
+                pass
+            buf.set_row(t, values)
 
     def set_save_plots(self, save_plots):
         if save_plots:
@@ -782,19 +1408,150 @@ class EV2Gym(gym.Env):
         targets = self.forecasting_config.get('targets', [])
         params = self.forecasting_config.get('params', {})
 
+        # Build an aligned datetime index for the current simulation window
+        try:
+            import pytz
+            fixed_tz = pytz.FixedOffset(600)
+        except Exception:
+            fixed_tz = None
+        start_idx = pd.Timestamp(year=self.config.get('year', 2019),
+                                 month=self.config.get('month', 1),
+                                 day=self.config.get('day', 1),
+                                 hour=self.config.get('hour', 0),
+                                 minute=self.config.get('minute', 0))
+        if fixed_tz is not None and start_idx.tzinfo is None:
+            start_idx = start_idx.tz_localize(fixed_tz)
+        sim_index = pd.date_range(start=start_idx,
+                                  periods=int(self.simulation_length),
+                                  freq=f"{self.timescale}min",
+                                  tz=start_idx.tz)
+
+        # Determine availability of transformer arrays up-front
+        has_tr_load = hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None and getattr(self, 'tr_inflexible_loads').shape[0] > 0
+        has_tr_pv = hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None and getattr(self, 'tr_solar_power').shape[0] > 0
+
         for target in targets:
-            if target == 'household_demand' and 'demand' in self.full_timeseries_data.columns:
-                self.demand_forecast = create_lookahead_forecast(
-                    data=self.full_timeseries_data['demand'],
-                    start_time=self.sim_date,
-                    **params
-                )
-            elif target == 'solar_production' and 'solar' in self.full_timeseries_data.columns:
-                self.solar_forecast = create_lookahead_forecast(
-                    data=self.full_timeseries_data['solar'],
-                    start_time=self.sim_date,
-                    **params
-                )
+            if target == 'household_demand':
+                # Use aggregate sum across transformers as the forecast baseline for roaming account
+                if has_tr_load and hasattr(self, 'transformers') and self.transformers:
+                    print("[DBG fcst-path] demand using transformer aggregate sum (full series)")
+                    # Use full transformer series (not step-filled arrays)
+                    try:
+                        agg_load = np.nansum([tr.inflexible_load for tr in self.transformers], axis=0)
+                    except Exception:
+                        # Fallback to step-filled arrays if needed
+                        agg_load = np.nansum(self.tr_inflexible_loads, axis=0)
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    t0 = int(self.current_step)
+                    horizon = int(params.get('forecast_horizon_hours', 24))
+                    fc = []
+                    for h in range(1, horizon + 1):
+                        idx = t0 + h * step_per_hour
+                        fc.append(float(agg_load[idx]) if idx < len(agg_load) else float(agg_load[-1]))
+                    self.demand_forecast = np.asarray(fc, dtype=float)
+                    # Per-step lightweight debug
+                    try:
+                        f0_idx = t0
+                        f1_idx = t0 + step_per_hour
+                        f2_idx = t0 + 2 * step_per_hour
+                        f0_val = float(agg_load[f0_idx]) if f0_idx < len(agg_load) else np.nan
+                        f1_val = float(agg_load[f1_idx]) if f1_idx < len(agg_load) else np.nan
+                        f2_val = float(agg_load[f2_idx]) if f2_idx < len(agg_load) else np.nan
+                        fc1 = float(self.demand_forecast[0]) if len(self.demand_forecast) > 0 else np.nan
+                        fc2 = float(self.demand_forecast[1]) if len(self.demand_forecast) > 1 else np.nan
+                        print(f"[DBG fcst-step] demand src(sum,full) t={t0}: now={f0_val:.4f} +1h@{f1_idx}={f1_val:.4f} +2h@{f2_idx}={f2_val:.4f} | fc1={fc1:.4f} fc2={fc2:.4f}")
+                    except Exception:
+                        pass
+                # Primary fallback: use full_timeseries_data which contains the entire horizon
+                elif hasattr(self, 'full_timeseries_data') and 'demand' in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
+                    print("[DBG fcst-path] demand using full_timeseries_data['demand']")
+                    series = self.full_timeseries_data['demand']
+                    self.demand_forecast = create_lookahead_forecast(
+                        data=series,
+                        start_time=self.sim_date,
+                        **params
+                    )
+                # Otherwise skip
+                else:
+                    # Data not ready; skip to avoid building zero forecasts. Will try again next tick.
+                    print("[DBG fcst-path] demand skipped (no transformer arrays yet and no full_timeseries_data)")
+                    self.demand_forecast = None
+            elif target == 'solar_production':
+                if has_tr_pv and hasattr(self, 'transformers') and self.transformers:
+                    print("[DBG fcst-path] solar using transformer aggregate sum (full series)")
+                    try:
+                        agg_pv = np.nansum([tr.solar_power for tr in self.transformers], axis=0)
+                    except Exception:
+                        agg_pv = np.nansum(self.tr_solar_power, axis=0)
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    t0 = int(self.current_step)
+                    horizon = int(params.get('forecast_horizon_hours', 24))
+                    fc = []
+                    for h in range(1, horizon + 1):
+                        idx = t0 + h * step_per_hour
+                        fc.append(float(agg_pv[idx]) if idx < len(agg_pv) else float(agg_pv[-1]))
+                    self.solar_forecast = np.asarray(fc, dtype=float)
+                    # Per-step lightweight debug for PV
+                    try:
+                        f0_idx = t0
+                        f1_idx = t0 + step_per_hour
+                        f2_idx = t0 + 2 * step_per_hour
+                        f0_val = float(agg_pv[f0_idx]) if f0_idx < len(agg_pv) else np.nan
+                        f1_val = float(agg_pv[f1_idx]) if f1_idx < len(agg_pv) else np.nan
+                        f2_val = float(agg_pv[f2_idx]) if f2_idx < len(agg_pv) else np.nan
+                        fc1 = float(self.solar_forecast[0]) if len(self.solar_forecast) > 0 else np.nan
+                        fc2 = float(self.solar_forecast[1]) if len(self.solar_forecast) > 1 else np.nan
+                        print(f"[DBG fcst-step] solar  src(sum,full) t={t0}: now={f0_val:.4f} +1h@{f1_idx}={f1_val:.4f} +2h@{f2_idx}={f2_val:.4f} | fc1={fc1:.4f} fc2={fc2:.4f}")
+                    except Exception:
+                        pass
+                elif hasattr(self, 'full_timeseries_data') and 'solar' in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
+                    print("[DBG fcst-path] solar using full_timeseries_data['solar']")
+                    series = self.full_timeseries_data['solar']
+                    self.solar_forecast = create_lookahead_forecast(
+                        data=series,
+                        start_time=self.sim_date,
+                        **params
+                    )
+                elif has_tr_pv:
+                    print("[DBG fcst-path] solar using transformer aggregate sum")
+                    agg_pv = np.nansum(self.tr_solar_power, axis=0)
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    t0 = int(self.current_step)
+                    horizon = int(params.get('forecast_horizon_hours', 24))
+                    fc = []
+                    for h in range(1, horizon + 1):
+                        idx = t0 + h * step_per_hour
+                        fc.append(float(agg_pv[idx]) if idx < len(agg_pv) else float(agg_pv[-1]))
+                    self.solar_forecast = np.asarray(fc, dtype=float)
+            elif target in ('temperature', 'temp'):
+                # try common column names
+                for cname in ['temperature', 'temp', 'air_temp']:
+                    if hasattr(self, 'full_timeseries_data') and cname in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
+                        self.temperature_forecast = create_lookahead_forecast(
+                            data=self.full_timeseries_data[cname],
+                            start_time=self.sim_date,
+                            **params
+                        )
+                        break
+            elif target in ('wind_speed', 'wind'):
+                for cname in ['wind_speed', 'wind', 'wind_spd']:
+                    if hasattr(self, 'full_timeseries_data') and cname in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
+                        self.wind_forecast = create_lookahead_forecast(
+                            data=self.full_timeseries_data[cname],
+                            start_time=self.sim_date,
+                            **params
+                        )
+                        break
+            elif target in ('dr_event_active', 'dr_event', 'dr'):
+                # Treat as binary series; forecast returns floats we will threshold when writing
+                for cname in ['dr_event_active', 'dr_event', 'dr']:
+                    if hasattr(self, 'full_timeseries_data') and cname in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
+                        self.dr_event_forecast = create_lookahead_forecast(
+                            data=self.full_timeseries_data[cname].astype(float),
+                            start_time=self.sim_date,
+                            **params
+                        )
+                        break
 
         # Optional concise debug to report forecast signal availability
         try:
@@ -803,13 +1560,51 @@ class EV2Gym(gym.Env):
                 sp = getattr(self, 'spot_price', None)
                 df = getattr(self, 'demand_forecast', None)
                 sf = getattr(self, 'solar_forecast', None)
+                tf = getattr(self, 'temperature_forecast', None)
+                wf = getattr(self, 'wind_forecast', None)
+                drf = getattr(self, 'dr_event_forecast', None)
                 pf_shape = tuple(pf.shape) if pf is not None else None
                 sp_len = len(sp) if sp is not None else None
                 df_len = len(df) if df is not None else None
                 sf_len = len(sf) if sf is not None else None
-                print(f"[DBG fcst] price_forecast={pf_shape} spot_price_len={sp_len} demand_fc_len={df_len} solar_fc_len={sf_len}")
+                tf_len = len(tf) if tf is not None else None
+                wf_len = len(wf) if wf is not None else None
+                dr_len = len(drf) if drf is not None else None
+                print(f"[DBG fcst] price_forecast={pf_shape} spot_price_len={sp_len} demand_fc_len={df_len} solar_fc_len={sf_len} temp_fc_len={tf_len} wind_fc_len={wf_len} dr_fc_len={dr_len}")
         except Exception as e:
             print(f"[DBG fcst] summary error: {e}")
+
+        # Mirror forecasts to per-account dicts for ledger writing
+        try:
+            if self.roaming_accounts:
+                if getattr(self, 'demand_forecast', None) is not None:
+                    self.account_load_forecast[0] = self.demand_forecast
+                    try:
+                        print(f"[DBG mirror] account[0] load fc h01-03={list(self.demand_forecast[:3]) if len(self.demand_forecast)>2 else self.demand_forecast}")
+                    except Exception:
+                        pass
+                if getattr(self, 'solar_forecast', None) is not None:
+                    self.account_pv_forecast[0] = self.solar_forecast
+                    try:
+                        print(f"[DBG mirror] account[0] pv   fc h01-03={list(self.solar_forecast[:3]) if len(self.solar_forecast)>2 else self.solar_forecast}")
+                    except Exception:
+                        pass
+            else:
+                for cs in self.charging_stations:
+                    if getattr(self, 'demand_forecast', None) is not None:
+                        self.account_load_forecast[cs.id] = self.demand_forecast
+                        try:
+                            print(f"[DBG mirror] account[{cs.id}] load fc h01-03={list(self.demand_forecast[:3]) if len(self.demand_forecast)>2 else self.demand_forecast}")
+                        except Exception:
+                            pass
+                    if getattr(self, 'solar_forecast', None) is not None:
+                        self.account_pv_forecast[cs.id] = self.solar_forecast
+                        try:
+                            print(f"[DBG mirror] account[{cs.id}] pv   fc h01-03={list(self.solar_forecast[:3]) if len(self.solar_forecast)>2 else self.solar_forecast}")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _get_observation(self):
         obs = self.state_function(self)

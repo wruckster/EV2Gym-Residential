@@ -14,3 +14,4 @@ pandapower
 tianshou>=1.0.0
 tensorboard>=2.11.0
 perlin-noise
+polars
