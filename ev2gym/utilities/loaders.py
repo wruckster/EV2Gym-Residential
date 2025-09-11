@@ -608,7 +608,10 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
             sim_temp_date = sim_temp_date + \
                 datetime.timedelta(minutes=env.timescale)
 
-    discharge_prices = discharge_prices * env.config['discharge_price_factor']
+    # Ensure discharge prices are negative (credits for discharging)
+    factor = env.config.get('discharge_price_factor', -1.0)
+    factor = -abs(factor)  # Force negative sign
+    discharge_prices = discharge_prices * factor
     return charge_prices, discharge_prices
 
 

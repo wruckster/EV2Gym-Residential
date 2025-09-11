@@ -321,6 +321,7 @@ class EV2Gym(gym.Env):
             self.renderer = Renderer(self)
 
         if self.save_plots:
+            
             os.makedirs("./results", exist_ok=True)
             print(f"Creating directory: ./results/{self.sim_name}")
             os.makedirs(f"./results/{self.sim_name}", exist_ok=True)
@@ -547,6 +548,9 @@ class EV2Gym(gym.Env):
         '''
         assert not self.done, "Episode is done, please reset the environment"
 
+        # Use a stable local index for all per-step writes
+        t = self.current_step
+
         if self.verbose:
             print(f"Step: {self.current_step}/{self.simulation_length}")
 
@@ -566,13 +570,13 @@ class EV2Gym(gym.Env):
                         ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
 
         # Reset power usage for this timestep to zero before processing charging stations
-        self.current_power_usage[self.current_step] = 0.0
+        self.current_power_usage[t] = 0.0
 
         # Add inflexible loads and solar power from transformers to the current power usage
         for tr in self.transformers:
             # Reset sets the current_power to inflexible_load + solar_power for the current step
-            tr.reset(step=self.current_step)
-            self.current_power_usage[self.current_step] += tr.current_power
+            tr.reset(step=t)
+            self.current_power_usage[t] += tr.current_power
 
         total_costs = 0
         total_invalid_action_punishment = 0
@@ -586,8 +590,8 @@ class EV2Gym(gym.Env):
             n_ports = cs.n_ports
             costs, user_satisfaction, invalid_action_punishment, ev = cs.step(
                 actions[port_counter:port_counter + n_ports],
-                self.charge_prices[cs.id, self.current_step],
-                self.discharge_prices[cs.id, self.current_step])
+                self.charge_prices[cs.id, t],
+                self.discharge_prices[cs.id, t])
 
             # Store departing EV for logging / statistics
             self.departing_evs.append(ev)
@@ -595,7 +599,7 @@ class EV2Gym(gym.Env):
             for u in user_satisfaction:
                 user_satisfaction_list.append(u)
 
-            self.current_power_usage[self.current_step] += cs.current_power_output
+            self.current_power_usage[t] += cs.current_power_output
 
             # Update transformer variables for this timestep
             self.transformers[cs.connected_transformer].step(
@@ -683,17 +687,17 @@ class EV2Gym(gym.Env):
 
         info = {
             'cost': cost,
-            'total_power_usage': self.current_power_usage[self.current_step - 1],
-            'power_setpoint': self.power_setpoints[self.current_step - 1] if self.power_setpoints is not None else 0,
-            'pv_generation': np.sum([tr.solar_power[self.current_step - 1] for tr in self.transformers]),
-            'ev_soc': np.mean(self.port_energy_level[:, :, self.current_step - 1][self.port_energy_level[:, :, self.current_step - 1] > 0]) if np.any(self.port_energy_level[:, :, self.current_step - 1] > 0) else 0,
+            'total_power_usage': self.current_power_usage[t],
+            'power_setpoint': self.power_setpoints[t] if self.power_setpoints is not None else 0,
+            'pv_generation': np.sum([tr.solar_power[t] for tr in self.transformers]),
+            'ev_soc': np.mean(self.port_energy_level[:, :, t][self.port_energy_level[:, :, t] > 0]) if np.any(self.port_energy_level[:, :, t] > 0) else 0,
             'num_evs_parked': self.current_evs_parked,
         }
 
         self.reward_history.append(reward)
-        # Finalize reward-dependent fields for row t = current_step - 1
+        # Finalize reward-dependent fields for row t
         try:
-            self._finalize_reward_for_row(self.current_step - 1, float(reward))
+            self._finalize_reward_for_row(t, float(reward))
         except Exception:
             pass
         self.total_evs_parked.append(len(self.EVs))
@@ -704,25 +708,29 @@ class EV2Gym(gym.Env):
         self.render()
 
         # Record solar power for the current step if within simulation bounds
-        if self.current_step < self.simulation_length:
+        if t < self.simulation_length:
             for i, tr in enumerate(self.transformers):
-                self.tr_solar_power[i, self.current_step] = tr.solar_power[self.current_step]
+                self.tr_solar_power[i, t] = tr.solar_power[t]
 
         # Record port energy levels for the current step for plotting
-        if self.current_step < self.simulation_length:
+        if t < self.simulation_length:
             for i, cs in enumerate(self.charging_stations):
                 for j in range(self.number_of_ports_per_cs):
                     if j < cs.n_ports and cs.evs_connected[j] is not None:
-                        self.port_energy_level[j, i, self.current_step] = cs.evs_connected[j].get_soc()
+                        self.port_energy_level[j, i, t] = cs.evs_connected[j].get_soc()
                     else:
-                        self.port_energy_level[j, i, self.current_step] = 0
+                        self.port_energy_level[j, i, t] = 0
 
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
 
+        # Advance simulation time for next step
+        self.current_step += 1
+        self._step_date()
+
         # Check termination conditions and return the appropriate values
         obs = self._get_observation()
-        
+
         return self._check_termination(reward, info)
 
     def render(self):
@@ -915,8 +923,8 @@ class EV2Gym(gym.Env):
             "charge_price": (float(np.mean(self.charge_prices[:, t])) if hasattr(self, 'charge_prices') and t < getattr(self.charge_prices, 'shape', [0, 0])[1] else np.nan),
             "discharge_price": (float(np.mean(self.discharge_prices[:, t])) if hasattr(self, 'discharge_prices') and t < getattr(self.discharge_prices, 'shape', [0, 0])[1] else np.nan),
             # current weather observations if available
-            "temp_c": (float(self.temperature_series[t]) if hasattr(self, 'temperature_series') and isinstance(getattr(self, 'temperature_series'), (list, np.ndarray)) and t < len(self.temperature_series) else np.nan),
-            "wind_speed": (float(self.wind_speed_series[t]) if hasattr(self, 'wind_speed_series') and isinstance(getattr(self, 'wind_speed_series'), (list, np.ndarray)) and t < len(self.wind_speed_series) else np.nan),
+            "temp_c": float(self.weather_data.iloc[t, 0]), #if hasattr(self, 'weather_data') and isinstance(getattr(self, 'weather_data'), (list, np.ndarray)) and t < len(self.weather_data) else np.nan),
+            "wind_speed": float(self.weather_data.iloc[t, 1]), #if hasattr(self, 'weather_data') and isinstance(getattr(self, 'weather_data'), (list, np.ndarray)) and t < len(self.weather_data) else np.nan),
             "evs_parked": int(self.current_evs_parked),
             # Defaults for tracking/cost/reward; reward fields will be finalized after reward calculation
             "tracking_error": np.nan,
@@ -1591,7 +1599,7 @@ class EV2Gym(gym.Env):
                     action_mask[i*cs.n_ports + j] = 1
 
         # Check if the episode is done or any constraint is violated
-        if self.current_step >= self.simulation_length - 1 or \
+        if self.current_step > self.simulation_length - 1 or \
             (any(tr.is_overloaded() > 0 for tr in self.transformers)
              and not self.generate_rnd_game):
             """Terminate if:
