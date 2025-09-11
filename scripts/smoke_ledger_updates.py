@@ -40,15 +40,9 @@ def main() -> None:
         t = env.current_step - 1  # row written for the step we just completed
         assert 0 <= t < env.global_buffers.T, f"Row index out of bounds: {t}"
 
-        # Global ledger checks
+        # Global ledger checks (silent)
         gdf = env.global_buffers.to_pandas()
         row = gdf.iloc[t]
-        print(f"[step={i} row={t}] Global ledger: timestamp={row['timestamp']} -> "
-              f"power_setpoint_kw={row.get('power_setpoint_kw', np.nan):.3f}, "
-              f"total_power_usage_kw={row.get('total_power_usage_kw', np.nan):.3f}, "
-              f"ev_power_kw={row.get('ev_power_kw', np.nan):.3f}, "
-              f"inflexible_load_kw={row.get('inflexible_load_kw', np.nan):.3f}, "
-              f"solar_production_kw={row.get('solar_production_kw', np.nan):.3f}")
         # Timestamp monotonicity
         if last_ts is not None:
             assert row["timestamp"] >= last_ts, "timestamps not monotonic"
@@ -70,10 +64,8 @@ def main() -> None:
         assert abuf is not None, "missing account buffer"
         adf = abuf.to_pandas()
         arow = adf.iloc[t]
-        # Summaries for account row (avoid dumping all port fields every step)
-        base_msg = (f"[step={i} row={t}] Account[{account_id}] ledger: "
-                    f"cs_power_kw={arow.get('cs_power_kw', np.nan):.3f}, "
-                    f"cs_amps={arow.get('cs_amps', np.nan):.3f}, evs_connected={int(arow.get('evs_connected', 0))}")
+        # Summaries for account row (silent)
+        base_msg = None
         # If roaming simplification fields are present, append them
         roam_bits = []
         if 'soc' in adf.columns:
@@ -98,9 +90,7 @@ def main() -> None:
         if 'pv_fc_h01' in adf.columns:
             pv_fc_vals = [arow.get(f'pv_fc_h{h:02d}', np.nan) for h in range(1, 4)]
             roam_bits.append(f"pv_fc_h01-03=[{pv_fc_vals[0]:.3f},{pv_fc_vals[1]:.3f},{pv_fc_vals[2]:.3f}]")
-        if roam_bits:
-            base_msg += ", " + ", ".join(roam_bits)
-        print(base_msg)
+        # Keep silent per-step; rely on assertions and warnings below
         for col in ["cs_power_kw", "cs_amps", "evs_connected"]:
             assert col in adf.columns, f"missing account column {col}"
         # If per-account forecasts are present, they should be present and numeric columns

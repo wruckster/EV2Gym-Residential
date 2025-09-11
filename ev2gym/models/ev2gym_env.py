@@ -644,35 +644,35 @@ class EV2Gym(gym.Env):
         for ev in self.EVs:
             ev.update_location_state(self.current_step)
 
+        # Update power stats arrays for this step
         self._update_power_statistics(self.departing_evs)
 
         # Stash invalid action punishment for this step so the global ledger can include it
         self._pending_invalid_action_punishment = float(total_invalid_action_punishment)
+
+        # Refresh forecasts/series so current-step weather and lookaheads are up-to-date
+        try:
+            self._update_forecasts()
+        except Exception:
+            pass
+
         # Ledger writes for current step
         self._update_global_ledger_row()
         self._update_account_ledger_row()
 
-        self.current_step += 1
-        self._step_date()
-        self.timestamps.append(self.sim_date)
-
-        if self.current_step < self.simulation_length - 1:
-            self.charge_power_potential[self.current_step] = calculate_charge_power_potential(
-                self)
-
+        # Track EVs parked count
         self.current_evs_parked += self.current_ev_arrived - self.current_ev_departed
 
-        # Call step for the grid
+        # Compute reward
         if self.simulate_grid:
             # TODO: transform actions -> grid_actions
             raise NotImplementedError
-            grid_report = self.grid.step(actions=actions)
-            reward = self._calculate_reward(grid_report)
         else:
             reward = self._calculate_reward(total_costs,
                                             user_satisfaction_list,
                                             total_invalid_action_punishment)
 
+        # Optional cost
         if self.cost_function is not None:
             cost = self.cost_function(self,
                                       total_costs,
@@ -719,9 +719,6 @@ class EV2Gym(gym.Env):
 
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
-
-        # Update forecasts for the current timestep
-        self._update_forecasts()
 
         # Check termination conditions and return the appropriate values
         obs = self._get_observation()
@@ -807,6 +804,12 @@ class EV2Gym(gym.Env):
         global_cols.append(ColumnSpec("ev_power_kw", np.dtype(np.float32)))
         global_cols.append(ColumnSpec("inflexible_load_kw", np.dtype(np.float32)))
         global_cols.append(ColumnSpec("solar_production_kw", np.dtype(np.float32)))
+        # current prices (averaged across CS where applicable)
+        global_cols.append(ColumnSpec("charge_price", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("discharge_price", np.dtype(np.float32)))
+        # current weather observations (aligned to env timeline when available)
+        global_cols.append(ColumnSpec("temp_c", np.dtype(np.float32)))
+        global_cols.append(ColumnSpec("wind_speed", np.dtype(np.float32)))
         global_cols.append(ColumnSpec("evs_parked", np.dtype(np.int16)))
         # tracking/cost/reward
         global_cols.append(ColumnSpec("tracking_error", np.dtype(np.float32)))
@@ -831,8 +834,6 @@ class EV2Gym(gym.Env):
             account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
-            account_cols.append(ColumnSpec("charge_price", np.dtype(np.float32)))     # average across CS
-            account_cols.append(ColumnSpec("discharge_price", np.dtype(np.float32)))  # average across CS
             account_cols.append(ColumnSpec("evs_connected", np.dtype(np.int16)))      # total across CS
             account_cols.append(ColumnSpec("cs_kw_limit", np.dtype(np.float32)))      # total/aggregate
             # simplified per-account EV status (single EV in residential roaming)
@@ -860,8 +861,6 @@ class EV2Gym(gym.Env):
                 account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
-                account_cols.append(ColumnSpec("charge_price", np.dtype(np.float32)))
-                account_cols.append(ColumnSpec("discharge_price", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("evs_connected", np.dtype(np.int16)))
                 account_cols.append(ColumnSpec("cs_kw_limit", np.dtype(np.float32)))
                 for p in range(cs.n_ports):
@@ -912,6 +911,12 @@ class EV2Gym(gym.Env):
             "ev_power_kw": float(self.energy_flow_breakdown['ev_power'][t]) if 'ev_power' in self.energy_flow_breakdown else float(np.sum(self.cs_power[:, t])) if t < self.simulation_length else np.nan,
             "inflexible_load_kw": float(self.energy_flow_breakdown['inflexible_load'][t]) if 'inflexible_load' in self.energy_flow_breakdown else np.nan,
             "solar_production_kw": float(self.energy_flow_breakdown['solar_production'][t]) if 'solar_production' in self.energy_flow_breakdown else np.nan,
+            # current prices averaged across CS
+            "charge_price": (float(np.mean(self.charge_prices[:, t])) if hasattr(self, 'charge_prices') and t < getattr(self.charge_prices, 'shape', [0, 0])[1] else np.nan),
+            "discharge_price": (float(np.mean(self.discharge_prices[:, t])) if hasattr(self, 'discharge_prices') and t < getattr(self.discharge_prices, 'shape', [0, 0])[1] else np.nan),
+            # current weather observations if available
+            "temp_c": (float(self.temperature_series[t]) if hasattr(self, 'temperature_series') and isinstance(getattr(self, 'temperature_series'), (list, np.ndarray)) and t < len(self.temperature_series) else np.nan),
+            "wind_speed": (float(self.wind_speed_series[t]) if hasattr(self, 'wind_speed_series') and isinstance(getattr(self, 'wind_speed_series'), (list, np.ndarray)) and t < len(self.wind_speed_series) else np.nan),
             "evs_parked": int(self.current_evs_parked),
             # Defaults for tracking/cost/reward; reward fields will be finalized after reward calculation
             "tracking_error": np.nan,
@@ -934,30 +939,30 @@ class EV2Gym(gym.Env):
                     values[key] = np.nan
             else:
                 values[key] = np.nan
-        # temperature forecast (vector length up to 24 at current step)
+        # Temperature forecast (float32)
         try:
-            tf = getattr(self, 'temperature_forecast', None)
+            tfc = getattr(self, 'temp_forecast', None)
         except Exception:
-            tf = None
+            tfc = None
         for h in range(24):
             key = f"temp_fc_h{h+1:02d}"
-            if tf is not None and h < len(tf):
+            if tfc is not None and h < len(tfc):
                 try:
-                    values[key] = float(tf[h])
+                    values[key] = np.float32(float(tfc[h]))
                 except Exception:
                     values[key] = np.nan
             else:
                 values[key] = np.nan
-        # wind forecast
+        # Wind forecast (float32)
         try:
-            wf = getattr(self, 'wind_forecast', None)
+            wfc = getattr(self, 'wind_forecast', None)
         except Exception:
-            wf = None
+            wfc = None
         for h in range(24):
             key = f"wind_fc_h{h+1:02d}"
-            if wf is not None and h < len(wf):
+            if wfc is not None and h < len(wfc):
                 try:
-                    values[key] = float(wf[h])
+                    values[key] = np.float32(float(wfc[h]))
                 except Exception:
                     values[key] = np.nan
             else:
@@ -1086,8 +1091,6 @@ class EV2Gym(gym.Env):
             total_power_kw = float(np.nansum(self.cs_power[:, t]))
             total_amps = float(np.nansum(self.cs_current[:, t]))
             total_evs = int(np.nansum([cs.n_evs_connected for cs in self.charging_stations]))
-            avg_charge_price = float(np.nanmean(self.charge_prices[:, t]))
-            avg_discharge_price = float(np.nanmean(self.discharge_prices[:, t]))
             agg_kw_limit = float(np.nansum([getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan for cs in self.charging_stations]))
             values = {
                 "step": int(t),
@@ -1097,8 +1100,6 @@ class EV2Gym(gym.Env):
                 "household_inflexible_load_kw": np.nan,
                 "household_pv_kw": np.nan,
                 "tracking_error_account": np.nan,
-                "charge_price": avg_charge_price,
-                "discharge_price": avg_discharge_price,
                 "evs_connected": total_evs,
                 "cs_kw_limit": agg_kw_limit,
             }
@@ -1117,34 +1118,7 @@ class EV2Gym(gym.Env):
                 pfc = getattr(self, 'account_pv_forecast', {}).get(0)
                 if pfc is None and getattr(self, 'account_pv_forecast', {}):
                     pfc = next(iter(self.account_pv_forecast.values()))
-                # Debug: show first 3 forecast values vs actual future aggregate signals
-                try:
-                    step_per_hour = max(1, int(60 // self.timescale))
-                    # Compare to aggregate sum of full transformer series (not step-filled arrays)
-                    if hasattr(self, 'transformers') and self.transformers:
-                        base_load = None
-                        try:
-                            base_load = np.nansum([tr.inflexible_load for tr in self.transformers], axis=0)
-                        except Exception:
-                            pass
-                        if base_load is not None:
-                            f1 = float(base_load[t + step_per_hour]) if t + step_per_hour < len(base_load) else np.nan
-                            f2 = float(base_load[t + 2 * step_per_hour]) if t + 2 * step_per_hour < len(base_load) else np.nan
-                            lv = [float(lfc[i]) if lfc is not None and i < len(lfc) else np.nan for i in range(2)]
-                            print(f"[DBG ledger] load_fc_h01={lv[0]:.3f} h02={lv[1]:.3f} vs future actuals {f1:.3f}, {f2:.3f}")
-                    if hasattr(self, 'transformers') and self.transformers:
-                        base_pv = None
-                        try:
-                            base_pv = np.nansum([tr.solar_power for tr in self.transformers], axis=0)
-                        except Exception:
-                            pass
-                        if base_pv is not None:
-                            f1 = float(base_pv[t + step_per_hour]) if t + step_per_hour < len(base_pv) else np.nan
-                            f2 = float(base_pv[t + 2 * step_per_hour]) if t + 2 * step_per_hour < len(base_pv) else np.nan
-                            pv = [float(pfc[i]) if pfc is not None and i < len(pfc) else np.nan for i in range(2)]
-                            print(f"[DBG ledger] pv_fc_h01={pv[0]:.3f} h02={pv[1]:.3f} vs future actuals {f1:.3f}, {f2:.3f}")
-                except Exception:
-                    pass
+                # Removed verbose debug comparison prints used during ledger troubleshooting
                 for h in range(24):
                     values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
                 for h in range(24):
@@ -1210,8 +1184,6 @@ class EV2Gym(gym.Env):
                 "household_inflexible_load_kw": np.nan,
                 "household_pv_kw": np.nan,
                 "tracking_error_account": np.nan,
-                "charge_price": float(self.charge_prices[cs.id, t]),
-                "discharge_price": float(self.discharge_prices[cs.id, t]),
                 "evs_connected": int(cs.n_evs_connected),
                 "cs_kw_limit": float(getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan),
             }
@@ -1434,7 +1406,6 @@ class EV2Gym(gym.Env):
             if target == 'household_demand':
                 # Use aggregate sum across transformers as the forecast baseline for roaming account
                 if has_tr_load and hasattr(self, 'transformers') and self.transformers:
-                    print("[DBG fcst-path] demand using transformer aggregate sum (full series)")
                     # Use full transformer series (not step-filled arrays)
                     try:
                         agg_load = np.nansum([tr.inflexible_load for tr in self.transformers], axis=0)
@@ -1449,22 +1420,9 @@ class EV2Gym(gym.Env):
                         idx = t0 + h * step_per_hour
                         fc.append(float(agg_load[idx]) if idx < len(agg_load) else float(agg_load[-1]))
                     self.demand_forecast = np.asarray(fc, dtype=float)
-                    # Per-step lightweight debug
-                    try:
-                        f0_idx = t0
-                        f1_idx = t0 + step_per_hour
-                        f2_idx = t0 + 2 * step_per_hour
-                        f0_val = float(agg_load[f0_idx]) if f0_idx < len(agg_load) else np.nan
-                        f1_val = float(agg_load[f1_idx]) if f1_idx < len(agg_load) else np.nan
-                        f2_val = float(agg_load[f2_idx]) if f2_idx < len(agg_load) else np.nan
-                        fc1 = float(self.demand_forecast[0]) if len(self.demand_forecast) > 0 else np.nan
-                        fc2 = float(self.demand_forecast[1]) if len(self.demand_forecast) > 1 else np.nan
-                        print(f"[DBG fcst-step] demand src(sum,full) t={t0}: now={f0_val:.4f} +1h@{f1_idx}={f1_val:.4f} +2h@{f2_idx}={f2_val:.4f} | fc1={fc1:.4f} fc2={fc2:.4f}")
-                    except Exception:
-                        pass
+                    # Removed per-step forecast debug prints
                 # Primary fallback: use full_timeseries_data which contains the entire horizon
                 elif hasattr(self, 'full_timeseries_data') and 'demand' in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
-                    print("[DBG fcst-path] demand using full_timeseries_data['demand']")
                     series = self.full_timeseries_data['demand']
                     self.demand_forecast = create_lookahead_forecast(
                         data=series,
@@ -1474,11 +1432,57 @@ class EV2Gym(gym.Env):
                 # Otherwise skip
                 else:
                     # Data not ready; skip to avoid building zero forecasts. Will try again next tick.
-                    print("[DBG fcst-path] demand skipped (no transformer arrays yet and no full_timeseries_data)")
                     self.demand_forecast = None
+            elif target == 'temperature':
+                # Load weather data and extract temperature forecasts and current series
+                from ev2gym.utilities.loaders import load_weather_data
+                weather_df = load_weather_data(self)
+                if weather_df is not None and 'temperature' in weather_df.columns:
+                    # Persist current series aligned to simulation timeline
+                    try:
+                        aligned = weather_df.reindex(sim_index, method='nearest')
+                        self.temperature_series = aligned['temperature'].to_numpy(dtype=float)[: int(self.simulation_length)]
+                    except Exception:
+                        self.temperature_series = None
+                    # Build lookahead forecast from current step
+                    temp_series = aligned['temperature'] if 'aligned' in locals() else weather_df['temperature']
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    t0 = int(self.current_step)
+                    horizon = int(params.get('forecast_horizon_hours', 24))
+                    fc = []
+                    for h in range(1, horizon + 1):
+                        idx = t0 + h * step_per_hour
+                        val = temp_series.iloc[idx] if idx < len(temp_series) else temp_series.iloc[-1]
+                        fc.append(float(val))
+                    self.temp_forecast = np.asarray(fc, dtype=float)
+                else:
+                    self.temp_forecast = None
+            elif target == 'wind':
+                # Load weather data and extract wind forecasts and current series
+                from ev2gym.utilities.loaders import load_weather_data
+                weather_df = load_weather_data(self)
+                if weather_df is not None and 'wind_speed' in weather_df.columns:
+                    # Persist current series aligned to simulation timeline
+                    try:
+                        aligned = weather_df.reindex(sim_index, method='nearest')
+                        self.wind_speed_series = aligned['wind_speed'].to_numpy(dtype=float)[: int(self.simulation_length)]
+                    except Exception:
+                        self.wind_speed_series = None
+                    # Build lookahead forecast from current step
+                    wind_series = aligned['wind_speed'] if 'aligned' in locals() else weather_df['wind_speed']
+                    step_per_hour = max(1, int(60 // self.timescale))
+                    t0 = int(self.current_step)
+                    horizon = int(params.get('forecast_horizon_hours', 24))
+                    fc = []
+                    for h in range(1, horizon + 1):
+                        idx = t0 + h * step_per_hour
+                        val = wind_series.iloc[idx] if idx < len(wind_series) else wind_series.iloc[-1]
+                        fc.append(float(val))
+                    self.wind_forecast = np.asarray(fc, dtype=float)
+                else:
+                    self.wind_forecast = None
             elif target == 'solar_production':
                 if has_tr_pv and hasattr(self, 'transformers') and self.transformers:
-                    print("[DBG fcst-path] solar using transformer aggregate sum (full series)")
                     try:
                         agg_pv = np.nansum([tr.solar_power for tr in self.transformers], axis=0)
                     except Exception:
@@ -1491,21 +1495,7 @@ class EV2Gym(gym.Env):
                         idx = t0 + h * step_per_hour
                         fc.append(float(agg_pv[idx]) if idx < len(agg_pv) else float(agg_pv[-1]))
                     self.solar_forecast = np.asarray(fc, dtype=float)
-                    # Per-step lightweight debug for PV
-                    try:
-                        f0_idx = t0
-                        f1_idx = t0 + step_per_hour
-                        f2_idx = t0 + 2 * step_per_hour
-                        f0_val = float(agg_pv[f0_idx]) if f0_idx < len(agg_pv) else np.nan
-                        f1_val = float(agg_pv[f1_idx]) if f1_idx < len(agg_pv) else np.nan
-                        f2_val = float(agg_pv[f2_idx]) if f2_idx < len(agg_pv) else np.nan
-                        fc1 = float(self.solar_forecast[0]) if len(self.solar_forecast) > 0 else np.nan
-                        fc2 = float(self.solar_forecast[1]) if len(self.solar_forecast) > 1 else np.nan
-                        print(f"[DBG fcst-step] solar  src(sum,full) t={t0}: now={f0_val:.4f} +1h@{f1_idx}={f1_val:.4f} +2h@{f2_idx}={f2_val:.4f} | fc1={fc1:.4f} fc2={fc2:.4f}")
-                    except Exception:
-                        pass
                 elif hasattr(self, 'full_timeseries_data') and 'solar' in getattr(self, 'full_timeseries_data', pd.DataFrame()).columns:
-                    print("[DBG fcst-path] solar using full_timeseries_data['solar']")
                     series = self.full_timeseries_data['solar']
                     self.solar_forecast = create_lookahead_forecast(
                         data=series,
@@ -1513,7 +1503,6 @@ class EV2Gym(gym.Env):
                         **params
                     )
                 elif has_tr_pv:
-                    print("[DBG fcst-path] solar using transformer aggregate sum")
                     agg_pv = np.nansum(self.tr_solar_power, axis=0)
                     step_per_hour = max(1, int(60 // self.timescale))
                     t0 = int(self.current_step)
@@ -1553,56 +1542,21 @@ class EV2Gym(gym.Env):
                         )
                         break
 
-        # Optional concise debug to report forecast signal availability
-        try:
-            if getattr(self, 'debug_setpoints', False) and self.config.get('res_v2g_setpoints', {}).get('enabled', False):
-                pf = getattr(self, 'price_forecast', None)
-                sp = getattr(self, 'spot_price', None)
-                df = getattr(self, 'demand_forecast', None)
-                sf = getattr(self, 'solar_forecast', None)
-                tf = getattr(self, 'temperature_forecast', None)
-                wf = getattr(self, 'wind_forecast', None)
-                drf = getattr(self, 'dr_event_forecast', None)
-                pf_shape = tuple(pf.shape) if pf is not None else None
-                sp_len = len(sp) if sp is not None else None
-                df_len = len(df) if df is not None else None
-                sf_len = len(sf) if sf is not None else None
-                tf_len = len(tf) if tf is not None else None
-                wf_len = len(wf) if wf is not None else None
-                dr_len = len(drf) if drf is not None else None
-                print(f"[DBG fcst] price_forecast={pf_shape} spot_price_len={sp_len} demand_fc_len={df_len} solar_fc_len={sf_len} temp_fc_len={tf_len} wind_fc_len={wf_len} dr_fc_len={dr_len}")
-        except Exception as e:
-            print(f"[DBG fcst] summary error: {e}")
+        # Removed concise forecast availability debug prints
 
-        # Mirror forecasts to per-account dicts for ledger writing
+        # Mirror forecasts to per-account dicts for ledger writing (silently)
         try:
             if self.roaming_accounts:
                 if getattr(self, 'demand_forecast', None) is not None:
                     self.account_load_forecast[0] = self.demand_forecast
-                    try:
-                        print(f"[DBG mirror] account[0] load fc h01-03={list(self.demand_forecast[:3]) if len(self.demand_forecast)>2 else self.demand_forecast}")
-                    except Exception:
-                        pass
                 if getattr(self, 'solar_forecast', None) is not None:
                     self.account_pv_forecast[0] = self.solar_forecast
-                    try:
-                        print(f"[DBG mirror] account[0] pv   fc h01-03={list(self.solar_forecast[:3]) if len(self.solar_forecast)>2 else self.solar_forecast}")
-                    except Exception:
-                        pass
             else:
                 for cs in self.charging_stations:
                     if getattr(self, 'demand_forecast', None) is not None:
                         self.account_load_forecast[cs.id] = self.demand_forecast
-                        try:
-                            print(f"[DBG mirror] account[{cs.id}] load fc h01-03={list(self.demand_forecast[:3]) if len(self.demand_forecast)>2 else self.demand_forecast}")
-                        except Exception:
-                            pass
                     if getattr(self, 'solar_forecast', None) is not None:
                         self.account_pv_forecast[cs.id] = self.solar_forecast
-                        try:
-                            print(f"[DBG mirror] account[{cs.id}] pv   fc h01-03={list(self.solar_forecast[:3]) if len(self.solar_forecast)>2 else self.solar_forecast}")
-                        except Exception:
-                            pass
         except Exception:
             pass
 

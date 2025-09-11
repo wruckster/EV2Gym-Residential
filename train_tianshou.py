@@ -539,25 +539,29 @@ def main(config_path: str):
             else:
                 logging.warning("No best policy found to load for evaluation.")
 
-            # Run one full episode
-            eval_collector = Collector(policy, eval_env)
-            logging.info("Starting evaluation episode...")
-            collect_result = eval_collector.collect(n_episode=1, render=0.0, reset_before_collect=True)
-            logging.info(f"Evaluation complete: {collect_result}")
+            # Run one full episode manually to control when ledgers are saved
+            logging.info("Starting manual evaluation episode...")
+            obs, info = eval_env.reset()
+            done, truncated = False, False
+            total_reward = 0
+            while not done and not truncated:
+                # Note: Tianshou's Batch object is needed for the policy to process the observation
+                from tianshou.data import Batch
+                batch = Batch(obs=np.array([obs]), info=info)
+                action = policy(batch).act.cpu().numpy().flatten()
+                obs, step_reward, done, truncated, info = eval_env.step(action)
+                total_reward += step_reward
+            logging.info(f"Manual evaluation complete. Total reward: {total_reward}")
 
-            # Log episode details; support both vectorized and raw envs
+            # Parquet ledger export is decommissioned in this script to keep replay-only outputs.
+
+            # Log episode details from the evaluation environment
             try:
-                if hasattr(eval_collector.env, 'get_env_attr'):
-                    current_step = eval_collector.env.get_env_attr('current_step')[0]
-                    sim_length = eval_collector.env.get_env_attr('simulation_length')[0]
-                    evs_spawned = eval_collector.env.get_env_attr('total_evs_spawned')[0]
-                    is_done = eval_collector.env.get_env_attr('done')[0]
-                else:
-                    base_env = getattr(eval_collector.env, 'env', eval_collector.env)
-                    current_step = getattr(base_env, 'current_step', None)
-                    sim_length = getattr(base_env, 'simulation_length', None)
-                    evs_spawned = getattr(base_env, 'total_evs_spawned', None)
-                    is_done = getattr(base_env, 'done', None)
+                base_env = getattr(eval_env, 'env', eval_env)
+                current_step = getattr(base_env, 'current_step', None)
+                sim_length = getattr(base_env, 'simulation_length', None)
+                evs_spawned = getattr(base_env, 'total_evs_spawned', None)
+                is_done = getattr(base_env, 'done', None)
                 logging.info(f"Episode completed at step {current_step}/{sim_length}")
                 logging.info(f"Total EVs spawned: {evs_spawned}")
                 logging.info(f"Episode done: {is_done}")

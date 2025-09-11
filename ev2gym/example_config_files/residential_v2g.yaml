@@ -1,4 +1,4 @@
-debug_setpoints: true
+debug_setpoints: false
 
 # This yml file configures the residential V2G simulation
 
@@ -6,7 +6,7 @@ debug_setpoints: true
 # Simulation Parameters
 ##############################################################################
 timescale: 5  # minutes per step
-simulation_length: 500  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+simulation_length: 100  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 # Path to external features
 data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet
@@ -110,6 +110,8 @@ forecasting:
   targets:
     - household_demand
     - solar_production
+    - temperature
+    - wind
   params:
     forecast_horizon_hours: 24
     noise_level: 0.1
@@ -225,9 +227,9 @@ ev:
 # Charging Station Specifications
 ##############################################################################
 charging_station:
-  min_charge_current: 6  # Amperes (minimum current for Level 2 charging)
+  min_charge_current: 1  # Amperes (minimum current for Level 2 charging)
   max_charge_current: 45  # Amperes (11 kW @ 240V)
-  min_discharge_current: -6  # Amperes (must be non-zero to enable V2G)
+  min_discharge_current: -1  # Amperes (must be non-zero to enable V2G)
   max_discharge_current: -45  # Amperes (11 kW @ 240V, negative for discharge)
   voltage: 240  # Single-phase voltage for residential
   phases: 1  # Most residential chargers are single-phase

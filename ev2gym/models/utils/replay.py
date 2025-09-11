@@ -5,6 +5,7 @@ This file is part of the ev2gym package. It is used to save the simulation data 
 import os
 import numpy as np
 import math
+import pandas as pd
 from ev2gym.utilities.utils import get_statistics
 
 class EvCityReplay():
@@ -238,6 +239,28 @@ class EvCityReplay():
         # print(f'ev_max_energy: {self.ev_max_energy}')
         # print(f'ev_max_ch_power: {self.ev_max_ch_power}')
         # print(f'ev_max_dis_power: {self.ev_max_dis_power}')
+
+        # --- Embed ledger snapshots (global and per-account) if available ---
+        try:
+            if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+                # Store as pandas DataFrame for convenience
+                self.global_ledger = env.global_buffers.to_pandas()
+            else:
+                self.global_ledger = None
+        except Exception:
+            self.global_ledger = None
+
+        try:
+            acct_ledgers = {}
+            if hasattr(env, 'account_buffers') and isinstance(env.account_buffers, dict):
+                for acc_id, buf in env.account_buffers.items():
+                    try:
+                        acct_ledgers[acc_id] = buf.to_pandas()
+                    except Exception:
+                        continue
+            self.account_ledgers = acct_ledgers if acct_ledgers else None
+        except Exception:
+            self.account_ledgers = None
 
     def save(self):
         '''Save the replay data to a pickle file'''

@@ -299,8 +299,14 @@ class Rescale_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
         # this function returns the action list based on the round robin algorithm
 
         import warnings
-        # in W
-        power_setpoint = self.env.power_setpoints[self.env.current_step]
+        # in W - Use ledger data instead of legacy arrays
+        if hasattr(self.env, 'global_buffers') and self.env.global_buffers is not None:
+            t = int(max(0, min(self.env.current_step, self.env.global_buffers.T - 1)))
+            setpoint_arr = self.env.global_buffers._data.get('power_setpoint_kw')
+            power_setpoint = float(setpoint_arr[t]) if setpoint_arr is not None else 0.0
+        else:
+            # Fallback to legacy
+            power_setpoint = self.env.power_setpoints[self.env.current_step]
 
         # rescale actions from interval (0,1) to interval (min_action,1) for every charger
 
@@ -540,7 +546,13 @@ class Rescale_RepairLayer_V2G(gym.ActionWrapper, gym.utils.RecordConstructorArgs
         # One-line debug when env.debug_setpoints is enabled (V2G wrapper)
         if getattr(self.env, 'debug_setpoints', False):
             try:
-                setpt = float(self.env.power_setpoints[self.env.current_step]) if hasattr(self.env, 'power_setpoints') else float('nan')
+                # Use ledger data instead of legacy arrays
+                if hasattr(self.env, 'global_buffers') and self.env.global_buffers is not None:
+                    t = int(max(0, min(self.env.current_step, self.env.global_buffers.T - 1)))
+                    setpoint_arr = self.env.global_buffers._data.get('power_setpoint_kw')
+                    setpt = float(setpoint_arr[t]) if setpoint_arr is not None else float('nan')
+                else:
+                    setpt = float(self.env.power_setpoints[self.env.current_step]) if hasattr(self.env, 'power_setpoints') else float('nan')
                 print(f"[DBG action V2G] step={self.env.current_step} setpt={setpt:.3f} in_sum={float(np.nansum(action)):.3f} out_sum={float(np.nansum(out)):.3f}")
             except Exception:
                 pass
@@ -642,7 +654,14 @@ class MinMax_RepairLayer(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
 
         # this function returns the action list based on the round robin algorithm
 
-        power_setpoint = self.env.power_setpoints[self.env.current_step]  # in W
+        # Use ledger data instead of legacy arrays
+        if hasattr(self.env, 'global_buffers') and self.env.global_buffers is not None:
+            t = int(max(0, min(self.env.current_step, self.env.global_buffers.T - 1)))
+            setpoint_arr = self.env.global_buffers._data.get('power_setpoint_kw')
+            power_setpoint = float(setpoint_arr[t]) if setpoint_arr is not None else 0.0
+        else:
+            # Fallback to legacy
+            power_setpoint = self.env.power_setpoints[self.env.current_step]  # in W
 
         if self.verbose:
             print("-------------------MinMax RepairLayer -------------------")

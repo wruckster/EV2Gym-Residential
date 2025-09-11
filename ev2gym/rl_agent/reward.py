@@ -8,8 +8,28 @@ def SquaredTrackingErrorReward(env,*args):
     '''This reward function is the squared tracking error that uses the minimum of the power setpoints and the charge power potential
     The reward is negative'''
     
-    reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
-        env.current_power_usage[env.current_step-1])**2
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        prev_t = max(0, t - 1)
+        
+        # Get power setpoint from global ledger
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        power_setpoint = float(setpoint_arr[prev_t]) if setpoint_arr is not None else 0.0
+        
+        # Get EV power as proxy for charge power potential
+        ev_power_arr = env.global_buffers._data.get('ev_power_kw')
+        charge_potential = float(ev_power_arr[prev_t]) if ev_power_arr is not None else 0.0
+        
+        # Get total power usage
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+        
+        reward = - (min(power_setpoint, charge_potential) - current_power)**2
+    else:
+        # Fallback to legacy arrays
+        reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
+            env.current_power_usage[env.current_step-1])**2
         
     return reward
 
@@ -18,10 +38,33 @@ def SqTrError_TrPenalty_UserIncentives(env, _, user_satisfaction_list, *args):
     It penalizes transofrmers that are overloaded    
     The reward is negative'''
     
-    tr_max_limit = env.transformers[0].max_power[env.current_step-1]
-    
-    reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1],tr_max_limit) -
-        env.current_power_usage[env.current_step-1])**2
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        prev_t = max(0, t - 1)
+        
+        # Get power setpoint from global ledger
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        power_setpoint = float(setpoint_arr[prev_t]) if setpoint_arr is not None else 0.0
+        
+        # Get EV power as proxy for charge power potential
+        ev_power_arr = env.global_buffers._data.get('ev_power_kw')
+        charge_potential = float(ev_power_arr[prev_t]) if ev_power_arr is not None else 0.0
+        
+        # Get total power usage
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+        
+        # Get transformer max limit (fallback to transformer object)
+        tr_max_limit = env.transformers[0].max_power[env.current_step-1]
+        
+        reward = - (min(power_setpoint, charge_potential, tr_max_limit) - current_power)**2
+    else:
+        # Fallback to legacy arrays
+        tr_max_limit = env.transformers[0].max_power[env.current_step-1]
+        
+        reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1],tr_max_limit) -
+            env.current_power_usage[env.current_step-1])**2
             
     for tr in env.transformers:
         reward -= 100 * tr.get_how_overloaded()
@@ -48,11 +91,34 @@ def SquaredTrackingErrorRewardWithPenalty(env,*args):
     The reward is negative
     If the EV is not charging, the reward is penalized
     '''
-    if env.current_power_usage[env.current_step-1] == 0 and env.charge_power_potential[env.current_step-2] != 0:
-        reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
-            env.current_power_usage[env.current_step-1])**2 - 100
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        prev_t = max(0, t - 1)
+        prev_prev_t = max(0, t - 2)
+        
+        # Get power values from ledger
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+        
+        ev_power_arr = env.global_buffers._data.get('ev_power_kw')
+        charge_potential_prev = float(ev_power_arr[prev_prev_t]) if ev_power_arr is not None else 0.0
+        charge_potential = float(ev_power_arr[prev_t]) if ev_power_arr is not None else 0.0
+        
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        power_setpoint = float(setpoint_arr[prev_t]) if setpoint_arr is not None else 0.0
+        
+        if current_power == 0 and charge_potential_prev != 0:
+            reward = - (min(power_setpoint, charge_potential) - current_power)**2 - 1000
+        else:
+            reward = - (min(power_setpoint, charge_potential) - current_power)**2
     else:
-        reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
+        # Fallback to legacy arrays
+        if env.current_power_usage[env.current_step-1] == 0 and env.charge_power_potential[env.current_step-2] != 0:
+            reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
+            env.current_power_usage[env.current_step-1])**2 - 1000
+        else:
+            reward = - (min(env.power_setpoints[env.current_step-1], env.charge_power_potential[env.current_step-1]) -
             env.current_power_usage[env.current_step-1])**2
     
     return reward
@@ -60,18 +126,50 @@ def SquaredTrackingErrorRewardWithPenalty(env,*args):
 def SimpleReward(env,*args):
     '''This reward function does not consider the charge power potential'''
     
-    reward = - (env.power_setpoints[env.current_step-1] - env.current_power_usage[env.current_step-1])**2
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        prev_t = max(0, t - 1)
+        
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        power_setpoint = float(setpoint_arr[prev_t]) if setpoint_arr is not None else 0.0
+        
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+        
+        reward = - (power_setpoint - current_power)**2
+    else:
+        # Fallback to legacy arrays
+        reward = - (env.power_setpoints[env.current_step-1] - env.current_power_usage[env.current_step-1])**2
     
     return reward
 
 def MinimizeTrackerSurplusWithChargeRewards(env,*args):
     ''' This reward function minimizes the tracker surplus and gives a reward for charging '''
     
-    reward = 0
-    if env.power_setpoints[env.current_step-1] < env.current_power_usage[env.current_step-1]:
-            reward -= (env.current_power_usage[env.current_step-1]-env.power_setpoints[env.current_step-1])**2
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        prev_t = max(0, t - 1)
+        
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        power_setpoint = float(setpoint_arr[prev_t]) if setpoint_arr is not None else 0.0
+        
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+        
+        reward = 0
+        if power_setpoint < current_power:
+            reward -= (current_power - power_setpoint)**2
+        
+        reward += current_power #/75
+    else:
+        # Fallback to legacy arrays
+        reward = 0
+        if env.power_setpoints[env.current_step-1] < env.current_power_usage[env.current_step-1]:
+                reward -= (env.current_power_usage[env.current_step-1]-env.power_setpoints[env.current_step-1])**2
 
-    reward += env.current_power_usage[env.current_step-1] #/75
+        reward += env.current_power_usage[env.current_step-1] #/75
     
     return reward
 

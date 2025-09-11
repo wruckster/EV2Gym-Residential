@@ -191,7 +191,7 @@ class ActionMonitor(gym.Wrapper):
             elif state_fn_name == "V2G_profit_max_loads":
                 # Matches ev2gym/rl_agent/state.py::V2G_profit_max_loads
                 labels.append("t")
-                labels.append("current_power_usage_prev")
+                labels.append("total_power_usage_prev")  # Updated to match ledger naming
                 H = infer_price_horizon(default_h=20)
                 labels.extend([f"price_h+{k}" for k in range(H)])
 
@@ -218,7 +218,7 @@ class ActionMonitor(gym.Wrapper):
                 # Matches ev2gym/rl_agent/state.py::PublicPST
                 labels.append("t_normalized")
                 labels.append("power_setpoint_now")
-                labels.append("current_power_usage_prev")
+                labels.append("total_power_usage_prev")  # Updated to match ledger naming
 
                 # For each EV port: [is_full_or_half, total_energy_exchanged, time_since_arrival]
                 if hasattr(self.env, "transformers") and hasattr(self.env, "charging_stations"):
@@ -237,7 +237,7 @@ class ActionMonitor(gym.Wrapper):
             else:
                 # Fallback: keep previous heuristic similar to V2G_profit_max
                 labels.append("t")
-                labels.append("current_power_usage_prev")
+                labels.append("total_power_usage_prev")  # Updated to match ledger naming
                 H = infer_price_horizon(default_h=20)
                 labels.extend([f"price_h+{k}" for k in range(H)])
                 if hasattr(self.env, "transformers") and hasattr(self.env, "charging_stations"):

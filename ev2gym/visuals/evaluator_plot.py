@@ -33,6 +33,101 @@ def _load_replay(file_path: str):
     return data
 
 
+def _find_ledgers_near(replay_path: str) -> dict:
+    """Locate and load ledger parquet files near the given replay path.
+
+    Search strategy:
+    - Look in the same directory as the replay for parquet files matching
+      typical ledger names, e.g. global*.parquet, account*.parquet.
+    - If not found, also search the parent directory.
+
+    Returns a dict with optional keys:
+    {"global": pd.DataFrame | None, "accounts": dict[int, pd.DataFrame]}
+    """
+    def _try_load_dir(directory: str) -> tuple[Optional[pd.DataFrame], dict]:
+        gdf: Optional[pd.DataFrame] = None
+        adfs: dict[int, pd.DataFrame] = {}
+        try:
+            for fname in os.listdir(directory):
+                lower = fname.lower()
+                fpath = os.path.join(directory, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                if lower.endswith(".parquet"):
+                    if lower.startswith("global") or "global_ledger" in lower or "global" in lower:
+                        # prefer the first global-like parquet
+                        if gdf is None:
+                            try:
+                                gdf = pd.read_parquet(fpath)
+                            except Exception:
+                                pass
+                    elif lower.startswith("account") or "acct" in lower:
+                        # extract an index if present like account_0.parquet
+                        idx = None
+                        for tok in ["account_", "acct_", "account-"]:
+                            if tok in lower:
+                                try:
+                                    num = ''.join(ch for ch in lower.split(tok, 1)[1] if ch.isdigit())
+                                    if num:
+                                        idx = int(num)
+                                except Exception:
+                                    idx = None
+                        try:
+                            df = pd.read_parquet(fpath)
+                            adfs[idx if idx is not None else len(adfs)] = df
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return gdf, adfs
+
+    search_dirs = [os.path.dirname(replay_path)]
+    parent = os.path.dirname(search_dirs[0])
+    if parent and parent != search_dirs[0]:
+        search_dirs.append(parent)
+
+    global_df: Optional[pd.DataFrame] = None
+    account_dfs: dict[int, pd.DataFrame] = {}
+    for d in search_dirs:
+        gdf, adfs = _try_load_dir(d)
+        if global_df is None and gdf is not None:
+            global_df = gdf
+        account_dfs.update(adfs)
+        # Early exit if we already have a plausible set
+        if global_df is not None and account_dfs:
+            break
+
+    return {"global": global_df, "accounts": account_dfs}
+
+
+def _ledgers_for(replay_obj, replay_path: str) -> dict:
+    """Return ledger DataFrames by preferring nearby parquet files and falling back
+    to embedded ledgers inside the replay object.
+
+    Returns a dict with keys: {"global": DataFrame|None, "accounts": {int: DataFrame}}
+    """
+    bundle = _find_ledgers_near(replay_path)
+    # If no global parquet was found, use embedded if present
+    if bundle.get("global") is None and hasattr(replay_obj, "global_ledger"):
+        try:
+            gld = getattr(replay_obj, "global_ledger")
+            if isinstance(gld, pd.DataFrame):
+                bundle["global"] = gld
+        except Exception:
+            pass
+    # Merge/augment accounts with embedded account ledgers
+    try:
+        accs = bundle.get("accounts") or {}
+        if hasattr(replay_obj, "account_ledgers") and isinstance(replay_obj.account_ledgers, dict):
+            for k, v in replay_obj.account_ledgers.items():
+                if k not in accs and isinstance(v, pd.DataFrame):
+                    accs[k] = v
+        bundle["accounts"] = accs
+    except Exception:
+        pass
+    return bundle
+
+
 def _extract_series(
     replay_obj: Union[object, dict], attr_name: str
 ) -> Optional[np.ndarray]:
@@ -99,10 +194,12 @@ def plot_from_replay(
     # 1. Load replay data
     # ------------------------------------------------------------------
     replays = []
+    ledger_bundles = []  # align with replays; each is {"global": df|None, "accounts": {idx: df}}
     for replay_file in replay_files:
         try:
             rep = _load_replay(replay_file)
             replays.append(rep)
+            ledger_bundles.append(_ledgers_for(rep, replay_file))
         except Exception as e:
             print(f"[evaluator_plot] Error loading replay {replay_file}: {e}")
             continue
@@ -115,7 +212,7 @@ def plot_from_replay(
     # 2. Generate the requested plot type
     # ------------------------------------------------------------------
     if plot_type == "main":
-        _plot_main(replays, labels, save_path)
+        _plot_main(replays, labels, save_path, ledger_bundles)
     elif plot_type == "replays":
         _plot_replays(replays, labels, save_path)
     elif plot_type == "prices":
@@ -133,7 +230,7 @@ def plot_from_replay(
         _plot_main(replays, labels, save_path)
 
 
-def _plot_main(replays, labels, save_path):
+def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] = None):
     """Generate the main 6-panel evaluation plot."""
     plt.close("all")
     plt.style.use("seaborn-v0_8")
@@ -150,13 +247,37 @@ def _plot_main(replays, labels, save_path):
     demand_data = []  
     ev_locations = []  
 
-    for rep in replays:
-        power = _extract_series(rep, "current_power_usage")
-        setpoint = _extract_series(rep, "power_setpoints")
-        ev_count = _extract_series(rep, "total_evs_parked")
-        rewards = _extract_series(rep, "reward_history")
-        demand = _extract_series(rep, "tr_inflexible_loads")
-        solar = _extract_series(rep, "tr_solar_power")
+    for idx, rep in enumerate(replays):
+        # Prefer ledger-based series when available
+        gdf = None
+        if ledger_bundles and idx < len(ledger_bundles):
+            gdf = ledger_bundles[idx].get("global")
+
+        if gdf is not None and isinstance(gdf, pd.DataFrame):
+            # Expect columns named by the new ledger schema
+            try:
+                power = gdf.get("total_power_usage_kw", None)
+                setpoint = gdf.get("power_setpoint_kw", None)
+                ev_count = gdf.get("evs_parked", None)
+                demand = gdf.get("inflexible_load_kw", None)
+                solar = gdf.get("solar_production_kw", None)
+                rewards = _extract_series(rep, "reward_history")
+                power = np.asarray(power) if power is not None else None
+                setpoint = np.asarray(setpoint) if setpoint is not None else None
+                ev_count = np.asarray(ev_count) if ev_count is not None else None
+                demand = np.asarray(demand) if demand is not None else None
+                solar = np.asarray(solar) if solar is not None else None
+            except Exception:
+                power = setpoint = ev_count = demand = solar = None
+                rewards = _extract_series(rep, "reward_history")
+        else:
+            # Fallback to legacy arrays from replay
+            power = _extract_series(rep, "current_power_usage")
+            setpoint = _extract_series(rep, "power_setpoints")
+            ev_count = _extract_series(rep, "total_evs_parked")
+            rewards = _extract_series(rep, "reward_history")
+            demand = _extract_series(rep, "tr_inflexible_loads")
+            solar = _extract_series(rep, "tr_solar_power")
         
         # Extract EV metadata if available (from enhanced replay)
         ev_meta = _extract_ev_location_data(rep)
@@ -172,11 +293,18 @@ def _plot_main(replays, labels, save_path):
         if rewards is not None:
             reward_data.append(rewards)
         if demand is not None:
-            demand_tot = demand.sum(axis=0) if isinstance(demand, np.ndarray) else np.sum(demand, axis=0)
+            # If demand is 1D from ledger, use directly; otherwise aggregate across transformers
+            if demand.ndim == 1:
+                demand_tot = demand
+            else:
+                demand_tot = demand.sum(axis=0)
             demand_data.append(demand_tot)
         if solar is not None:
-            # Sum across transformers to get total solar generation
-            solar_tot = solar.sum(axis=0) if isinstance(solar, np.ndarray) else np.sum(solar, axis=0)
+            # If solar is 1D from ledger, use directly; otherwise aggregate across transformers
+            if solar.ndim == 1:
+                solar_tot = solar
+            else:
+                solar_tot = solar.sum(axis=0)
             solar_data.append(solar_tot)
 
     # ------------------------------------------------------------------

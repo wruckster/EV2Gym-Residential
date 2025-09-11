@@ -17,22 +17,32 @@ def PublicPST(env, *args):
         # math.cos(env.sim_date.hour/24*2*math.pi),
     ]
 
-    # the final state of each simulation
-    # if env.current_step < env.simulation_length:        
-    #     setpoint = min(env.power_setpoints[env.current_step], env.charge_power_potential[env.current_step])        
-    # else:
-    #     setpoint = 0       
-    if env.current_step < env.simulation_length:  
-        # setpoint = env.power_setpoints[env.current_step:env.current_step+10]
-        setpoint = env.power_setpoints[env.current_step]
-    else:
-        setpoint = np.zeros((1))
-        
-    # if len(setpoint) < 10:
-    #     setpoint = np.append(setpoint, np.zeros(10-len(setpoint)))
+    # Use ledger data instead of legacy arrays
+    t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
     
+    # Get power setpoint from global ledger
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        setpoint = float(setpoint_arr[t]) if setpoint_arr is not None else 0.0
+    else:
+        # Fallback to legacy if ledgers not available
+        if env.current_step < env.simulation_length:  
+            setpoint = env.power_setpoints[env.current_step]
+        else:
+            setpoint = np.zeros((1))
+        
     state.append(setpoint)
-    state.append(env.current_power_usage[env.current_step-1])
+    
+    # Get current power usage from global ledger (previous step)
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        prev_t = max(0, t - 1)
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+    else:
+        # Fallback to legacy
+        current_power = env.current_power_usage[env.current_step-1]
+    
+    state.append(current_power)
 
     # For every transformer
     for tr in env.transformers:
@@ -143,7 +153,17 @@ def V2G_profit_max(env, *args):
         (env.current_step),        
     ]
 
-    state.append(env.current_power_usage[env.current_step-1])
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        prev_t = max(0, t - 1)
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+    else:
+        # Fallback to legacy
+        current_power = env.current_power_usage[env.current_step-1]
+    
+    state.append(current_power)
 
     horizon = 20
     # Prefer rrp_hxx forecast if available
@@ -192,7 +212,17 @@ def V2G_profit_max_loads(env, *args):
         (env.current_step),        
     ]
 
-    state.append(env.current_power_usage[env.current_step-1])
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        power_arr = env.global_buffers._data.get('total_power_usage_kw')
+        prev_t = max(0, t - 1)
+        current_power = float(power_arr[prev_t]) if power_arr is not None else 0.0
+    else:
+        # Fallback to legacy
+        current_power = env.current_power_usage[env.current_step-1]
+    
+    state.append(current_power)
 
     charge_prices = abs(env.charge_prices[0, env.current_step:
         env.current_step+20])
@@ -247,13 +277,27 @@ def BusinessPSTwithMoreKnowledge(env, *args):
         #math.cos(env.sim_date.hour/12*2*math.pi),
     ]
 
-    # the final state of each simulation
-    if env.current_step < env.simulation_length:
-        state.append(env.power_setpoints[env.current_step]) #/100
-        state.append(env.charge_power_potential[env.current_step]) #/100
+    # Use ledger data instead of legacy arrays
+    if hasattr(env, 'global_buffers') and env.global_buffers is not None:
+        t = int(max(0, min(env.current_step, env.global_buffers.T - 1)))
+        
+        # Get power setpoint from global ledger
+        setpoint_arr = env.global_buffers._data.get('power_setpoint_kw')
+        setpoint = float(setpoint_arr[t]) if setpoint_arr is not None else 0.0
+        state.append(setpoint)
+        
+        # For charge power potential, we'll use EV power from ledger as proxy
+        ev_power_arr = env.global_buffers._data.get('ev_power_kw')
+        charge_potential = float(ev_power_arr[t]) if ev_power_arr is not None else 0.0
+        state.append(charge_potential)
     else:
-        state.append(env.power_setpoints[env.current_step-1]) #/100
-        state.append(env.charge_power_potential[env.current_step-1]) #/100   
+        # Fallback to legacy arrays
+        if env.current_step < env.simulation_length:
+            state.append(env.power_setpoints[env.current_step]) #/100
+            state.append(env.charge_power_potential[env.current_step]) #/100
+        else:
+            state.append(env.power_setpoints[env.current_step-1]) #/100
+            state.append(env.charge_power_potential[env.current_step-1]) #/100   
 
     for tr in env.transformers:
         state.append(tr.max_current/100)
