@@ -22,7 +22,7 @@ environment:
 # 3. RL agent and algorithm settings
 rl:
   # --- Modular components to use ---
-  state_function: 'V2G_profit_max'      # From ev2gym.rl_agent.state
+  state_function: 'LedgersPublicState'      # From ev2gym.rl_agent.state
   reward_function: 'profit_maximization' # From ev2gym.rl_agent.reward
   cost_function: ''                     # Optional: from ev2gym.rl_agent.cost
 

@@ -11,6 +11,7 @@ This script does not modify library behavior. It is safe to run locally.
 from __future__ import annotations
 
 import argparse
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from ev2gym.mpc.residential_mpc import RuleBasedController
@@ -57,7 +58,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    env = EV2Gym(config_file=args.config, verbose=False, save_replay=False, save_plots=False)
+    # Output directory under results/
+    outdir = os.path.join("results", "smoke_test_setpoints")
+    os.makedirs(outdir, exist_ok=True)
+
+    # Ensure replays and any artifacts are written to results/
+    env = EV2Gym(
+        config_file=args.config,
+        verbose=False,
+        save_replay=True,
+        save_plots=False,
+        replay_save_path=outdir,
+    )
 
     print(f"sim_length={env.simulation_length} timescale={env.timescale} cs={env.cs}")
     pf = getattr(env, 'price_forecast', None)
@@ -186,6 +198,20 @@ def main() -> None:
         a = np.zeros(env.number_of_ports)
         env.step(a)
     print("step_ok")
+
+    # Persist a replay and ledgers to results/
+    try:
+        replay_path = env._save_sim_replay()
+        print(f"[smoke_test_setpoints] Replay saved to {replay_path}")
+    except Exception as e:
+        print(f"[smoke_test_setpoints] Failed to save replay: {e}")
+    try:
+        ledger_dir = os.path.join(outdir, "ledgers")
+        os.makedirs(ledger_dir, exist_ok=True)
+        env.save_ledgers_parquet(ledger_dir)
+        print(f"[smoke_test_setpoints] Ledgers saved under {ledger_dir}")
+    except Exception as e:
+        print(f"[smoke_test_setpoints] Failed to save ledgers: {e}")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from ev2gym.models.ev2gym_env import EV2Gym
 # Editable constants (no CLI)
 # -------------------------------
 CONFIG_PATH = os.path.join("ev2gym", "example_config_files", "residential_v2g.yaml")
-STEPS = 288  # ~1 day at 5-min resolution
+STEPS = 1000  # ~1 day at 5-min resolution
 OUTDIR = os.path.join("results", "smoke_setpoints")
 PLOT_FILENAME = "setpoints_smoke.png"
 
@@ -59,6 +59,7 @@ def main() -> None:
         config_file=CONFIG_PATH,
         save_replay=True,
         save_plots=False,
+        replay_save_path=OUTDIR,
     )
 
     # Light-touch: enable account online setpoints at runtime
