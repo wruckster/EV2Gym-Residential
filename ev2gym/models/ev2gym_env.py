@@ -738,6 +738,156 @@ class EV2Gym(gym.Env):
         if self.render_mode:
             self.renderer.render()
 
+    def _compute_account_online_setpoint(self, t: int, load_kw: float, pv_kw: float, cs=None) -> float:
+        """
+        Compute per-account aggregate grid setpoint (kW) for step t using PV surplus, EV reserves,
+        desired capacity ceiling, and peak-period V2G policy. If `cs` is None, aggregates across
+        all charging stations (roaming account). Otherwise, computes for the specific CS account.
+
+        Uses EV YAML reserves (min_emergency_battery_capacity/min_battery_capacity) and desired_capacity.
+        """
+        # Normalized setpoint config (supports unified and legacy paths)
+        sp_cfg = self._sp_cfg()
+        os_cfg = sp_cfg.get('account_online', {})
+
+        # If not enabled, just mirror current global setpoint for compatibility
+        if not bool(os_cfg.get('enabled', False)):
+            try:
+                return float(self.power_setpoints[t]) if self.power_setpoints is not None else 0.0
+            except Exception:
+                return 0.0
+
+        # Select charger iterable
+        chargers = [cs] if cs is not None else list(self.charging_stations)
+
+        # Capability
+        max_charge_kw = 0.0
+        max_discharge_kw = 0.0
+        ev_socs = []
+        energy_above_reserve_kwh = 0.0
+        for ch in chargers:
+            try:
+                max_charge_kw += float(ch.get_max_power())
+                max_discharge_kw += abs(float(ch.get_min_power())) if hasattr(ch, 'get_min_power') else float(ch.get_max_power())
+            except Exception:
+                pass
+            # EV state
+            for ev in ch.evs_connected:
+                if ev is None:
+                    continue
+                try:
+                    ev_socs.append(float(ev.get_soc()))
+                except Exception:
+                    pass
+                try:
+                    reserve_kwh = max(float(getattr(ev, 'min_emergency_battery_capacity', 0.0)),
+                                      float(getattr(ev, 'min_battery_capacity', 0.0)))
+                    energy_above_reserve_kwh += max(0.0, float(ev.current_capacity) - reserve_kwh)
+                except Exception:
+                    pass
+
+        # Peak check
+        try:
+            cur_price = float(np.mean(self.charge_prices[:, t])) if cs is None else float(self.charge_prices[cs.id, t])
+        except Exception:
+            cur_price = 0.0
+        peak_thr = float(os_cfg.get('peak_price_threshold', 0.35))
+        peak_period = bool(cur_price >= peak_thr)
+
+        # Policy gates
+        v2g_allowed = bool(os_cfg.get('v2g_allowed', self.config.get('v2g_enabled', True)))
+        export_allowed = bool(os_cfg.get('grid_export_allowed', True))
+        dt_hours = float(self.timescale) / 60.0
+
+        # Base net grid draw
+        net_kw = (float(load_kw) if np.isfinite(load_kw) else 0.0) - (float(pv_kw) if np.isfinite(pv_kw) else 0.0)
+        setpt = max(net_kw, 0.0)
+
+        # Absorb PV only if there is EV headroom to desired capacity
+        if np.isfinite(load_kw) and np.isfinite(pv_kw) and pv_kw > load_kw and max_charge_kw > 0 and len(ev_socs) > 0:
+            headroom_kwh = 0.0
+            for ch in chargers:
+                for ev in ch.evs_connected:
+                    if ev is None:
+                        continue
+                    try:
+                        desired_kwh = float(getattr(ev, 'desired_capacity', float('nan')))
+                        cur_kwh = float(ev.current_capacity)
+                        if np.isfinite(desired_kwh):
+                            headroom_kwh += max(0.0, desired_kwh - cur_kwh)
+                    except Exception:
+                        pass
+            excess = pv_kw - load_kw
+            max_headroom_kw = headroom_kwh / dt_hours if dt_hours > 0 else max_charge_kw
+            charge_cap_kw = min(excess, max_charge_kw, max_headroom_kw)
+            if charge_cap_kw > 0:
+                setpt = max(net_kw - charge_cap_kw, 0.0)
+
+        # Discharge on peak respecting reserve and export policy
+        if peak_period and v2g_allowed and energy_above_reserve_kwh > 0 and max_discharge_kw > 0:
+            max_step_dis_kw = energy_above_reserve_kwh / dt_hours if dt_hours > 0 else max_discharge_kw
+            if export_allowed:
+                discharge_kw = min(max_discharge_kw, max_step_dis_kw)
+                setpt = net_kw - discharge_kw
+            else:
+                discharge_kw = min(max_discharge_kw, max_step_dis_kw, max(net_kw, 0.0))
+                setpt = max(net_kw - discharge_kw, 0.0)
+
+        return float(setpt)
+
+    def _sp_cfg(self) -> dict:
+        """Return a normalized setpoints configuration with unified keys and legacy fallbacks.
+
+        Structure:
+          {
+            'account_online': {enabled, v2g_allowed, grid_export_allowed, peak_price_threshold},
+            'generation': {...},
+            'filters': {...}
+          }
+        """
+        cfg = getattr(self, 'config', {}) or {}
+        setpoints = cfg.get('setpoints', {}) if isinstance(cfg, dict) else {}
+
+        # Account online (new preferred: setpoints.account_online, legacy: accounts.online_setpoints)
+        acc_online = {}
+        if isinstance(setpoints, dict) and 'account_online' in setpoints:
+            acc_online.update(setpoints.get('account_online') or {})
+        accounts = cfg.get('accounts', {}) if isinstance(cfg, dict) else {}
+        if isinstance(accounts, dict) and 'online_setpoints' in accounts:
+            # legacy override fills any missing fields
+            legacy = accounts.get('online_setpoints') or {}
+            for k, v in legacy.items():
+                acc_online.setdefault(k, v)
+        # Defaults
+        acc_online.setdefault('enabled', False)
+        acc_online.setdefault('v2g_allowed', cfg.get('v2g_enabled', True))
+        acc_online.setdefault('grid_export_allowed', True)
+        acc_online.setdefault('peak_price_threshold', 0.35)
+
+        # Generation policy (new preferred: setpoints.generation, legacy: res_v2g_setpoints)
+        generation = {}
+        if isinstance(setpoints, dict) and 'generation' in setpoints:
+            generation.update(setpoints.get('generation') or {})
+        legacy_gen = cfg.get('res_v2g_setpoints') or {}
+        if isinstance(legacy_gen, dict):
+            for k, v in legacy_gen.items():
+                generation.setdefault(k, v)
+
+        # Filters (new: setpoints.filters, legacy: setpoint_filters)
+        filters = {}
+        if isinstance(setpoints, dict) and 'filters' in setpoints:
+            filters.update(setpoints.get('filters') or {})
+        legacy_filters = cfg.get('setpoint_filters') or {}
+        if isinstance(legacy_filters, dict):
+            for k, v in legacy_filters.items():
+                filters.setdefault(k, v)
+
+        return {
+            'account_online': acc_online,
+            'generation': generation,
+            'filters': filters,
+        }
+
     def save_ledgers_parquet(self, dir_path: str) -> dict:
         """Export the global and per-account ledgers to Parquet files.
 
@@ -839,6 +989,7 @@ class EV2Gym(gym.Env):
             account_cols.append(ColumnSpec("cs_power_kw", np.dtype(np.float32)))  # aggregated over all CS
             account_cols.append(ColumnSpec("cs_amps", np.dtype(np.float32)))      # aggregated over all CS
             account_cols.append(ColumnSpec("account_power_setpoint_kw", np.dtype(np.float32)))
+            account_cols.append(ColumnSpec("account_actual_power_kw", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
@@ -866,6 +1017,7 @@ class EV2Gym(gym.Env):
                 account_cols.append(ColumnSpec("cs_power_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("cs_amps", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("account_power_setpoint_kw", np.dtype(np.float32)))
+                account_cols.append(ColumnSpec("account_actual_power_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("household_inflexible_load_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("household_pv_kw", np.dtype(np.float32)))
                 account_cols.append(ColumnSpec("tracking_error_account", np.dtype(np.float32)))
@@ -996,18 +1148,66 @@ class EV2Gym(gym.Env):
         """Fill in reward_step, reward_cumsum, and tracking_error for row t after reward is computed."""
         if self.global_buffers is None or t < 0 or t >= int(self.simulation_length):
             return
-        # compute tracking error at t using available series
+        # Compute tracking error at t
+        # If account-online setpoints are enabled, use per-account targets and per-account actuals.
+        # Otherwise, preserve legacy global behavior.
         try:
-            setpt = float(self.power_setpoints[t]) if self.power_setpoints is not None else np.nan
-            cpp = float(self.charge_power_potential[t]) if t < len(self.charge_power_potential) else np.nan
-            usage = float(self.current_power_usage[t]) if t < len(self.current_power_usage) else np.nan
-            if np.isfinite(setpt) and np.isfinite(cpp) and np.isfinite(usage):
-                target = min(setpt, cpp)
-                trk_err = float((target - usage) ** 2)
-            else:
-                trk_err = np.nan
+            sp_cfg = self._sp_cfg()
+            online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
         except Exception:
-            trk_err = np.nan
+            online_enabled = False
+
+        if online_enabled:
+            try:
+                # Per-account tracking error
+                if self.roaming_accounts:
+                    # Single aggregated account (id=0)
+                    load0 = float(self.account_load_series.get(0, pd.Series(dtype=float)).iloc[t]) \
+                        if 0 in self.account_load_series and t < len(self.account_load_series[0]) else 0.0
+                    pv0 = float(self.account_pv_series.get(0, pd.Series(dtype=float)).iloc[t]) \
+                        if 0 in self.account_pv_series and t < len(self.account_pv_series[0]) else 0.0
+                    setpt0 = float(self._compute_account_online_setpoint(t, load0, pv0, cs=None))
+                    actual0 = float(self._account_actual_power_kw(0, t))
+                    trk_err = float((setpt0 - actual0) ** 2)
+                else:
+                    # Multiple accounts: sum squared errors across accounts (CS ids)
+                    err_sum = 0.0
+                    for cs in self.charging_stations:
+                        aid = cs.id
+                        load_j = float(self.account_load_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
+                            if aid in self.account_load_series and t < len(self.account_load_series[aid]) else 0.0
+                        pv_j = float(self.account_pv_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
+                            if aid in self.account_pv_series and t < len(self.account_pv_series[aid]) else 0.0
+                        setpt_j = float(self._compute_account_online_setpoint(t, load_j, pv_j, cs=cs))
+                        actual_j = float(self._account_actual_power_kw(aid, t))
+                        err_sum += (setpt_j - actual_j) ** 2
+                    trk_err = float(err_sum)
+            except Exception:
+                # Fallback to legacy behavior on any error
+                try:
+                    setpt = float(self.power_setpoints[t]) if self.power_setpoints is not None else np.nan
+                    cpp = float(self.charge_power_potential[t]) if t < len(self.charge_power_potential) else np.nan
+                    usage = float(self.current_power_usage[t]) if t < len(self.current_power_usage) else np.nan
+                    if np.isfinite(setpt) and np.isfinite(cpp) and np.isfinite(usage):
+                        target = min(setpt, cpp)
+                        trk_err = float((target - usage) ** 2)
+                    else:
+                        trk_err = np.nan
+                except Exception:
+                    trk_err = np.nan
+        else:
+            # Legacy global tracking error
+            try:
+                setpt = float(self.power_setpoints[t]) if self.power_setpoints is not None else np.nan
+                cpp = float(self.charge_power_potential[t]) if t < len(self.charge_power_potential) else np.nan
+                usage = float(self.current_power_usage[t]) if t < len(self.current_power_usage) else np.nan
+                if np.isfinite(setpt) and np.isfinite(cpp) and np.isfinite(usage):
+                    target = min(setpt, cpp)
+                    trk_err = float((target - usage) ** 2)
+                else:
+                    trk_err = np.nan
+            except Exception:
+                trk_err = np.nan
         # reward cumsum
         try:
             rc = float(np.nansum(self.reward_history[: t + 1])) if hasattr(self, 'reward_history') else reward_value
@@ -1018,6 +1218,50 @@ class EV2Gym(gym.Env):
             "reward_step": float(reward_value),
             "reward_cumsum": float(rc),
         })
+
+    def _account_actual_power_kw(self, aid: int, t: int) -> float:
+        """Compute the actual net grid power [kW] for an account at step t.
+
+        For residential accounts, we treat an account as a charging station (non-roaming)
+        or an aggregate (aid=0) when roaming.
+
+        actual_kw = household_load_kw - pv_kw + ev_power_kw
+
+        - household_load_kw / pv_kw come from per-account series (if available)
+        - ev_power_kw is the charging station current power output for that account; when
+          roaming is enabled, this sums over all stations
+        """
+        # Household load and PV series
+        try:
+            if self.roaming_accounts and aid == 0:
+                load_kw = float(self.account_load_series.get(0, pd.Series(dtype=float)).iloc[t]) \
+                    if 0 in self.account_load_series and t < len(self.account_load_series[0]) else 0.0
+                pv_kw = float(self.account_pv_series.get(0, pd.Series(dtype=float)).iloc[t]) \
+                    if 0 in self.account_pv_series and t < len(self.account_pv_series[0]) else 0.0
+            else:
+                load_kw = float(self.account_load_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
+                    if aid in self.account_load_series and t < len(self.account_load_series[aid]) else 0.0
+                pv_kw = float(self.account_pv_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
+                    if aid in self.account_pv_series and t < len(self.account_pv_series[aid]) else 0.0
+        except Exception:
+            load_kw, pv_kw = 0.0, 0.0
+
+        # EV power contribution
+        try:
+            if self.roaming_accounts and aid == 0:
+                ev_kw = float(np.sum([cs.current_power_output for cs in self.charging_stations]))
+            else:
+                # Find charging station matching aid
+                target_cs = None
+                for cs in self.charging_stations:
+                    if cs.id == aid:
+                        target_cs = cs
+                        break
+                ev_kw = float(getattr(target_cs, 'current_power_output', 0.0)) if target_cs is not None else 0.0
+        except Exception:
+            ev_kw = 0.0
+
+        return float(load_kw - pv_kw + ev_kw)
 
     def _init_account_series(self) -> None:
         """Populate per-account household demand/PV series aligned to env timeline.
@@ -1088,7 +1332,7 @@ class EV2Gym(gym.Env):
             buf = self.account_buffers.get(0)
             if buf is None:
                 return
-            # Default per-account setpoint split (can be overridden by user logic)
+            # Default per-account setpoint (may be overridden by online mode)
             def _get_account_setpoint(step: int) -> float:
                 try:
                     gsp = float(self.power_setpoints[step]) if self.power_setpoints is not None else np.nan
@@ -1105,6 +1349,7 @@ class EV2Gym(gym.Env):
                 "cs_power_kw": total_power_kw,
                 "cs_amps": total_amps,
                 "account_power_setpoint_kw": float(_get_account_setpoint(t)),
+                "account_actual_power_kw": np.nan,
                 "household_inflexible_load_kw": np.nan,
                 "household_pv_kw": np.nan,
                 "tracking_error_account": np.nan,
@@ -1131,6 +1376,32 @@ class EV2Gym(gym.Env):
                     values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
                 for h in range(24):
                     values[f"pv_fc_h{h+1:02d}"] = float(pfc[h]) if pfc is not None and h < len(pfc) else np.nan
+            except Exception:
+                pass
+            # Online setpoint per-account (roaming aggregated account_id=0)
+            try:
+                acc_cfg = getattr(self, 'config', {}).get('accounts', {}) or {}
+                os_cfg = acc_cfg.get('online_setpoints', {}) if isinstance(acc_cfg, dict) else {}
+                if bool(os_cfg.get('enabled', False)):
+                    # Measurements from series if available, else transformer sums already in values
+                    load_kw = values.get("household_inflexible_load_kw", np.nan)
+                    pv_kw = values.get("household_pv_kw", np.nan)
+                    if 0 <= t < int(self.simulation_length):
+                        try:
+                            ls = getattr(self, 'account_load_series', {}).get(0)
+                            if ls is not None:
+                                load_kw = float(ls.iloc[t])
+                        except Exception:
+                            pass
+                        try:
+                            ps = getattr(self, 'account_pv_series', {}).get(0)
+                            if ps is not None:
+                                pv_kw = float(ps.iloc[t])
+                        except Exception:
+                            pass
+                    values["account_power_setpoint_kw"] = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=None)
+                    # Also compute per-account actual power using helper
+                    values["account_actual_power_kw"] = float(self._account_actual_power_kw(0, t))
             except Exception:
                 pass
             # Simplified EV status (pick the first connected EV across all CS)
@@ -1161,12 +1432,9 @@ class EV2Gym(gym.Env):
             # Account-level tracking error (aggregate)
             try:
                 setpt = float(values.get("account_power_setpoint_kw", np.nan))
-                ev_kw = float(values.get("cs_power_kw", np.nan))
-                load_kw = float(values.get("household_inflexible_load_kw", np.nan))
-                pv_kw = float(values.get("household_pv_kw", np.nan))
-                if np.isfinite(setpt) and np.isfinite(ev_kw) and np.isfinite(load_kw) and np.isfinite(pv_kw):
-                    net_meter = load_kw - pv_kw + ev_kw
-                    values["tracking_error_account"] = float((setpt - net_meter) ** 2)
+                actual = float(values.get("account_actual_power_kw", np.nan))
+                if np.isfinite(setpt) and np.isfinite(actual):
+                    values["tracking_error_account"] = float((setpt - actual) ** 2)
             except Exception:
                 pass
             buf.set_row(t, values)
@@ -1216,6 +1484,16 @@ class EV2Gym(gym.Env):
                     if tr_ids:
                         cs_solar = float(np.nansum(self.tr_solar_power[tr_ids, t]))
                         values["household_pv_kw"] = cs_solar
+            except Exception:
+                pass
+            # Online setpoint per-CS account when enabled
+            try:
+                acc_cfg = getattr(self, 'config', {}).get('accounts', {}) or {}
+                os_cfg = acc_cfg.get('online_setpoints', {}) if isinstance(acc_cfg, dict) else {}
+                if bool(os_cfg.get('enabled', False)):
+                    load_kw = values.get("household_inflexible_load_kw", np.nan)
+                    pv_kw = values.get("household_pv_kw", np.nan)
+                    values["account_power_setpoint_kw"] = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=cs)
             except Exception:
                 pass
             # per-port amps and soc

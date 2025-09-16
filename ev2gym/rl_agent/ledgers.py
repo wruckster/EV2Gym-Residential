@@ -47,7 +47,19 @@ class _BaseLedgerBuffers:
             "timestamp": self.timestamps.copy(),
         }
         for spec in columns:
-            self._data[spec.name] = np.full(self.T, np.nan, dtype=spec.dtype)
+            # Choose a safe default fill value per dtype to avoid casting warnings
+            dt = spec.dtype
+            if np.issubdtype(dt, np.floating):
+                fill = np.nan
+            elif np.issubdtype(dt, np.integer):
+                # Use 0 as a neutral default for integer columns
+                fill = 0
+            elif np.issubdtype(dt, np.bool_):
+                fill = False
+            else:
+                # Fallback: try NaN, most non-int numeric types will accept it
+                fill = np.nan
+            self._data[spec.name] = np.full(self.T, fill, dtype=dt)
 
         # Name -> index mapping for faster vectorization
         self._name_to_idx: Dict[str, int] = {name: i for i, name in enumerate(self.columns)}

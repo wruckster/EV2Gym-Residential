@@ -6,7 +6,7 @@ debug_setpoints: false
 # Simulation Parameters
 ##############################################################################
 timescale: 5  # minutes per step
-simulation_length: 100  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+simulation_length: 2500  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
 
 # Path to external features
 data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet
@@ -35,6 +35,36 @@ simulation_days: both  # weekdays, weekends, or both
 ##############################################################################
 accounts:
   roaming: true
+  online_setpoints:
+    enabled: true
+    v2g_allowed: true            # defaults to v2g_enabled if omitted
+    grid_export_allowed: true    # allow export during peak
+    peak_price_threshold: 0.35   # $/kWh threshold for “peak period”
+
+# -----------------------------------------------------------------------------
+# Unified Setpoints Configuration (preferred)
+# -----------------------------------------------------------------------------
+setpoints:
+  account_online:
+    enabled: true
+    v2g_allowed: true
+    grid_export_allowed: true
+    peak_price_threshold: 0.35
+
+  generation:
+    enabled: true
+    export_limit_kw_per_site: 5.0
+    ramp_kw_per_step: 1.0
+    smoothing_window_steps: 4
+    # objective: self_sufficiency  # [profit|self_sufficiency|emissions]
+
+  filters:
+    smoothing:
+      enabled: false
+      ema_alpha: 0.3
+    ramp_limit:
+      enabled: false
+      max_ramp_kw_per_step: 5.0
 
 user_profiles:
   office_worker:
@@ -148,16 +178,6 @@ charging_network_topology: None
 # The higher the number the easier it is to meet the power setpoints, the opposite for negative numbers
 power_setpoint_flexibility: 10  # (in percentage +/- %)
 
-# Residential V2G setpoint policy (default: disabled)
-# Minimal gate so existing runs are unchanged unless explicitly enabled
-res_v2g_setpoints:
-  enabled: true                 # Gate to avoid breaking existing runs
-  # Optional tuning (all optional):
-  # If omitted, reasonable defaults/derivations are used from transformer/CS/EV specs
-  export_limit_kw_per_site: 5.0  # If omitted, derive from transformer.max_power and station limits
-  ramp_kw_per_step: 1.0          # If omitted, derive from EV/CS power × a small fraction
-  smoothing_window_steps: 4      # If omitted, reuse existing median_smoothing window logic
-  # objective: self_sufficiency  # [profit|self_sufficiency|emissions] (to be used in Step 3)
 
 ##############################################################################
 # Filters and Preferences (default-off; enable for experiments)
@@ -171,14 +191,6 @@ control_filters:
     enabled: false
     max_ramp_kw_per_step: 5.0
 
-# Aggregate power setpoint filters for generated setpoints
-setpoint_filters:
-  smoothing:
-    enabled: false
-    ema_alpha: 0.3
-  ramp_limit:
-    enabled: false
-    max_ramp_kw_per_step: 5.0
 
 # Soft preference to charge from PV surplus (rule-based controller)
 pv_preference:

@@ -673,7 +673,12 @@ def generate_power_setpoints(env) -> np.ndarray:
     '''
 
     # Minimal gate for residential V2G setpoints (default-off)
-    cfg = getattr(env, 'config', {}).get('res_v2g_setpoints', {})
+    # Use unified config helper if available, fallback to legacy
+    if hasattr(env, '_sp_cfg'):
+        sp_cfg = env._sp_cfg()
+        cfg = sp_cfg.get('generation', {})
+    else:
+        cfg = getattr(env, 'config', {}).get('res_v2g_setpoints', {})
     use_res_v2g = bool(cfg.get('enabled', False))
 
     power_setpoints = np.zeros(env.simulation_length)
@@ -860,7 +865,12 @@ def generate_power_setpoints(env) -> np.ndarray:
     out = median_smoothing(power_setpoints, 5 * multiplier)
 
     # Optional aggregate setpoint filters: ramp limiting and EMA smoothing in kW
-    sp_filt = getattr(env, 'config', {}).get('setpoint_filters', {})
+    # Use unified config helper if available, fallback to legacy
+    if hasattr(env, '_sp_cfg'):
+        sp_cfg = env._sp_cfg()
+        sp_filt = sp_cfg.get('filters', {})
+    else:
+        sp_filt = getattr(env, 'config', {}).get('setpoint_filters', {})
     sp_ramp = (sp_filt or {}).get('ramp_limit', {})
     sp_smooth = (sp_filt or {}).get('smoothing', {})
 

@@ -240,7 +240,8 @@ def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] 
     # 3. Extract data series from replays
     # ------------------------------------------------------------------
     power_data = []
-    setpoint_data = []
+    setpoint_data = []  # global setpoint (legacy)
+    account_setpoints = []  # list per replay: dict[int, np.ndarray]
     ev_count_data = []
     reward_data = []
     solar_data = []  
@@ -257,19 +258,31 @@ def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] 
             # Expect columns named by the new ledger schema
             try:
                 power = gdf.get("total_power_usage_kw", None)
-                setpoint = gdf.get("power_setpoint_kw", None)
+                # Prefer per-account setpoints if available; otherwise use global setpoint
+                acct_bundle = ledger_bundles[idx].get("accounts") if ledger_bundles else {}
+                acct_sp: dict[int, np.ndarray] = {}
+                if isinstance(acct_bundle, dict) and acct_bundle:
+                    for aid, adf in acct_bundle.items():
+                        try:
+                            if isinstance(adf, pd.DataFrame) and "account_power_setpoint_kw" in adf.columns:
+                                series = np.asarray(adf["account_power_setpoint_kw"].values)
+                                acct_sp[int(aid) if aid is not None else len(acct_sp)] = series
+                        except Exception:
+                            pass
+                    setpoint = None  # suppress global if per-account present
+                else:
+                    setpoint = gdf.get("power_setpoint_kw", None)
                 ev_count = gdf.get("evs_parked", None)
                 demand = gdf.get("inflexible_load_kw", None)
                 solar = gdf.get("solar_production_kw", None)
                 rewards = _extract_series(rep, "reward_history")
                 power = np.asarray(power) if power is not None else None
                 setpoint = np.asarray(setpoint) if setpoint is not None else None
-                ev_count = np.asarray(ev_count) if ev_count is not None else None
-                demand = np.asarray(demand) if demand is not None else None
-                solar = np.asarray(solar) if solar is not None else None
+                account_setpoints.append(acct_sp)
             except Exception:
                 power = setpoint = ev_count = demand = solar = None
                 rewards = _extract_series(rep, "reward_history")
+                account_setpoints.append({})
         else:
             # Fallback to legacy arrays from replay
             power = _extract_series(rep, "current_power_usage")
@@ -278,6 +291,7 @@ def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] 
             rewards = _extract_series(rep, "reward_history")
             demand = _extract_series(rep, "tr_inflexible_loads")
             solar = _extract_series(rep, "tr_solar_power")
+            account_setpoints.append({})
         
         # Extract EV metadata if available (from enhanced replay)
         ev_meta = _extract_ev_location_data(rep)
@@ -315,7 +329,7 @@ def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] 
 
     # 4.1 Total power usage (actual vs setpoint)
     ax1 = fig.add_subplot(grid[0, 0])
-    _plot_power_usage(ax1, power_data, setpoint_data, demand_data, solar_data, labels)
+    _plot_power_usage(ax1, power_data, setpoint_data, demand_data, solar_data, labels, account_setpoints)
 
     # # 4.2 EV Trajectory
     # ax2 = fig.add_subplot(grid[0, 1])
@@ -442,7 +456,7 @@ def _plot_replays(replays, labels, save_path):
     plt.close(fig)
 
 
-def _plot_power_usage(ax, power_data, setpoint_data, demand_data, solar_data, labels):
+def _plot_power_usage(ax, power_data, setpoint_data, demand_data, solar_data, labels, account_setpoints: Optional[List[dict]] = None):
     # Plot actual power usage
     for i, power in enumerate(power_data):
         ax.plot(power, label=f"{labels[i]} – actual", linewidth=2, color='blue')
@@ -450,6 +464,22 @@ def _plot_power_usage(ax, power_data, setpoint_data, demand_data, solar_data, la
     # Plot power setpoints
     for i, setpoint in enumerate(setpoint_data):
         ax.plot(setpoint, "--", label=f"{labels[i]} – setpoint", linewidth=2, color='red', alpha=0.8)
+
+    # Plot per-account setpoints if provided
+    if account_setpoints is not None:
+        # Choose a color cycle distinct from the global setpoint
+        acct_colors = ['#8B0000', '#B22222', '#DC143C', '#FF1493', '#C71585', '#FF69B4']
+        for i, acct_map in enumerate(account_setpoints):
+            if not isinstance(acct_map, dict) or len(acct_map) == 0:
+                continue
+            # Limit legend clutter: show up to first 5 accounts explicitly
+            for j, (aid, series) in enumerate(sorted(acct_map.items(), key=lambda x: (x[0] is None, x[0]))):
+                color = acct_colors[j % len(acct_colors)]
+                lbl = f"{labels[i]} – acct {aid} setpt" if j < 5 else None
+                try:
+                    ax.plot(series, linestyle='--', linewidth=1.5, color=color, alpha=0.7, label=lbl)
+                except Exception:
+                    pass
     
     # Plot household demand with enhanced visibility
     for i, demand in enumerate(demand_data):
@@ -465,7 +495,7 @@ def _plot_power_usage(ax, power_data, setpoint_data, demand_data, solar_data, la
     # Add zero line for reference
     ax.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
     
-    ax.set_title("Power Usage vs Setpoints vs Household Demand [kW]")
+    ax.set_title("Power Usage vs Setpoints (per-account) vs Household Demand [kW]")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Power [kW]")
     ax.legend(loc='best')
@@ -727,11 +757,11 @@ def _extract_ev_location_data(replay_obj):
     locations and plug-in status as values.
     """
     location_data = {}
-    if not hasattr(replay_obj, 'ev_location_states'):
+    if not hasattr(replay_obj, 'ev_location_data'):
         return location_data
 
-    for step in range(replay_obj.ev_location_states.shape[1]):
-        location_data[step] = replay_obj.ev_location_states[:, step]
+    for step in range(replay_obj.ev_location_data.shape[1]):
+        location_data[step] = replay_obj.ev_location_data[:, step]
 
     return location_data
 

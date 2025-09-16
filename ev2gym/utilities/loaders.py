@@ -43,13 +43,26 @@ def _ensure_filter_config_defaults(env) -> None:
         return
 
     # Aggregate setpoint filters (used by generate_power_setpoints)
-    spf = cfg.setdefault('setpoint_filters', {})
-    sm = spf.setdefault('smoothing', {})
+    # Support both unified setpoints.filters and legacy setpoint_filters
+    setpoints = cfg.setdefault('setpoints', {})
+    spf_unified = setpoints.setdefault('filters', {})
+    spf_legacy = cfg.setdefault('setpoint_filters', {})
+    
+    # Ensure unified structure exists with defaults
+    sm = spf_unified.setdefault('smoothing', {})
     sm.setdefault('enabled', False)
     sm.setdefault('ema_alpha', 0.3)
-    rl = spf.setdefault('ramp_limit', {})
+    rl = spf_unified.setdefault('ramp_limit', {})
     rl.setdefault('enabled', False)
     rl.setdefault('max_ramp_kw_per_step', 5.0)
+    
+    # Also ensure legacy structure for backward compatibility
+    sm_legacy = spf_legacy.setdefault('smoothing', {})
+    sm_legacy.setdefault('enabled', False)
+    sm_legacy.setdefault('ema_alpha', 0.3)
+    rl_legacy = spf_legacy.setdefault('ramp_limit', {})
+    rl_legacy.setdefault('enabled', False)
+    rl_legacy.setdefault('max_ramp_kw_per_step', 5.0)
 
     # Controller post-filters (used by MPC and rule-based controller if they opt-in)
     cf = cfg.setdefault('control_filters', {})
@@ -608,9 +621,10 @@ def load_electricity_prices(env) -> Tuple[np.ndarray, np.ndarray]:
             sim_temp_date = sim_temp_date + \
                 datetime.timedelta(minutes=env.timescale)
 
-    # Ensure discharge prices are negative (credits for discharging)
-    factor = env.config.get('discharge_price_factor', -1.0)
-    factor = -abs(factor)  # Force negative sign
+    # Normalize discharge prices to POSITIVE credits (€/kWh revenue for export)
+    # This aligns with cost calculation: net_cost = ... - discharging_kwh * discharge_price
+    factor = env.config.get('discharge_price_factor', 1.0)
+    factor = abs(factor)  # Force positive magnitude
     discharge_prices = discharge_prices * factor
     return charge_prices, discharge_prices
 
