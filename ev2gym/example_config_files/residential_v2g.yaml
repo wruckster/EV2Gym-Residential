@@ -44,7 +44,7 @@ setpoints:
     enabled: true
     v2g_allowed: true
     grid_export_allowed: true
-    peak_price_threshold: 0.35
+    peak_price_threshold: 0.25
 
   generation:
     enabled: true
