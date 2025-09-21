@@ -313,6 +313,7 @@ class EvCityReplay():
             'energy_flow_breakdown': self.energy_flow_breakdown,
             'cost_history': self.cost_history,
             'reward_history': self.reward_history,
+            'account_ledgers': self.account_ledgers,  # Add account ledgers for SOC tracking
         }
         import pickle
         with open(self.replay_path, 'wb') as f:

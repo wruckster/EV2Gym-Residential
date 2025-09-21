@@ -1,10 +1,11 @@
 import os
 import pickle
 from typing import List, Union, Optional
+import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as _mticker
-import numpy as np
-import pandas as pd
+import matplotlib.dates as mdates
 import datetime as _dt
 
 
@@ -276,8 +277,62 @@ def _plot_main(replays, labels, save_path, ledger_bundles: Optional[List[dict]] 
                 demand = gdf.get("inflexible_load_kw", None)
                 solar = gdf.get("solar_production_kw", None)
                 rewards = _extract_series(rep, "reward_history")
+
+                # Convert to np arrays where present
                 power = np.asarray(power) if power is not None else None
                 setpoint = np.asarray(setpoint) if setpoint is not None else None
+
+                # If global fields are missing or all-NaN (e.g., per-account mode),
+                # aggregate from account ledgers when available.
+                def _is_all_nan(x) -> bool:
+                    try:
+                        arr = np.asarray(x, dtype=float)
+                        return arr.size > 0 and np.all(np.isnan(arr))
+                    except Exception:
+                        return False
+
+                if (power is None or _is_all_nan(power)) and isinstance(acct_bundle, dict) and acct_bundle:
+                    vals = []
+                    for _, adf in acct_bundle.items():
+                        if isinstance(adf, pd.DataFrame) and "account_actual_power_kw" in adf.columns:
+                            try:
+                                vals.append(np.asarray(adf["account_actual_power_kw"].values, dtype=float))
+                            except Exception:
+                                pass
+                    if vals:
+                        try:
+                            power = np.nansum(np.vstack(vals), axis=0)
+                        except Exception:
+                            power = None
+
+                if (demand is None or _is_all_nan(demand)) and isinstance(acct_bundle, dict) and acct_bundle:
+                    vals = []
+                    for _, adf in acct_bundle.items():
+                        if isinstance(adf, pd.DataFrame) and "household_inflexible_load_kw" in adf.columns:
+                            try:
+                                vals.append(np.asarray(adf["household_inflexible_load_kw"].values, dtype=float))
+                            except Exception:
+                                pass
+                    if vals:
+                        try:
+                            demand = np.nansum(np.vstack(vals), axis=0)
+                        except Exception:
+                            demand = None
+
+                if (solar is None or _is_all_nan(solar)) and isinstance(acct_bundle, dict) and acct_bundle:
+                    vals = []
+                    for _, adf in acct_bundle.items():
+                        if isinstance(adf, pd.DataFrame) and "household_pv_kw" in adf.columns:
+                            try:
+                                vals.append(np.asarray(adf["household_pv_kw"].values, dtype=float))
+                            except Exception:
+                                pass
+                    if vals:
+                        try:
+                            solar = np.nansum(np.vstack(vals), axis=0)
+                        except Exception:
+                            solar = None
+
                 account_setpoints.append(acct_sp)
             except Exception:
                 power = setpoint = ev_count = demand = solar = None
@@ -1025,9 +1080,48 @@ def _plot_ev_details(ax, replay, time_steps):
     ax.patch.set_alpha(0)
 
     # Individual EV SoC Trajectory
-    if hasattr(replay, 'port_energy_level'):
+    soc_data = None
+    
+    # First try to get SOC from account ledger (more accurate, includes commuting periods)
+    if hasattr(replay, 'account_ledgers') and replay.account_ledgers:
+        try:
+            account_ledger = replay.account_ledgers.get(0)  # Get first account
+            if account_ledger is not None and isinstance(account_ledger, (dict, pd.DataFrame)) and 'soc' in account_ledger.columns:
+                # Get SOC data and handle NaN values
+                soc_values = account_ledger['soc'].values[:sim_steps]
+                
+                # Replace NaN values with interpolated values
+                for i in range(len(soc_values)):
+                    if np.isnan(soc_values[i]) and i > 0:
+                        # Find next valid value
+                        next_valid = None
+                        for j in range(i+1, len(soc_values)):
+                            if not np.isnan(soc_values[j]):
+                                next_valid = j
+                                break
+                        
+                        # Interpolate between previous and next valid values
+                        if next_valid is not None:
+                            prev_val = soc_values[i-1]
+                            next_val = soc_values[next_valid]
+                            steps = next_valid - (i-1)
+                            soc_values[i] = prev_val + (next_val - prev_val) * (1 / steps)
+                        else:
+                            # No next valid value, use previous
+                            soc_values[i] = soc_values[i-1]
+                
+                # Convert to percentage
+                soc_data = soc_values * 100
+                ax.plot(time_steps, soc_data, label='EV-1 SoC (Ledger)', color='#007ACC', linestyle='-')
+                print(f"[evaluator_plot] Using SOC data from account ledger")
+        except Exception as e:
+            print(f"[evaluator_plot] Error getting SOC from account ledger: {e}")
+    
+    # Fallback to port_energy_level (only has SOC when EV is connected)
+    if soc_data is None and hasattr(replay, 'port_energy_level'):
         soc_raw = replay.port_energy_level[0, 0, :sim_steps] * 100
-        ax.plot(time_steps, soc_raw, label='EV-1 SoC', color='#007ACC', linestyle='--')
+        ax.plot(time_steps, soc_raw, label='EV-1 SoC (Port)', color='#007ACC', linestyle='--')
+        print(f"[evaluator_plot] Falling back to port_energy_level for SOC data")
 
     # 3. Plot Power on Secondary Axis (Right)
     ax_power = ax.twinx()

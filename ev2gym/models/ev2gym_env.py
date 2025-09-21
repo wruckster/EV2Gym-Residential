@@ -312,6 +312,31 @@ class EV2Gym(gym.Env):
         # Variable showing whether the simulation is done or not
         self.done = False
 
+    def _initialize_step0_locations(self) -> None:
+        """Initialize EV location_state at t=0 from precomputed schedules and
+        ensure connection consistency before first ledger write.
+
+        - If an EV has sim_locations, set location_state = sim_locations[0]
+        - If location_state == 2 (commuting), ensure it is not connected to any CS
+        - Update ev_location_data for step 0
+        """
+        try:
+            # Set location_state from precomputed schedules
+            for ev in getattr(self, 'EVs', []):
+                if hasattr(ev, 'sim_locations') and len(ev.sim_locations) > 0:
+                    ev.location_state = int(ev.sim_locations[0])
+            # Disconnect any commuting EVs mistakenly connected at t=0
+            for cs in self.charging_stations:
+                for p_idx, ev in enumerate(list(cs.evs_connected)):
+                    if ev is not None and getattr(ev, 'location_state', -1) == 2:
+                        cs.evs_connected[p_idx] = None
+                        cs.n_evs_connected = max(0, cs.n_evs_connected - 1)
+            # Write location data for step 0
+            self._update_ev_location_data()
+        except Exception:
+            # Safe to ignore; fallback behavior will still function
+            pass
+
         # Make folders for results
         if self.save_replay:
             os.makedirs(self.replay_save_path, exist_ok=True)
@@ -338,7 +363,19 @@ class EV2Gym(gym.Env):
         self._update_forecasts()
 
         # Now generate power setpoints (can use forecasts if enabled)
-        self.power_setpoints = load_power_setpoints(self)
+        # Only load global setpoints when account-online mode is disabled
+        try:
+            sp_cfg = self._sp_cfg()
+            account_online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
+        except Exception:
+            account_online_enabled = False
+        if account_online_enabled:
+            # In account-online mode, global setpoints are not used
+            self.power_setpoints = np.full(int(self.simulation_length), np.nan, dtype=float)
+            self.global_setpoints_enabled = False
+        else:
+            self.power_setpoints = load_power_setpoints(self)
+            self.global_setpoints_enabled = True
 
         # Create replay only after power_setpoints (and other fields) exist
         if self.save_replay and self.replay is None:
@@ -414,21 +451,35 @@ class EV2Gym(gym.Env):
 
         self.sim_starting_date = self.sim_date
         self.EVs_profiles = load_ev_profiles(self)
-        self.power_setpoints = load_power_setpoints(self)
+        # Load global power setpoints only if account-online setpoints are disabled
+        try:
+            sp_cfg = self._sp_cfg()
+            online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
+        except Exception:
+            online_enabled = False
+        if not online_enabled:
+            self.power_setpoints = load_power_setpoints(self)
+        else:
+            # Keep a placeholder vector for legacy consumers; actual per-account
+            # online setpoints will be computed each step and written to ledgers
+            self.power_setpoints = np.zeros(int(self.simulation_length), dtype=float)
         self.EVs = []
 
         # Re-initialize ledgers for the new episode (timestamps realign, schemas consistent)
         self._init_ledgers()
 
+        # Initialize per-account household series aligned to env timeline
+        try:
+            self._init_account_series()
+        except Exception:
+            # Non-fatal; account-level columns will be NaN if data is missing
+            pass
+
         # Populate initial row (t=0) with time features and any known values
         # so consumers can access time columns immediately after reset.
         self.current_step = 0
-        try:
-            self._update_global_ledger_row()
-            self._update_account_ledger_row()
-        except Exception:
-            # Keep reset robust; ledger rows will be populated on first step
-            pass
+        # Do NOT write ledger rows yet; we first need to spawn EVs and initialize
+        # their step-0 states so the first ledger row contains valid values.
 
         # Optional concise debug: summarize EV profiles and power setpoints
         if getattr(self, 'debug_setpoints', False):
@@ -455,8 +506,21 @@ class EV2Gym(gym.Env):
 
         self.init_statistic_variables()
 
+        # Initialize EV location_state at t=0 from precomputed schedules if available
+        try:
+            self._initialize_step0_locations()
+        except Exception:
+            pass
+
         self._log_initial_state()
         self._update_forecasts()
+
+        # Now that step-0 state is initialized, write the first ledger rows
+        try:
+            self._update_global_ledger_row()
+            self._update_account_ledger_row()
+        except Exception:
+            pass
 
         return self._get_observation(), {}
 
@@ -548,8 +612,17 @@ class EV2Gym(gym.Env):
         '''
         assert not self.done, "Episode is done, please reset the environment"
 
+        # Advance to the next step FIRST so all logic uses the correct step number
+        self.current_step += 1
+        self._step_date()
+
         # Use a stable local index for all per-step writes
         t = self.current_step
+
+        # Check if we've reached the end of simulation
+        if t >= self.simulation_length:
+            self.done = True
+            return self._get_observation(), 0.0, True, False, {}
 
         if self.verbose:
             print(f"Step: {self.current_step}/{self.simulation_length}")
@@ -561,13 +634,83 @@ class EV2Gym(gym.Env):
         self.current_ev_departed = 0
         self.current_ev_arrived = 0
 
-        # Update EV states and drain battery for commuting EVs
+        # Update ALL EV location states first (both connected and disconnected)
+        for ev in self.EVs:
+            # Update location_state from pre-computed sim_locations array
+            if hasattr(ev, 'sim_locations') and self.current_step < len(ev.sim_locations):
+                old_location_state = ev.location_state
+                ev.location_state = int(ev.sim_locations[self.current_step])
+                if self.verbose and self.current_step in [182, 183, 204, 205]:
+                    print(f"[DEBUG] Step {self.current_step}: EV {ev.id} location_state {old_location_state} -> {ev.location_state}")
+                
+                # Drain battery for commuting EVs (regardless of connection status)
+                if ev.location_state == 2:  # If commuting
+                    ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
+                    if self.verbose and self.current_step in [182, 183, 204, 205]:
+                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} battery drained during commute, SOC: {ev.get_soc():.4f}")
+            else:
+                # Fallback to old method if sim_locations not available
+                ev.update_location_state(self.current_step)
+                if self.verbose and self.current_step in [182, 183, 204, 205]:
+                    print(f"[DEBUG] Step {self.current_step}: EV {ev.id} location_state (fallback): {ev.location_state}")
+                
+                # Drain battery for commuting EVs (regardless of connection status)
+                if ev.location_state == 2:  # If commuting
+                    ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
+                    if self.verbose and self.current_step in [182, 183, 204, 205]:
+                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} battery drained during commute, SOC: {ev.get_soc():.4f}")
+
+        # Check connected EVs for disconnection
+        evs_to_disconnect = []  # Track EVs that need to be disconnected
         for cs in self.charging_stations:
-            for ev in cs.evs_connected:
-                if ev is not None:
-                    ev.update_location_state(self.current_step)
-                    if ev.location_state == 2:  # If commuting
-                        ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
+            for port_idx, ev in enumerate(cs.evs_connected):
+                if ev is not None and ev.location_state == 2:  # If commuting
+                    # Mark for disconnection - commuting EVs should not be connected to chargers
+                    evs_to_disconnect.append((cs, port_idx, ev))
+        
+        # Disconnect commuting EVs from charging stations
+        for cs, port_idx, ev in evs_to_disconnect:
+            cs.evs_connected[port_idx] = None
+            cs.n_evs_connected -= 1
+            if self.verbose:
+                print(f"[EV2Gym] EV {ev.id} disconnected from CS {cs.id} port {port_idx} (commuting)")
+        
+        # Reconnect EVs that have returned from commuting (location_state 0=home or 1=work)
+        for ev in self.EVs:
+            # Location state already updated above
+            if self.verbose and self.current_step in [204, 205, 390, 391]:
+                print(f"[DEBUG] Step {self.current_step}: Checking EV {ev.id} for reconnection, location_state: {ev.location_state}")
+            if ev.location_state in [0, 1]:  # Home or work
+                # Check if this EV is already connected somewhere
+                already_connected = False
+                for cs in self.charging_stations:
+                    if ev in cs.evs_connected:
+                        already_connected = True
+                        break
+                
+                if not already_connected:
+                    if self.verbose and self.current_step in [204, 205, 390, 391]:
+                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} needs reconnection")
+                    # Find the appropriate charging station for this EV
+                    target_cs_id = None
+                    if ev.location_state == 0:  # Home
+                        target_cs_id = getattr(ev, 'default_station', ev.location)
+                    elif ev.location_state == 1:  # Work
+                        target_cs_id = getattr(ev, 'work_station', ev.location)
+                    
+                    # Try to connect to the target charging station
+                    if target_cs_id is not None and 0 <= target_cs_id < len(self.charging_stations):
+                        target_cs = self.charging_stations[target_cs_id]
+                        # Find an empty port
+                        for port_idx in range(target_cs.n_ports):
+                            if target_cs.evs_connected[port_idx] is None:
+                                target_cs.evs_connected[port_idx] = ev
+                                target_cs.n_evs_connected += 1
+                                ev.location = target_cs_id  # Update EV's current location
+                                if self.verbose:
+                                    location_name = "home" if ev.location_state == 0 else "work"
+                                    print(f"[EV2Gym] EV {ev.id} reconnected to CS {target_cs_id} port {port_idx} ({location_name})")
+                                break
 
         # Reset power usage for this timestep to zero before processing charging stations
         self.current_power_usage[t] = 0.0
@@ -577,6 +720,10 @@ class EV2Gym(gym.Env):
             # Reset sets the current_power to inflexible_load + solar_power for the current step
             tr.reset(step=t)
             self.current_power_usage[t] += tr.current_power
+
+        # Pre-calculate and store account setpoints BEFORE charging station processing
+        # This ensures heuristics can read current-step setpoints from account ledgers
+        self._pre_calculate_account_setpoints()
 
         total_costs = 0
         total_invalid_action_punishment = 0
@@ -644,9 +791,7 @@ class EV2Gym(gym.Env):
             elif ev.time_of_arrival > self.current_step:
                 break
 
-        # Update EV location states based on schedule transitions
-        for ev in self.EVs:
-            ev.update_location_state(self.current_step)
+        # EV location states already updated in the first loop above
 
         # Update power stats arrays for this step
         self._update_power_statistics(self.departing_evs)
@@ -659,10 +804,6 @@ class EV2Gym(gym.Env):
             self._update_forecasts()
         except Exception:
             pass
-
-        # Ledger writes for current step
-        self._update_global_ledger_row()
-        self._update_account_ledger_row()
 
         # Track EVs parked count
         self.current_evs_parked += self.current_ev_arrived - self.current_ev_departed
@@ -700,6 +841,12 @@ class EV2Gym(gym.Env):
             self._finalize_reward_for_row(t, float(reward))
         except Exception:
             pass
+            
+        # Ledger writes for current step - after power statistics and reward are computed
+        # to ensure all arrays are populated and ledger rows have current power data
+        self._update_global_ledger_row()
+        self._update_account_ledger_row()
+        
         self.total_evs_parked.append(len(self.EVs))
 
         if visualize:
@@ -724,9 +871,7 @@ class EV2Gym(gym.Env):
         # Track EV locations and plug-in status for this timestep
         self._update_ev_location_data()
 
-        # Advance simulation time for next step
-        self.current_step += 1
-        self._step_date()
+        # Step advancement already done at the beginning of this method
 
         # Check termination conditions and return the appropriate values
         obs = self._get_observation()
@@ -968,7 +1113,14 @@ class EV2Gym(gym.Env):
         # current weather observations (aligned to env timeline when available)
         global_cols.append(ColumnSpec("temp_c", np.dtype(np.float32)))
         global_cols.append(ColumnSpec("wind_speed", np.dtype(np.float32)))
-        global_cols.append(ColumnSpec("evs_parked", np.dtype(np.int16)))
+        # Include evs_parked only when NOT in per-account mode
+        try:
+            sp_cfg = self._sp_cfg()
+            online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
+        except Exception:
+            online_enabled = False
+        if not online_enabled:
+            global_cols.append(ColumnSpec("evs_parked", np.dtype(np.int16)))
         # tracking/cost/reward
         global_cols.append(ColumnSpec("tracking_error", np.dtype(np.float32)))
         global_cols.append(ColumnSpec("invalid_action_punishment", np.dtype(np.float32)))
@@ -999,6 +1151,15 @@ class EV2Gym(gym.Env):
             account_cols.append(ColumnSpec("soc", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("time_to_departure", np.dtype(np.float32)))
             account_cols.append(ColumnSpec("time_since_arrival", np.dtype(np.float32)))
+            # Per-EV location slots for roaming account: ev{i}_location (-1 empty, 0 home, 1 work, 2 commuting)
+            # Base slots on actual EV count, not port count
+            try:
+                max_slots = len(getattr(self, 'EVs_profiles', []))
+                max_slots = max(0, max_slots)
+            except Exception:
+                max_slots = 0
+            for i in range(max_slots):
+                account_cols.append(ColumnSpec(f"ev{i}_location", np.dtype(np.int8)))
             # per-account forecasts H=24
             for h in range(24):
                 account_cols.append(ColumnSpec(f"load_fc_h{h+1:02d}", np.dtype(np.float32)))
@@ -1034,6 +1195,10 @@ class EV2Gym(gym.Env):
                     account_cols.append(ColumnSpec(f"port{p}_action", np.dtype(np.float32)))
                     account_cols.append(ColumnSpec(f"port{p}_is_charging", np.dtype(np.int8)))
                     account_cols.append(ColumnSpec(f"port{p}_is_discharging", np.dtype(np.int8)))
+                # Per-EV location slots for this CS account (based on EVs that could use this CS)
+                # For simplicity, use cs.n_ports as max possible EVs per CS
+                for i in range(cs.n_ports):
+                    account_cols.append(ColumnSpec(f"ev{i}_location", np.dtype(np.int8)))
                 for h in range(24):
                     account_cols.append(ColumnSpec(f"load_fc_h{h+1:02d}", np.dtype(np.float32)))
                 for h in range(24):
@@ -1049,6 +1214,12 @@ class EV2Gym(gym.Env):
         t = self.current_step
         if self.global_buffers is None:
             return
+        # Determine whether per-account mode is enabled
+        try:
+            sp_cfg = self._sp_cfg()
+            online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
+        except Exception:
+            online_enabled = False
         # time features for step t (before increment): use current sim_date
         try:
             dow = int(self.sim_date.weekday())
@@ -1066,18 +1237,20 @@ class EV2Gym(gym.Env):
             "dow": np.int8(dow),
             "hour": np.int8(hour),
             "minute": np.int8(minute),
-            "total_power_usage_kw": float(self.current_power_usage[t]) if t < self.simulation_length else np.nan,
-            "power_setpoint_kw": float(self.power_setpoints[t]) if self.power_setpoints is not None and t < len(self.power_setpoints) else np.nan,
-            "ev_power_kw": float(self.energy_flow_breakdown['ev_power'][t]) if 'ev_power' in self.energy_flow_breakdown else float(np.sum(self.cs_power[:, t])) if t < self.simulation_length else np.nan,
-            "inflexible_load_kw": float(self.energy_flow_breakdown['inflexible_load'][t]) if 'inflexible_load' in self.energy_flow_breakdown else np.nan,
-            "solar_production_kw": float(self.energy_flow_breakdown['solar_production'][t]) if 'solar_production' in self.energy_flow_breakdown else np.nan,
+            # Populate global aggregate fields only when NOT in per-account mode
+            "total_power_usage_kw": (np.nan if online_enabled else (float(self.current_power_usage[t]) if t < self.simulation_length else np.nan)),
+            "power_setpoint_kw": (np.nan if online_enabled else (float(self.power_setpoints[t]) if self.power_setpoints is not None and t < len(self.power_setpoints) else np.nan)),
+            "ev_power_kw": (np.nan if online_enabled else (float(self.energy_flow_breakdown['ev_power'][t]) if 'ev_power' in self.energy_flow_breakdown else (float(np.sum(self.cs_power[:, t])) if t < self.simulation_length else np.nan))),
+            "inflexible_load_kw": (np.nan if online_enabled else (float(self.energy_flow_breakdown['inflexible_load'][t]) if 'inflexible_load' in self.energy_flow_breakdown else np.nan)),
+            "solar_production_kw": (np.nan if online_enabled else (float(self.energy_flow_breakdown['solar_production'][t]) if 'solar_production' in self.energy_flow_breakdown else np.nan)),
             # current prices averaged across CS
             "charge_price": (float(np.mean(self.charge_prices[:, t])) if hasattr(self, 'charge_prices') and t < getattr(self.charge_prices, 'shape', [0, 0])[1] else np.nan),
             "discharge_price": (float(np.mean(self.discharge_prices[:, t])) if hasattr(self, 'discharge_prices') and t < getattr(self.discharge_prices, 'shape', [0, 0])[1] else np.nan),
             # current weather observations if available
             "temp_c": float(self.weather_data.iloc[t, 0]), #if hasattr(self, 'weather_data') and isinstance(getattr(self, 'weather_data'), (list, np.ndarray)) and t < len(self.weather_data) else np.nan),
             "wind_speed": float(self.weather_data.iloc[t, 1]), #if hasattr(self, 'weather_data') and isinstance(getattr(self, 'weather_data'), (list, np.ndarray)) and t < len(self.weather_data) else np.nan),
-            "evs_parked": int(self.current_evs_parked),
+            # Only keep global evs_parked in non-account mode; otherwise it's duplicate info.
+            "evs_parked": (np.nan if online_enabled else int(self.current_evs_parked)),
             # Defaults for tracking/cost/reward; reward fields will be finalized after reward calculation
             "tracking_error": np.nan,
             "invalid_action_punishment": float(getattr(self, '_pending_invalid_action_punishment', np.nan)),
@@ -1274,60 +1447,191 @@ class EV2Gym(gym.Env):
         """
         try:
             df = _load_household_profiles(self, ignore_date_filter=False)
-        except Exception:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: loaded df shape={df.shape if df is not None else None}")
+                if df is not None:
+                    print(f"[DEBUG] _init_account_series: loaded df columns={list(df.columns)}")
+        except Exception as e:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: exception loading household profiles: {e}")
             return
         if not isinstance(df, pd.DataFrame) or df.empty:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: df is None or empty")
             return
         # Build a time-indexed frame from loader output. It may return a RangeIndex with a 'timestamp' column.
-        if 'timestamp' in df.columns:
-            dt_index = pd.to_datetime(df['timestamp'])
-            # Enforce fixed +10 tz to match loader behavior
-            if dt_index.tz is None:
-                try:
-                    import pytz
-                    dt_index = dt_index.tz_localize(pytz.FixedOffset(600))
-                except Exception:
-                    pass
-            ts_df = df[['demand', 'solar']].copy()
-            ts_df.index = dt_index
-        else:
-            # Already time-indexed
-            ts_df = df[['demand', 'solar']].copy()
-            dt_index = ts_df.index
-        # Determine target timeline aligned with env start and tz
-        start_date = pd.Timestamp(year=self.config.get('year', 2019),
-                                  month=self.config.get('month', 1),
-                                  day=self.config.get('day', 1),
-                                  hour=self.config.get('hour', 0),
+        try:
+            if 'timestamp' in df.columns:
+                if self.verbose:
+                    print(f"[DEBUG] _init_account_series: processing timestamp column")
+                dt_index = pd.to_datetime(df['timestamp'])
+                ts_df = df[['demand', 'solar']].copy()
+                ts_df.index = dt_index
+                if self.verbose:
+                    print(f"[DEBUG] _init_account_series: created ts_df with index, shape={ts_df.shape}")
+            else:
+                if self.verbose:
+                    print(f"[DEBUG] _init_account_series: using existing time index")
+                # Already time-indexed
+                ts_df = df[['demand', 'solar']].copy()
+        except Exception as e:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: exception in time indexing: {e}")
+            return
+
+        # Enforce a fixed timezone of +10 (UTC+10) for both series and target index
+        try:
+            import pytz
+            fixed_tz = pytz.FixedOffset(600)  # +10 hours
+        except Exception:
+            fixed_tz = None
+
+        try:
+            if fixed_tz is not None:
+                if getattr(ts_df.index, 'tz', None) is None:
+                    ts_df.index = ts_df.index.tz_localize(fixed_tz)
+                else:
+                    ts_df.index = ts_df.index.tz_convert(fixed_tz)
+        except Exception as e:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: exception enforcing fixed tz on ts_df.index: {e}")
+            return
+
+        # Determine target timeline aligned with env start and fixed tz
+        start_date = pd.Timestamp(year=self.config.get('year',  self.config.get('year', 2019)),
+                                  month=self.config.get('month', self.config.get('month', 1)),
+                                  day=self.config.get('day',    self.config.get('day', 1)),
+                                  hour=self.config.get('hour',  0),
                                   minute=self.config.get('minute', 0))
-        if getattr(dt_index, 'tz', None) is not None and start_date.tzinfo is None:
-            start_date = start_date.tz_localize(dt_index.tz)
+        if fixed_tz is not None and start_date.tzinfo is None:
+            start_date = start_date.tz_localize(fixed_tz)
+
         idx = pd.date_range(start=start_date,
                             periods=int(self.simulation_length),
                             freq=f"{self.timescale}min",
-                            tz=(dt_index.tz if getattr(dt_index, 'tz', None) is not None else None))
+                            tz=(fixed_tz if fixed_tz is not None else None))
         # Reindex to env timeline
-        load_series = ts_df['demand'].reindex(idx, method='nearest') if 'demand' in ts_df.columns else None
-        pv_series = ts_df['solar'].reindex(idx, method='nearest') if 'solar' in ts_df.columns else None
+        if self.verbose:
+            print(f"[DEBUG] _init_account_series: ts_df columns: {list(ts_df.columns)}")
+            print(f"[DEBUG] _init_account_series: ts_df shape: {ts_df.shape}")
+            print(f"[DEBUG] _init_account_series: target idx length: {len(idx)}")
+        try:
+            load_series = ts_df['demand'].reindex(idx, method='nearest') if 'demand' in ts_df.columns else None
+            pv_series = ts_df['solar'].reindex(idx, method='nearest') if 'solar' in ts_df.columns else None
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: reindexing successful")
+                print(f"[DEBUG] _init_account_series: load_series is None: {load_series is None}")
+                print(f"[DEBUG] _init_account_series: pv_series is None: {pv_series is None}")
+        except Exception as e:
+            if self.verbose:
+                print(f"[DEBUG] _init_account_series: exception in reindexing: {e}")
+            return
 
         # Assign to accounts
         if self.roaming_accounts:
             if load_series is not None:
                 self.account_load_series[0] = load_series
+                if self.verbose:
+                    print(f"[DEBUG] _init_account_series: assigned load_series to account 0, length={len(load_series)}")
             if pv_series is not None:
                 self.account_pv_series[0] = pv_series
+                if self.verbose:
+                    print(f"[DEBUG] _init_account_series: assigned pv_series to account 0, length={len(pv_series)}")
         else:
             for cs in self.charging_stations:
                 if load_series is not None:
                     self.account_load_series[cs.id] = load_series
+                    if self.verbose:
+                        print(f"[DEBUG] _init_account_series: assigned load_series to account {cs.id}, length={len(load_series)}")
                 if pv_series is not None:
                     self.account_pv_series[cs.id] = pv_series
+                    if self.verbose:
+                        print(f"[DEBUG] _init_account_series: assigned pv_series to account {cs.id}, length={len(pv_series)}")
+        
+        if self.verbose:
+            print(f"[DEBUG] _init_account_series: final account_load_series keys: {list(self.account_load_series.keys())}")
+            print(f"[DEBUG] _init_account_series: final account_pv_series keys: {list(self.account_pv_series.keys())}")
+
+    def _pre_calculate_account_setpoints(self) -> None:
+        """Pre-calculate and store account setpoints before charging station processing.
+        This ensures heuristics can read current-step setpoints from account ledgers.
+        """
+        t = self.current_step
+        try:
+            acc_bufs = getattr(self, 'account_buffers', {})
+            if not acc_bufs:
+                return
+                
+            if self.roaming_accounts:
+                buf = acc_bufs.get(0)
+                if buf is not None:
+                    # Calculate setpoint for roaming account (id=0)
+                    load_kw = np.nan
+                    pv_kw = np.nan
+                    
+                    # Get household load and PV from transformer aggregates
+                    if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
+                        load_kw = float(np.nansum(self.tr_inflexible_loads[:, t]))
+                    if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
+                        pv_kw = float(np.nansum(self.tr_solar_power[:, t]))
+                    
+                    # Override with account series if available
+                    try:
+                        ls = getattr(self, 'account_load_series', {}).get(0)
+                        if ls is not None and t < len(ls):
+                            load_kw = float(ls.iloc[t])
+                    except Exception:
+                        pass
+                    try:
+                        ps = getattr(self, 'account_pv_series', {}).get(0)
+                        if ps is not None and t < len(ps):
+                            pv_kw = float(ps.iloc[t])
+                    except Exception:
+                        pass
+                    
+                    # Calculate and store the setpoint
+                    setpoint = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=None)
+                    buf._data['account_power_setpoint_kw'][t] = float(setpoint)
+            else:
+                # Non-roaming: calculate setpoint for each charging station account
+                for cs in self.charging_stations:
+                    buf = acc_bufs.get(cs.id)
+                    if buf is not None:
+                        load_kw = np.nan
+                        pv_kw = np.nan
+                        
+                        # Get per-account data if available
+                        try:
+                            ls = getattr(self, 'account_load_series', {}).get(cs.id)
+                            if ls is not None and t < len(ls):
+                                load_kw = float(ls.iloc[t])
+                        except Exception:
+                            pass
+                        try:
+                            ps = getattr(self, 'account_pv_series', {}).get(cs.id)
+                            if ps is not None and t < len(ps):
+                                pv_kw = float(ps.iloc[t])
+                        except Exception:
+                            pass
+                        
+                        # Calculate and store the setpoint
+                        setpoint = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=cs)
+                        buf._data['account_power_setpoint_kw'][t] = float(setpoint)
+        except Exception:
+            # Non-fatal; setpoints will remain NaN if calculation fails
+            pass
 
     def _update_account_ledger_row(self) -> None:
         """Write current-step per-account values into account_buffers.
         In roaming mode, a single account (id=0) aggregates over all charging stations/ports.
         """
         t = self.current_step
+        # Determine whether per-account mode is enabled
+        try:
+            sp_cfg = self._sp_cfg()
+            online_enabled = bool(sp_cfg.get('account_online', {}).get('enabled', False))
+        except Exception:
+            online_enabled = False
         if self.roaming_accounts:
             buf = self.account_buffers.get(0)
             if buf is None:
@@ -1342,47 +1646,56 @@ class EV2Gym(gym.Env):
             # Aggregate CS-levels
             total_power_kw = float(np.nansum(self.cs_power[:, t]))
             total_amps = float(np.nansum(self.cs_current[:, t]))
-            total_evs = int(np.nansum([cs.n_evs_connected for cs in self.charging_stations]))
+            # Count only non-commuting EVs (exclude location_state == 2)
+            total_evs = 0
+            for cs in self.charging_stations:
+                for ev in cs.evs_connected:
+                    if ev is not None and getattr(ev, 'location_state', -1) != 2:
+                        total_evs += 1
             agg_kw_limit = float(np.nansum([getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan for cs in self.charging_stations]))
             values = {
                 "step": int(t),
                 "cs_power_kw": total_power_kw,
                 "cs_amps": total_amps,
-                "account_power_setpoint_kw": float(_get_account_setpoint(t)),
-                "account_actual_power_kw": np.nan,
-                "household_inflexible_load_kw": np.nan,
-                "household_pv_kw": np.nan,
+                # Only populate per-account fields when online mode is enabled; otherwise keep NaN
+                "account_power_setpoint_kw": (float(_get_account_setpoint(t)) if online_enabled else np.nan),
+                "account_actual_power_kw": (np.nan),
+                "household_inflexible_load_kw": (np.nan),
+                "household_pv_kw": (np.nan),
                 "tracking_error_account": np.nan,
                 "evs_connected": total_evs,
                 "cs_kw_limit": agg_kw_limit,
             }
-            # Household series (shared) and forecasts (aggregate sum baseline for roaming)
+            # Populate household series using account series when available; fallback to transformer sums
             try:
-                # Use aggregate sum across transformers as the roaming baseline
-                if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
-                    total_load = float(np.nansum(self.tr_inflexible_loads[:, t]))
-                    values["household_inflexible_load_kw"] = total_load
-                if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
-                    total_solar = float(np.nansum(self.tr_solar_power[:, t]))
-                    values["household_pv_kw"] = total_solar
-                lfc = getattr(self, 'account_load_forecast', {}).get(0)
-                if lfc is None and getattr(self, 'account_load_forecast', {}):
-                    lfc = next(iter(self.account_load_forecast.values()))
-                pfc = getattr(self, 'account_pv_forecast', {}).get(0)
-                if pfc is None and getattr(self, 'account_pv_forecast', {}):
-                    pfc = next(iter(self.account_pv_forecast.values()))
-                # Removed verbose debug comparison prints used during ledger troubleshooting
-                for h in range(24):
-                    values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
-                for h in range(24):
-                    values[f"pv_fc_h{h+1:02d}"] = float(pfc[h]) if pfc is not None and h < len(pfc) else np.nan
+                # Primary: aligned per-account series prepared at reset
+                ls = getattr(self, 'account_load_series', {}).get(0)
+                ps = getattr(self, 'account_pv_series', {}).get(0)
+                if ls is not None and t < len(ls):
+                    values["household_inflexible_load_kw"] = float(ls.iloc[t])
+                elif hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
+                    values["household_inflexible_load_kw"] = float(np.nansum(self.tr_inflexible_loads[:, t]))
+                if ps is not None and t < len(ps):
+                    values["household_pv_kw"] = float(ps.iloc[t])
+                elif hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
+                    values["household_pv_kw"] = float(np.nansum(self.tr_solar_power[:, t]))
+                # Forecasts are only meaningful when online mode is enabled
+                if online_enabled:
+                    lfc = getattr(self, 'account_load_forecast', {}).get(0)
+                    if lfc is None and getattr(self, 'account_load_forecast', {}):
+                        lfc = next(iter(self.account_load_forecast.values()))
+                    pfc = getattr(self, 'account_pv_forecast', {}).get(0)
+                    if pfc is None and getattr(self, 'account_pv_forecast', {}):
+                        pfc = next(iter(self.account_pv_forecast.values()))
+                    for h in range(24):
+                        values[f"load_fc_h{h+1:02d}"] = float(lfc[h]) if lfc is not None and h < len(lfc) else np.nan
+                    for h in range(24):
+                        values[f"pv_fc_h{h+1:02d}"] = float(pfc[h]) if pfc is not None and h < len(pfc) else np.nan
             except Exception:
                 pass
             # Online setpoint per-account (roaming aggregated account_id=0)
             try:
-                acc_cfg = getattr(self, 'config', {}).get('accounts', {}) or {}
-                os_cfg = acc_cfg.get('online_setpoints', {}) if isinstance(acc_cfg, dict) else {}
-                if bool(os_cfg.get('enabled', False)):
+                if online_enabled:
                     # Measurements from series if available, else transformer sums already in values
                     load_kw = values.get("household_inflexible_load_kw", np.nan)
                     pv_kw = values.get("household_pv_kw", np.nan)
@@ -1426,9 +1739,57 @@ class EV2Gym(gym.Env):
                 values["time_to_departure"] = float(ttd) if np.isfinite(ttd) else np.nan
                 values["time_since_arrival"] = float(tsa) if np.isfinite(tsa) else np.nan
             else:
-                values["soc"] = np.nan
-                values["time_to_departure"] = np.nan
-                values["time_since_arrival"] = np.nan
+                # Fallback: use the first EV in the scenario even if not connected
+                ev0 = None
+                try:
+                    ev_list = getattr(self, 'EVs', [])
+                    if isinstance(ev_list, list) and len(ev_list) > 0:
+                        ev0 = ev_list[0]
+                except Exception:
+                    ev0 = None
+                if ev0 is not None:
+                    try:
+                        values["soc"] = float(ev0.get_soc())
+                    except Exception:
+                        values["soc"] = np.nan
+                    try:
+                        ttd = max(0, int(getattr(ev0, 'time_of_departure', t) - t))
+                        tsa = max(0, int(t - getattr(ev0, 'time_of_arrival', t)))
+                    except Exception:
+                        ttd, tsa = np.nan, np.nan
+                    values["time_to_departure"] = float(ttd) if np.isfinite(ttd) else np.nan
+                    values["time_since_arrival"] = float(tsa) if np.isfinite(tsa) else np.nan
+                else:
+                    values["soc"] = np.nan
+                    values["time_to_departure"] = np.nan
+                    values["time_since_arrival"] = np.nan
+            # Populate per-EV location slots (roaming): ev{i}_location
+            # Fill based on EV profiles, not just connected EVs
+            try:
+                if hasattr(buf, 'columns'):
+                    slot_keys = [k for k in buf.columns if k.startswith("ev") and k.endswith("_location")]
+                    slot_keys.sort(key=lambda s: int(s.split("ev")[1].split("_location")[0]))
+                    # Initialize all to -1
+                    for k in slot_keys:
+                        values[k] = np.int8(-1)
+                    # Fill from all EVs (spawned and unspawned) based on their current location_state
+                    slots_filled = 0
+                    for ev in getattr(self, 'EVs', []):
+                        if slots_filled < len(slot_keys):
+                            values[slot_keys[slots_filled]] = np.int8(getattr(ev, 'location_state', -1))
+                            
+                            # Also update SOC for this EV regardless of connection status
+                            if slots_filled == 0:  # For the first EV, update the account-level SOC
+                                try:
+                                    values["soc"] = float(ev.get_soc())
+                                except Exception:
+                                    values["soc"] = np.nan
+                            
+                            slots_filled += 1
+                        else:
+                            break
+            except Exception:
+                pass
             # Account-level tracking error (aggregate)
             try:
                 setpt = float(values.get("account_power_setpoint_kw", np.nan))
@@ -1460,40 +1821,49 @@ class EV2Gym(gym.Env):
                 "household_inflexible_load_kw": np.nan,
                 "household_pv_kw": np.nan,
                 "tracking_error_account": np.nan,
-                "evs_connected": int(cs.n_evs_connected),
+                "evs_connected": int(sum(1 for ev in cs.evs_connected if ev is not None and getattr(ev, 'location_state', -1) != 2)),
                 "cs_kw_limit": float(getattr(cs, 'get_max_power', lambda: np.nan)() if hasattr(cs, 'get_max_power') else np.nan),
             }
             # Optional per-account household signals if provided
             try:
-                # Use transformer data for this CS's connected transformers
-                if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
-                    # Find transformers connected to this CS
-                    tr_ids = []
-                    for tr in self.transformers:
-                        if cs.id in tr.cs_ids:
-                            tr_ids.append(tr.id)
-                    if tr_ids:
-                        cs_load = float(np.nansum(self.tr_inflexible_loads[tr_ids, t]))
-                        values["household_inflexible_load_kw"] = cs_load
-                if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
-                    # Find transformers connected to this CS
-                    tr_ids = []
-                    for tr in self.transformers:
-                        if cs.id in tr.cs_ids:
-                            tr_ids.append(tr.id)
-                    if tr_ids:
-                        cs_solar = float(np.nansum(self.tr_solar_power[tr_ids, t]))
-                        values["household_pv_kw"] = cs_solar
+                # Prefer per-account series when defined (non-roaming setups may carry series per CS.id)
+                ls_dict = getattr(self, 'account_load_series', {})
+                ps_dict = getattr(self, 'account_pv_series', {})
+                ls = ls_dict.get(cs.id)
+                ps = ps_dict.get(cs.id)
+                if ls is not None and t < len(ls):
+                    values["household_inflexible_load_kw"] = float(ls.iloc[t])
+                else:
+                    # Fallback: transformer aggregation for this CS
+                    if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
+                        tr_ids = []
+                        for tr in self.transformers:
+                            if cs.id in tr.cs_ids:
+                                tr_ids.append(tr.id)
+                        if tr_ids:
+                            cs_load = float(np.nansum(self.tr_inflexible_loads[tr_ids, t]))
+                            values["household_inflexible_load_kw"] = cs_load
+                if ps is not None and t < len(ps):
+                    values["household_pv_kw"] = float(ps.iloc[t])
+                else:
+                    if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
+                        tr_ids = []
+                        for tr in self.transformers:
+                            if cs.id in tr.cs_ids:
+                                tr_ids.append(tr.id)
+                        if tr_ids:
+                            cs_solar = float(np.nansum(self.tr_solar_power[tr_ids, t]))
+                            values["household_pv_kw"] = cs_solar
             except Exception:
                 pass
             # Online setpoint per-CS account when enabled
             try:
-                acc_cfg = getattr(self, 'config', {}).get('accounts', {}) or {}
-                os_cfg = acc_cfg.get('online_setpoints', {}) if isinstance(acc_cfg, dict) else {}
-                if bool(os_cfg.get('enabled', False)):
+                sp_cfg = self._sp_cfg()
+                if bool(sp_cfg.get('account_online', {}).get('enabled', False)):
                     load_kw = values.get("household_inflexible_load_kw", np.nan)
                     pv_kw = values.get("household_pv_kw", np.nan)
-                    values["account_power_setpoint_kw"] = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=cs)
+                    setpt = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=cs)
+                    values["account_power_setpoint_kw"] = float(setpt)
             except Exception:
                 pass
             # per-port amps and soc
@@ -1550,6 +1920,33 @@ class EV2Gym(gym.Env):
                     ttd, tsa = np.nan, np.nan
                 values[f"port{p}_time_to_departure"] = float(ttd) if np.isfinite(ttd) else np.nan
                 values[f"port{p}_time_since_arrival"] = float(tsa) if np.isfinite(tsa) else np.nan
+            # Populate per-EV location slots (per-CS): ev{i}_location
+            # Fill based on EVs that could be at this CS
+            try:
+                if hasattr(buf, 'columns'):
+                    slot_keys = [k for k in buf.columns if k.startswith("ev") and k.endswith("_location")]
+                    slot_keys.sort(key=lambda s: int(s.split("ev")[1].split("_location")[0]))
+                    for k in slot_keys:
+                        values[k] = np.int8(-1)
+                    slots_filled = 0
+                    # Fill from EVs that are associated with this CS (either connected or could be)
+                    for ev in getattr(self, 'EVs', []):
+                        # Check if this EV is associated with this CS (either currently connected or has this as home/work)
+                        ev_at_this_cs = False
+                        if hasattr(ev, 'location') and ev.location == cs.id:
+                            ev_at_this_cs = True
+                        elif hasattr(ev, 'default_station') and ev.default_station == cs.id:
+                            ev_at_this_cs = True
+                        elif hasattr(ev, 'work_station') and ev.work_station == cs.id:
+                            ev_at_this_cs = True
+                        
+                        if ev_at_this_cs and slots_filled < len(slot_keys):
+                            values[slot_keys[slots_filled]] = np.int8(getattr(ev, 'location_state', -1))
+                            slots_filled += 1
+                        if slots_filled >= len(slot_keys):
+                            break
+            except Exception:
+                pass
             # Per-account forecasts (if present)
             try:
                 lfc = getattr(self, 'account_load_forecast', {}).get(cs.id)
@@ -1619,6 +2016,14 @@ class EV2Gym(gym.Env):
 
                 self.port_energy_level[j, cs.id,
                                        self.current_step] = ev.get_soc()
+
+        # Compute and store the maximum feasible charging power for this step
+        # This reflects the available charging capability irrespective of the chosen action
+        try:
+            self.charge_power_potential[self.current_step] = calculate_charge_power_potential(self)
+        except Exception:
+            # Keep previous/default value on failure
+            pass
 
         # Departed EVs are no longer connected; their port data has already been
         # set to 0 above. We keep them only for high-level metrics, so skip
@@ -1946,16 +2351,23 @@ class EV2Gym(gym.Env):
 
     def _update_ev_location_data(self):
         """Update EV location data for the current timestep."""
-        # For each charging station and port
-        for cs_idx, cs in enumerate(self.charging_stations):
+        # First, mark all slots as empty
+        for cs_idx in range(len(self.charging_stations)):
             for port_idx in range(self.number_of_ports_per_cs):
-                if port_idx < len(cs.evs_connected) and cs.evs_connected[port_idx] is not None:
+                self.ev_location_data[port_idx, cs_idx, self.current_step] = -1  # -1 indicates no EV
+        
+        # Track all EVs, not just connected ones
+        for ev_idx, ev in enumerate(self.EVs):
+            if ev_idx < self.number_of_ports_per_cs:  # Only track up to max ports
+                # Use the first charging station for tracking all EVs (for visualization)
+                self.ev_location_data[ev_idx, 0, self.current_step] = ev.location_state
+                
+        # Also track connected EVs in their actual charging stations
+        for cs_idx, cs in enumerate(self.charging_stations):
+            for port_idx in range(min(self.number_of_ports_per_cs, len(cs.evs_connected))):
+                if cs.evs_connected[port_idx] is not None:
                     ev = cs.evs_connected[port_idx]
-                    # Update location state (0=home, 1=work, 2=commuting)
-                    self.ev_location_data[port_idx, cs_idx, self.current_step] = ev.location_state  # Track location state
-                else:
-                    # No EV in this port
-                    self.ev_location_data[port_idx, cs_idx, self.current_step] = -1  # -1 indicates no EV
+                    self.ev_location_data[port_idx, cs_idx, self.current_step] = ev.location_state
 
     def _log_initial_state(self):
         """Logs the initial state of EVs in the environment if verbose is True."""

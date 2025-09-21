@@ -261,9 +261,21 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
 
             if not presence_blocks:
                 continue # Skip if no blocks were generated for this profile
+                
+            # Check for and fix gaps in presence blocks
+            sorted_blocks = sorted(presence_blocks, key=lambda b: b.start_step)
+            for i in range(len(sorted_blocks) - 1):
+                current_block = sorted_blocks[i]
+                next_block = sorted_blocks[i + 1]
+                if current_block.end_step != next_block.start_step:
+                    print(f"Warning: Gap found in presence blocks between steps {current_block.end_step} and {next_block.start_step}")
+                    # If there's a gap, extend the current block to meet the next one
+                    if current_block.end_step < next_block.start_step:
+                        print(f"  Extending block {i} to fill gap")
+                        current_block.end_step = next_block.start_step
 
-            first_block = presence_blocks[0]
-            last_block = presence_blocks[-1]
+            first_block = sorted_blocks[0]
+            last_block = sorted_blocks[-1]
 
             # If the first block starts before the simulation, set start time to 0.
             if first_block.start_step < 0:
@@ -299,14 +311,14 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 charge_efficiency=ev_spec["charge_efficiency"],
                 discharge_efficiency=ev_spec["discharge_efficiency"],
                 timescale=timestep_minutes,
-                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in presence_blocks]},
+                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in sorted_blocks]},
                 location_state=0 if first_block.location_type == "home" else 1,
             )
 
             # Build full transition list from the detailed presence_blocks.
             ev_profile.clear_schedule_transitions() # Clear any default transitions
-            for idx, blk in enumerate(presence_blocks[:-1]):
-                next_blk = presence_blocks[idx + 1]
+            for idx, blk in enumerate(sorted_blocks[:-1]):
+                next_blk = sorted_blocks[idx + 1]
                 # At the end of any block, a transition occurs.
                 # The new state is determined by the type of the *next* block.
                 if next_blk.location_type == "home":
@@ -318,6 +330,25 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
 
                 # The transition happens at the start of the next block.
                 ev_profile.add_schedule_transition(next_blk.start_step, new_state)
+
+            
+            # Pre-compute location_state for every simulation step
+            sim_locations = np.full(sim_len, -1, dtype=np.int8)  # -1 = not spawned yet
+            for blk in sorted_blocks:
+                start = max(0, blk.start_step)
+                end = min(sim_len, blk.end_step)
+                if blk.location_type == "home":
+                    location_state = 0
+                elif blk.location_type == "work":
+                    location_state = 1
+                else:  # away/commuting
+                    location_state = 2
+                
+                for step in range(start, end):
+                    sim_locations[step] = location_state
+            
+            # Store the pre-computed locations in the EV
+            ev_profile.sim_locations = sim_locations
 
             # Extend overall availability so EV object exists until after final block
             ev_profile.time_of_departure = presence_blocks[-1].end_step
