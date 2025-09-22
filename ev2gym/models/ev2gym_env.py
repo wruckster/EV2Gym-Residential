@@ -624,8 +624,6 @@ class EV2Gym(gym.Env):
             self.done = True
             return self._get_observation(), 0.0, True, False, {}
 
-        if self.verbose:
-            print(f"Step: {self.current_step}/{self.simulation_length}")
 
         # Spawn EVs with arrival time equal to the current step
         self._spawn_evs_at_current_step()
@@ -640,25 +638,17 @@ class EV2Gym(gym.Env):
             if hasattr(ev, 'sim_locations') and self.current_step < len(ev.sim_locations):
                 old_location_state = ev.location_state
                 ev.location_state = int(ev.sim_locations[self.current_step])
-                if self.verbose and self.current_step in [182, 183, 204, 205]:
-                    print(f"[DEBUG] Step {self.current_step}: EV {ev.id} location_state {old_location_state} -> {ev.location_state}")
                 
                 # Drain battery for commuting EVs (regardless of connection status)
                 if ev.location_state == 2:  # If commuting
                     ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
-                    if self.verbose and self.current_step in [182, 183, 204, 205]:
-                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} battery drained during commute, SOC: {ev.get_soc():.4f}")
             else:
                 # Fallback to old method if sim_locations not available
                 ev.update_location_state(self.current_step)
-                if self.verbose and self.current_step in [182, 183, 204, 205]:
-                    print(f"[DEBUG] Step {self.current_step}: EV {ev.id} location_state (fallback): {ev.location_state}")
                 
                 # Drain battery for commuting EVs (regardless of connection status)
                 if ev.location_state == 2:  # If commuting
                     ev.drain_commuting_battery(distance_km=1)  # Assume 1km per step
-                    if self.verbose and self.current_step in [182, 183, 204, 205]:
-                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} battery drained during commute, SOC: {ev.get_soc():.4f}")
 
         # Check connected EVs for disconnection
         evs_to_disconnect = []  # Track EVs that need to be disconnected
@@ -672,14 +662,10 @@ class EV2Gym(gym.Env):
         for cs, port_idx, ev in evs_to_disconnect:
             cs.evs_connected[port_idx] = None
             cs.n_evs_connected -= 1
-            if self.verbose:
-                print(f"[EV2Gym] EV {ev.id} disconnected from CS {cs.id} port {port_idx} (commuting)")
         
         # Reconnect EVs that have returned from commuting (location_state 0=home or 1=work)
         for ev in self.EVs:
             # Location state already updated above
-            if self.verbose and self.current_step in [204, 205, 390, 391]:
-                print(f"[DEBUG] Step {self.current_step}: Checking EV {ev.id} for reconnection, location_state: {ev.location_state}")
             if ev.location_state in [0, 1]:  # Home or work
                 # Check if this EV is already connected somewhere
                 already_connected = False
@@ -689,8 +675,6 @@ class EV2Gym(gym.Env):
                         break
                 
                 if not already_connected:
-                    if self.verbose and self.current_step in [204, 205, 390, 391]:
-                        print(f"[DEBUG] Step {self.current_step}: EV {ev.id} needs reconnection")
                     # Find the appropriate charging station for this EV
                     target_cs_id = None
                     if ev.location_state == 0:  # Home
@@ -707,9 +691,6 @@ class EV2Gym(gym.Env):
                                 target_cs.evs_connected[port_idx] = ev
                                 target_cs.n_evs_connected += 1
                                 ev.location = target_cs_id  # Update EV's current location
-                                if self.verbose:
-                                    location_name = "home" if ev.location_state == 0 else "work"
-                                    print(f"[EV2Gym] EV {ev.id} reconnected to CS {target_cs_id} port {port_idx} ({location_name})")
                                 break
 
         # Reset power usage for this timestep to zero before processing charging stations
@@ -970,12 +951,18 @@ class EV2Gym(gym.Env):
 
         # Discharge on peak respecting reserve and export policy
         if peak_period and v2g_allowed and energy_above_reserve_kwh > 0 and max_discharge_kw > 0:
+            # Calculate maximum discharge rate based on energy available above reserve
             max_step_dis_kw = energy_above_reserve_kwh / dt_hours if dt_hours > 0 else max_discharge_kw
+            
+            # Apply a fixed limit to maximum discharge to prevent excessive setpoints
+            # This is especially important when peak_price_threshold is set low
+            max_discharge_limit = min(max_discharge_kw, 5.0)  # Cap at 5 kW per account
+            
             if export_allowed:
-                discharge_kw = min(max_discharge_kw, max_step_dis_kw)
+                discharge_kw = min(max_discharge_limit, max_step_dis_kw)
                 setpt = net_kw - discharge_kw
             else:
-                discharge_kw = min(max_discharge_kw, max_step_dis_kw, max(net_kw, 0.0))
+                discharge_kw = min(max_discharge_limit, max_step_dis_kw, max(net_kw, 0.0))
                 setpt = max(net_kw - discharge_kw, 0.0)
 
         return float(setpt)
