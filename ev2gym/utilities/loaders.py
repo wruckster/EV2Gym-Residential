@@ -9,6 +9,7 @@ import math
 import datetime
 import importlib.resources
 import pathlib
+from functools import lru_cache
 from importlib.resources.abc import Traversable
 import pytz
 
@@ -18,7 +19,7 @@ def get_resource_path(package, resource):
     with importlib.resources.path('ev2gym.data', resource) as p:
         return str(p)
 import json
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ev2gym.models.ev.charger import EV_Charger
 from ev2gym.models.ev.vehicle import EV
@@ -26,6 +27,35 @@ from ev2gym.models.transformer import Transformer
 
 from ev2gym.profiles.schedule_generator import generate_ev_profiles
 from ev2gym.utilities.utils import EV_spawner, generate_power_setpoints, EV_spawner_GF
+
+
+_HOUSEHOLD_PROFILE_CACHE: Dict[Tuple, pd.DataFrame] = {}
+
+
+@lru_cache(maxsize=16)
+def _read_household_parquet(data_file: str, household_ids_key: Optional[Tuple[str, ...]]) -> pd.DataFrame:
+    columns = ["timestamp", "household_id", "demand", "solar"]
+    df = pd.read_parquet(data_file, columns=columns)
+    required_cols = set(columns)
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Parquet missing columns {missing} in {data_file}")
+
+    if household_ids_key:
+        df = df[df["household_id"].isin(household_ids_key)].copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp").sort_index()
+    # Aggregate across households per timestamp (sum over selected ids)
+    return df.groupby(level=0)[["demand", "solar"]].sum()
+
+
+@lru_cache(maxsize=64)
+def _read_household_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(
+        path,
+        parse_dates=["interval_start"],
+        usecols=["interval_start", "demand", "solar"],
+    )
 
 
 def _ensure_filter_config_defaults(env) -> None:
@@ -664,27 +694,36 @@ def _load_household_profiles(env, ignore_date_filter: bool = False):
         if not os.path.exists(data_file):
             print(f"Error: Parquet file not found: {data_file}")
             return None
-        if not isinstance(household_ids, (list, tuple)) or len(household_ids) == 0:
-            print("Warning: household_ids not provided; using all households in Parquet")
+
+        household_ids_key: Optional[Tuple] = None
+        if isinstance(household_ids, (list, tuple)) and len(household_ids) > 0:
+            household_ids_key = tuple(sorted(household_ids))
+        else:
+            household_ids = []
+
+        # Construct cache key including simulation window information
+        cache_key = (
+            "parquet",
+            data_file,
+            household_ids_key,
+            env.timescale,
+            ignore_date_filter,
+            env.config.get('year'),
+            env.config.get('month'),
+            env.config.get('day'),
+            env.config.get('hour'),
+            env.config.get('minute'),
+            env.simulation_length,
+        )
+        cached = _HOUSEHOLD_PROFILE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
         try:
-            df = pd.read_parquet(data_file)
+            df_agg = _read_household_parquet(data_file, household_ids_key)
         except Exception as e:
             print(f"Error reading Parquet {data_file}: {e}")
             return None
-        # Expect columns: timestamp, household_id, demand, solar
-        required_cols = {"timestamp", "household_id", "demand", "solar"}
-        missing = required_cols - set(df.columns)
-        if missing:
-            print(f"Error: Parquet missing columns {missing} in {data_file}")
-            return None
-        # Filter by household_ids if provided
-        if isinstance(household_ids, (list, tuple)) and len(household_ids) > 0:
-            df = df[df["household_id"].isin(household_ids)].copy()
-        # Prepare index
-        df["timestamp"] = pd.to_datetime(df["timestamp"])  # handles tz-aware too
-        df = df.set_index("timestamp").sort_index()
-        # Aggregate across households per timestamp (sum over selected ids)
-        df_agg = df.groupby(level=0)[["demand", "solar"]].sum()
 
         # Construct start/end
         year = env.config.get('year', 2019)
@@ -733,10 +772,13 @@ def _load_household_profiles(env, ignore_date_filter: bool = False):
                 df_use = df_use.iloc[:desired]
             # Backward compatibility: return RangeIndex and only the needed columns
             df_out = df_use.reset_index(drop=False)
-            return df_out[["timestamp", "demand", "solar"]] if "timestamp" in df_out.columns else df_out.rename_axis("timestamp").reset_index()[["timestamp", "demand", "solar"]]
+            df_out = df_out[["timestamp", "demand", "solar"]] if "timestamp" in df_out.columns else df_out.rename_axis("timestamp").reset_index()[["timestamp", "demand", "solar"]]
+            _HOUSEHOLD_PROFILE_CACHE[cache_key] = df_out
+            return df_out.copy()
         else:
             # Forecasting path: preserve DatetimeIndex, no truncation/padding
-            return df_rs
+            _HOUSEHOLD_PROFILE_CACHE[cache_key] = df_rs
+            return df_rs.copy()
 
     # Legacy path: list of CSVs in data_files
     file_paths = cfg.get('data_files', [])
@@ -758,7 +800,7 @@ def _load_household_profiles(env, ignore_date_filter: bool = False):
     dfs = []
     for p in file_paths:
         try:
-            df = pd.read_csv(p, parse_dates=['interval_start'], usecols=['interval_start', 'demand', 'solar'])
+            df = _read_household_csv(p)
             # Expect at least 'demand' and 'solar' columns
             if not {'demand', 'solar'}.issubset(df.columns):
                 raise ValueError(f"{p} must contain 'demand' and 'solar' columns")
@@ -787,20 +829,38 @@ def _load_household_profiles(env, ignore_date_filter: bool = False):
         raise ValueError("No valid household data files could be loaded")
 
     # Average multiple households if more than one file supplied
+    data = pd.concat(dfs).groupby(level=0).mean()
+
+    cache_key = (
+        "csv",
+        tuple(sorted(file_paths)),
+        env.timescale,
+        ignore_date_filter,
+        env.config.get('year'),
+        env.config.get('month'),
+        env.config.get('day'),
+        env.config.get('hour'),
+        env.config.get('minute'),
+        env.simulation_length,
+    )
+    cached = _HOUSEHOLD_PROFILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
     if ignore_date_filter:
         # DatetimeIndex preserved when ignore_date_filter=True
-        data = pd.concat(dfs).groupby(level=0).mean()
-        # Do NOT truncate/pad; keep full resampled history for forecasting
-        return data
-    else:
-        data = pd.concat(dfs).groupby(level=0).mean()
-        # Ensure we have at least env.simulation_length rows
-        reps = math.ceil(env.simulation_length / len(data)) + 1
-        data = pd.concat([data] * reps).iloc[:env.simulation_length]
-        data.reset_index(drop=True, inplace=True)
-        assert len(data) == env.simulation_length, \
-            f"Household profile data length ({len(data)}) does not match simulation length ({env.simulation_length})"
-        return data
+        _HOUSEHOLD_PROFILE_CACHE[cache_key] = data
+        return data.copy()
+
+    # Ensure we have at least env.simulation_length rows
+    reps = math.ceil(env.simulation_length / len(data)) + 1
+    data = pd.concat([data] * reps).iloc[:env.simulation_length]
+    data.reset_index(drop=True, inplace=True)
+    assert len(data) == env.simulation_length, \
+        f"Household profile data length ({len(data)}) does not match simulation length ({env.simulation_length})"
+
+    _HOUSEHOLD_PROFILE_CACHE[cache_key] = data
+    return data.copy()
 
 
 def _load_external_features(env):
