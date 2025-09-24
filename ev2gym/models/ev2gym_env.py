@@ -272,6 +272,20 @@ class EV2Gym(gym.Env):
         self.number_of_ports = np.array(
             [cs.n_ports for cs in self.charging_stations]).sum()
 
+        # Define action space EARLY so wrappers can rely on it immediately
+        # Store v2g_enabled as an attribute for clarity
+        try:
+            self.v2g_enabled = bool(self.config.get('v2g_enabled', False))
+        except Exception:
+            self.v2g_enabled = False
+
+        high = np.ones([self.number_of_ports])
+        if self.v2g_enabled:
+            lows = -1 * np.ones([self.number_of_ports])
+        else:
+            lows = np.zeros([self.number_of_ports])
+        self.action_space = spaces.Box(low=lows, high=high, dtype=np.float64)
+
         # Load EV spawn scenarios
         if self.load_from_replay_path is None:
             load_ev_spawn_scenarios(self)
@@ -351,13 +365,14 @@ class EV2Gym(gym.Env):
             print(f"Creating directory: ./results/{self.sim_name}")
             os.makedirs(f"./results/{self.sim_name}", exist_ok=True)
 
-        # Action space: is a vector of size "Sum of all ports of all charging stations"
-        high = np.ones([self.number_of_ports])
-        if self.config['v2g_enabled']:
-            lows = -1 * np.ones([self.number_of_ports])
-        else:
-            lows = np.zeros([self.number_of_ports])
-        self.action_space = spaces.Box(low=lows, high=high, dtype=np.float64)
+        # Action space was defined earlier; keep a safety guard in case of refactors
+        if not hasattr(self, 'action_space'):
+            high = np.ones([self.number_of_ports])
+            if bool(self.config.get('v2g_enabled', False)):
+                lows = -1 * np.ones([self.number_of_ports])
+            else:
+                lows = np.zeros([self.number_of_ports])
+            self.action_space = spaces.Box(low=lows, high=high, dtype=np.float64)
 
         # Ensure forecasts are up-to-date BEFORE using them for setpoints or building observation space
         self._update_forecasts()
@@ -892,25 +907,59 @@ class EV2Gym(gym.Env):
         ev_socs = []
         energy_above_reserve_kwh = 0.0
         for ch in chargers:
+            # Charger charge capability (AC charge power)
             try:
-                max_charge_kw += float(ch.get_max_power())
-                max_discharge_kw += abs(float(ch.get_min_power())) if hasattr(ch, 'get_min_power') else float(ch.get_max_power())
+                cs_max_charge_kw = float(ch.get_max_power())
             except Exception:
-                pass
-            # EV state
-            for ev in ch.evs_connected:
+                cs_max_charge_kw = 0.0
+
+            # Charger V2G hardware capability in kW from electrical ratings
+            try:
+                cs_phases = getattr(ch, 'phases', 1)
+                cs_voltage = getattr(ch, 'voltage', 230.0)
+                cs_max_dis_current = abs(float(getattr(ch, 'max_discharge_current', 0.0)))
+                cs_max_dis_kw = float(math.sqrt(cs_phases) * cs_voltage * cs_max_dis_current / 1000.0)
+            except Exception:
+                cs_max_dis_kw = 0.0
+
+            # Sum EV-side charge and V2G capabilities configured in YAML
+            ev_side_dis_kw = 0.0
+            ev_side_charge_kw = 0.0
+            for ev in getattr(ch, 'evs_connected', []):
                 if ev is None:
                     continue
+                # Track SOCs
                 try:
                     ev_socs.append(float(ev.get_soc()))
                 except Exception:
                     pass
+
+                # Energy above reserve for per-step discharge bound
                 try:
                     reserve_kwh = max(float(getattr(ev, 'min_emergency_battery_capacity', 0.0)),
                                       float(getattr(ev, 'min_battery_capacity', 0.0)))
                     energy_above_reserve_kwh += max(0.0, float(ev.current_capacity) - reserve_kwh)
                 except Exception:
                     pass
+
+                # EV V2G capability from YAML: e.g., max_discharge_power: -7.0 (kW)
+                try:
+                    ev_max_dis_kw = abs(float(getattr(ev, 'max_discharge_power', 0.0)))
+                    ev_side_dis_kw += max(0.0, ev_max_dis_kw)
+                except Exception:
+                    pass
+
+                # EV AC charge capability from YAML: max_ac_charge_power (kW)
+                try:
+                    ev_max_ac_kw = float(getattr(ev, 'max_ac_charge_power', 0.0))
+                    ev_side_charge_kw += max(0.0, ev_max_ac_kw)
+                except Exception:
+                    pass
+
+            # Station discharge capability is limited by both charger hardware and connected EV limits
+            max_discharge_kw += max(0.0, min(cs_max_dis_kw, ev_side_dis_kw))
+            # Station charge capability is limited by both charger hardware and connected EV limits
+            max_charge_kw += max(0.0, min(cs_max_charge_kw, ev_side_charge_kw))
 
         # Peak check
         try:

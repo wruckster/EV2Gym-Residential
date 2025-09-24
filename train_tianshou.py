@@ -583,14 +583,11 @@ def main(config_path: str):
             except Exception:
                 logging.warning("Explicit replay save attempt failed.")
 
-            # Close evaluation env (and wrappers if vectorized)
+            # Close evaluation env
             try:
-                eval_collector.env.close()
+                eval_env.close()
             except Exception:
-                try:
-                    eval_env.close()
-                except Exception:
-                    pass
+                pass
 
             # Generate plots from the replay files
             if os.path.exists(eval_replay_path):
