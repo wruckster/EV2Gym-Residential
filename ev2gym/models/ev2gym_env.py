@@ -80,9 +80,14 @@ class EV2Gym(gym.Env):
         self.temperature_forecast = None
         self.wind_forecast = None
         self.dr_event_forecast = None
+        self.temperature_series = None
+        self.wind_speed_series = None
+        self._forecast_index: pd.DatetimeIndex | None = None
         # Optional per-account series and forecasts (residential 1:1 household mapping)
         self.account_load_series = {}   # cs.id -> pd.Series at env timescale
         self.account_pv_series = {}     # cs.id -> pd.Series at env timescale
+        self.account_load_arrays: dict[int, np.ndarray] = {}
+        self.account_pv_arrays: dict[int, np.ndarray] = {}
         self.account_load_forecast = {} # cs.id -> np.ndarray length 24
         self.account_pv_forecast = {}   # cs.id -> np.ndarray length 24
 
@@ -489,6 +494,32 @@ class EV2Gym(gym.Env):
         except Exception:
             # Non-fatal; account-level columns will be NaN if data is missing
             pass
+
+        # Preload weather data for forecasts if configured
+        try:
+            if self.forecasting_config.get('enabled'):
+                from ev2gym.utilities.loaders import load_weather_data
+                weather_df = load_weather_data(self)
+                if isinstance(weather_df, pd.DataFrame) and not weather_df.empty:
+                    if self._forecast_index is None:
+                        self._forecast_index = pd.date_range(
+                            start=self.sim_starting_date,
+                            periods=int(self.simulation_length),
+                            freq=f"{self.timescale}min",
+                            tz=weather_df.index.tz,
+                        )
+                    try:
+                        aligned = weather_df.reindex(self._forecast_index, method='nearest')
+                    except Exception:
+                        aligned = weather_df
+                    if 'temperature' in aligned.columns:
+                        self.temperature_series = aligned['temperature'].to_numpy(dtype=float)[: int(self.simulation_length)]
+                    if 'wind_speed' in aligned.columns:
+                        self.wind_speed_series = aligned['wind_speed'].to_numpy(dtype=float)[: int(self.simulation_length)]
+        except Exception:
+            self.temperature_series = None
+            self.wind_speed_series = None
+            self._forecast_index = None
 
         # Populate initial row (t=0) with time features and any known values
         # so consumers can access time columns immediately after reset.
@@ -1370,11 +1401,8 @@ class EV2Gym(gym.Env):
             try:
                 # Per-account tracking error
                 if self.roaming_accounts:
-                    # Single aggregated account (id=0)
-                    load0 = float(self.account_load_series.get(0, pd.Series(dtype=float)).iloc[t]) \
-                        if 0 in self.account_load_series and t < len(self.account_load_series[0]) else 0.0
-                    pv0 = float(self.account_pv_series.get(0, pd.Series(dtype=float)).iloc[t]) \
-                        if 0 in self.account_pv_series and t < len(self.account_pv_series[0]) else 0.0
+                    load0 = self._get_account_load_kw(0, t, default=0.0)
+                    pv0 = self._get_account_pv_kw(0, t, default=0.0)
                     setpt0 = float(self._compute_account_online_setpoint(t, load0, pv0, cs=None))
                     actual0 = float(self._account_actual_power_kw(0, t))
                     trk_err = float((setpt0 - actual0) ** 2)
@@ -1383,10 +1411,8 @@ class EV2Gym(gym.Env):
                     err_sum = 0.0
                     for cs in self.charging_stations:
                         aid = cs.id
-                        load_j = float(self.account_load_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
-                            if aid in self.account_load_series and t < len(self.account_load_series[aid]) else 0.0
-                        pv_j = float(self.account_pv_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
-                            if aid in self.account_pv_series and t < len(self.account_pv_series[aid]) else 0.0
+                        load_j = self._get_account_load_kw(aid, t, default=0.0)
+                        pv_j = self._get_account_pv_kw(aid, t, default=0.0)
                         setpt_j = float(self._compute_account_online_setpoint(t, load_j, pv_j, cs=cs))
                         actual_j = float(self._account_actual_power_kw(aid, t))
                         err_sum += (setpt_j - actual_j) ** 2
@@ -1428,44 +1454,60 @@ class EV2Gym(gym.Env):
             "reward_cumsum": float(rc),
         })
 
+    def _account_series_value(
+        self,
+        arrays: dict[int, np.ndarray],
+        series_dict: dict[int, pd.Series],
+        account_id: int,
+        t: int,
+        default: float = np.nan,
+    ) -> float:
+        """Fast helper to read a per-account series with cached NumPy fallback."""
+        if t < 0:
+            return float(default)
+        arr = arrays.get(account_id)
+        if arr is not None and 0 <= t < len(arr):
+            try:
+                val = float(arr[t])
+            except Exception:
+                val = default
+            if np.isfinite(val):
+                return val
+            return float(default)
+        series = series_dict.get(account_id)
+        if series is not None and 0 <= t < len(series):
+            try:
+                val = float(series.iloc[t])
+                if np.isfinite(val):
+                    return val
+            except Exception:
+                pass
+        return float(default)
+
+    def _get_account_load_kw(self, account_id: int, t: int, default: float = np.nan) -> float:
+        return float(self._account_series_value(self.account_load_arrays, self.account_load_series, account_id, t, default))
+
+    def _get_account_pv_kw(self, account_id: int, t: int, default: float = np.nan) -> float:
+        return float(self._account_series_value(self.account_pv_arrays, self.account_pv_series, account_id, t, default))
+
     def _account_actual_power_kw(self, aid: int, t: int) -> float:
         """Compute the actual net grid power [kW] for an account at step t.
 
-        For residential accounts, we treat an account as a charging station (non-roaming)
-        or an aggregate (aid=0) when roaming.
-
         actual_kw = household_load_kw - pv_kw + ev_power_kw
 
-        - household_load_kw / pv_kw come from per-account series (if available)
+        - household_load_kw / pv_kw come from per-account cached series when available
         - ev_power_kw is the charging station current power output for that account; when
           roaming is enabled, this sums over all stations
         """
-        # Household load and PV series
-        try:
-            if self.roaming_accounts and aid == 0:
-                load_kw = float(self.account_load_series.get(0, pd.Series(dtype=float)).iloc[t]) \
-                    if 0 in self.account_load_series and t < len(self.account_load_series[0]) else 0.0
-                pv_kw = float(self.account_pv_series.get(0, pd.Series(dtype=float)).iloc[t]) \
-                    if 0 in self.account_pv_series and t < len(self.account_pv_series[0]) else 0.0
-            else:
-                load_kw = float(self.account_load_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
-                    if aid in self.account_load_series and t < len(self.account_load_series[aid]) else 0.0
-                pv_kw = float(self.account_pv_series.get(aid, pd.Series(dtype=float)).iloc[t]) \
-                    if aid in self.account_pv_series and t < len(self.account_pv_series[aid]) else 0.0
-        except Exception:
-            load_kw, pv_kw = 0.0, 0.0
+        series_id = 0 if self.roaming_accounts else aid
+        load_kw = self._get_account_load_kw(series_id, t, default=0.0)
+        pv_kw = self._get_account_pv_kw(series_id, t, default=0.0)
 
-        # EV power contribution
         try:
             if self.roaming_accounts and aid == 0:
                 ev_kw = float(np.sum([cs.current_power_output for cs in self.charging_stations]))
             else:
-                # Find charging station matching aid
-                target_cs = None
-                for cs in self.charging_stations:
-                    if cs.id == aid:
-                        target_cs = cs
-                        break
+                target_cs = next((cs for cs in self.charging_stations if cs.id == aid), None)
                 ev_kw = float(getattr(target_cs, 'current_power_output', 0.0)) if target_cs is not None else 0.0
         except Exception:
             ev_kw = 0.0
@@ -1567,20 +1609,24 @@ class EV2Gym(gym.Env):
         if self.roaming_accounts:
             if load_series is not None:
                 self.account_load_series[0] = load_series
+                self.account_load_arrays[0] = load_series.to_numpy(dtype=float, copy=False)
                 if self.verbose:
                     print(f"[DEBUG] _init_account_series: assigned load_series to account 0, length={len(load_series)}")
             if pv_series is not None:
                 self.account_pv_series[0] = pv_series
+                self.account_pv_arrays[0] = pv_series.to_numpy(dtype=float, copy=False)
                 if self.verbose:
                     print(f"[DEBUG] _init_account_series: assigned pv_series to account 0, length={len(pv_series)}")
         else:
             for cs in self.charging_stations:
                 if load_series is not None:
                     self.account_load_series[cs.id] = load_series
+                    self.account_load_arrays[cs.id] = load_series.to_numpy(dtype=float, copy=False)
                     if self.verbose:
                         print(f"[DEBUG] _init_account_series: assigned load_series to account {cs.id}, length={len(load_series)}")
                 if pv_series is not None:
                     self.account_pv_series[cs.id] = pv_series
+                    self.account_pv_arrays[cs.id] = pv_series.to_numpy(dtype=float, copy=False)
                     if self.verbose:
                         print(f"[DEBUG] _init_account_series: assigned pv_series to account {cs.id}, length={len(pv_series)}")
         
@@ -1612,18 +1658,8 @@ class EV2Gym(gym.Env):
                         pv_kw = float(np.nansum(self.tr_solar_power[:, t]))
                     
                     # Override with account series if available
-                    try:
-                        ls = getattr(self, 'account_load_series', {}).get(0)
-                        if ls is not None and t < len(ls):
-                            load_kw = float(ls.iloc[t])
-                    except Exception:
-                        pass
-                    try:
-                        ps = getattr(self, 'account_pv_series', {}).get(0)
-                        if ps is not None and t < len(ps):
-                            pv_kw = float(ps.iloc[t])
-                    except Exception:
-                        pass
+                    load_kw = self._get_account_load_kw(0, t, default=load_kw)
+                    pv_kw = self._get_account_pv_kw(0, t, default=pv_kw)
                     
                     # Calculate and store the setpoint
                     setpoint = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=None)
@@ -1637,18 +1673,8 @@ class EV2Gym(gym.Env):
                         pv_kw = np.nan
                         
                         # Get per-account data if available
-                        try:
-                            ls = getattr(self, 'account_load_series', {}).get(cs.id)
-                            if ls is not None and t < len(ls):
-                                load_kw = float(ls.iloc[t])
-                        except Exception:
-                            pass
-                        try:
-                            ps = getattr(self, 'account_pv_series', {}).get(cs.id)
-                            if ps is not None and t < len(ps):
-                                pv_kw = float(ps.iloc[t])
-                        except Exception:
-                            pass
+                        load_kw = self._get_account_load_kw(cs.id, t, default=load_kw)
+                        pv_kw = self._get_account_pv_kw(cs.id, t, default=pv_kw)
                         
                         # Calculate and store the setpoint
                         setpoint = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=cs)
@@ -1705,14 +1731,14 @@ class EV2Gym(gym.Env):
             # Populate household series using account series when available; fallback to transformer sums
             try:
                 # Primary: aligned per-account series prepared at reset
-                ls = getattr(self, 'account_load_series', {}).get(0)
-                ps = getattr(self, 'account_pv_series', {}).get(0)
-                if ls is not None and t < len(ls):
-                    values["household_inflexible_load_kw"] = float(ls.iloc[t])
+                load_val = self._get_account_load_kw(0, t)
+                pv_val = self._get_account_pv_kw(0, t)
+                if np.isfinite(load_val):
+                    values["household_inflexible_load_kw"] = float(load_val)
                 elif hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
                     values["household_inflexible_load_kw"] = float(np.nansum(self.tr_inflexible_loads[:, t]))
-                if ps is not None and t < len(ps):
-                    values["household_pv_kw"] = float(ps.iloc[t])
+                if np.isfinite(pv_val):
+                    values["household_pv_kw"] = float(pv_val)
                 elif hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
                     values["household_pv_kw"] = float(np.nansum(self.tr_solar_power[:, t]))
                 # Forecasts are only meaningful when online mode is enabled
@@ -1736,18 +1762,8 @@ class EV2Gym(gym.Env):
                     load_kw = values.get("household_inflexible_load_kw", np.nan)
                     pv_kw = values.get("household_pv_kw", np.nan)
                     if 0 <= t < int(self.simulation_length):
-                        try:
-                            ls = getattr(self, 'account_load_series', {}).get(0)
-                            if ls is not None:
-                                load_kw = float(ls.iloc[t])
-                        except Exception:
-                            pass
-                        try:
-                            ps = getattr(self, 'account_pv_series', {}).get(0)
-                            if ps is not None:
-                                pv_kw = float(ps.iloc[t])
-                        except Exception:
-                            pass
+                        load_kw = self._get_account_load_kw(0, t, default=load_kw)
+                        pv_kw = self._get_account_pv_kw(0, t, default=pv_kw)
                     values["account_power_setpoint_kw"] = self._compute_account_online_setpoint(t, load_kw, pv_kw, cs=None)
                     # Also compute per-account actual power using helper
                     values["account_actual_power_kw"] = float(self._account_actual_power_kw(0, t))
@@ -1863,12 +1879,10 @@ class EV2Gym(gym.Env):
             # Optional per-account household signals if provided
             try:
                 # Prefer per-account series when defined (non-roaming setups may carry series per CS.id)
-                ls_dict = getattr(self, 'account_load_series', {})
-                ps_dict = getattr(self, 'account_pv_series', {})
-                ls = ls_dict.get(cs.id)
-                ps = ps_dict.get(cs.id)
-                if ls is not None and t < len(ls):
-                    values["household_inflexible_load_kw"] = float(ls.iloc[t])
+                load_val = self._get_account_load_kw(cs.id, t)
+                pv_val = self._get_account_pv_kw(cs.id, t)
+                if np.isfinite(load_val):
+                    values["household_inflexible_load_kw"] = float(load_val)
                 else:
                     # Fallback: transformer aggregation for this CS
                     if hasattr(self, 'tr_inflexible_loads') and self.tr_inflexible_loads is not None:
@@ -1879,8 +1893,8 @@ class EV2Gym(gym.Env):
                         if tr_ids:
                             cs_load = float(np.nansum(self.tr_inflexible_loads[tr_ids, t]))
                             values["household_inflexible_load_kw"] = cs_load
-                if ps is not None and t < len(ps):
-                    values["household_pv_kw"] = float(ps.iloc[t])
+                if np.isfinite(pv_val):
+                    values["household_pv_kw"] = float(pv_val)
                 else:
                     if hasattr(self, 'tr_solar_power') and self.tr_solar_power is not None:
                         tr_ids = []
@@ -2161,50 +2175,50 @@ class EV2Gym(gym.Env):
                     # Data not ready; skip to avoid building zero forecasts. Will try again next tick.
                     self.demand_forecast = None
             elif target == 'temperature':
-                # Load weather data and extract temperature forecasts and current series
-                from ev2gym.utilities.loaders import load_weather_data
-                weather_df = load_weather_data(self)
-                if weather_df is not None and 'temperature' in weather_df.columns:
-                    # Persist current series aligned to simulation timeline
+                if self.temperature_series is None:
                     try:
-                        aligned = weather_df.reindex(sim_index, method='nearest')
-                        self.temperature_series = aligned['temperature'].to_numpy(dtype=float)[: int(self.simulation_length)]
+                        from ev2gym.utilities.loaders import load_weather_data
+                        weather_df = load_weather_data(self)
+                        if weather_df is not None and 'temperature' in weather_df.columns:
+                            self.temperature_series = weather_df['temperature'].to_numpy(dtype=float)[: int(self.simulation_length)]
                     except Exception:
                         self.temperature_series = None
-                    # Build lookahead forecast from current step
-                    temp_series = aligned['temperature'] if 'aligned' in locals() else weather_df['temperature']
+
+                series = self.temperature_series
+                if series is not None and len(series) > 0:
                     step_per_hour = max(1, int(60 // self.timescale))
                     t0 = int(self.current_step)
                     horizon = int(params.get('forecast_horizon_hours', 24))
+                    last_idx = len(series) - 1
                     fc = []
                     for h in range(1, horizon + 1):
                         idx = t0 + h * step_per_hour
-                        val = temp_series.iloc[idx] if idx < len(temp_series) else temp_series.iloc[-1]
-                        fc.append(float(val))
+                        idx = last_idx if idx > last_idx else idx
+                        fc.append(float(series[idx]))
                     self.temp_forecast = np.asarray(fc, dtype=float)
                 else:
                     self.temp_forecast = None
             elif target == 'wind':
-                # Load weather data and extract wind forecasts and current series
-                from ev2gym.utilities.loaders import load_weather_data
-                weather_df = load_weather_data(self)
-                if weather_df is not None and 'wind_speed' in weather_df.columns:
-                    # Persist current series aligned to simulation timeline
+                if self.wind_speed_series is None:
                     try:
-                        aligned = weather_df.reindex(sim_index, method='nearest')
-                        self.wind_speed_series = aligned['wind_speed'].to_numpy(dtype=float)[: int(self.simulation_length)]
+                        from ev2gym.utilities.loaders import load_weather_data
+                        weather_df = load_weather_data(self)
+                        if weather_df is not None and 'wind_speed' in weather_df.columns:
+                            self.wind_speed_series = weather_df['wind_speed'].to_numpy(dtype=float)[: int(self.simulation_length)]
                     except Exception:
                         self.wind_speed_series = None
-                    # Build lookahead forecast from current step
-                    wind_series = aligned['wind_speed'] if 'aligned' in locals() else weather_df['wind_speed']
+
+                series = self.wind_speed_series
+                if series is not None and len(series) > 0:
                     step_per_hour = max(1, int(60 // self.timescale))
                     t0 = int(self.current_step)
                     horizon = int(params.get('forecast_horizon_hours', 24))
+                    last_idx = len(series) - 1
                     fc = []
                     for h in range(1, horizon + 1):
                         idx = t0 + h * step_per_hour
-                        val = wind_series.iloc[idx] if idx < len(wind_series) else wind_series.iloc[-1]
-                        fc.append(float(val))
+                        idx = last_idx if idx > last_idx else idx
+                        fc.append(float(series[idx]))
                     self.wind_forecast = np.asarray(fc, dtype=float)
                 else:
                     self.wind_forecast = None

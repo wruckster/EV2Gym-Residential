@@ -9,6 +9,7 @@ import math
 import datetime
 import importlib.resources
 import pathlib
+from pathlib import Path
 from functools import lru_cache
 from importlib.resources.abc import Traversable
 import pytz
@@ -30,6 +31,10 @@ from ev2gym.utilities.utils import EV_spawner, generate_power_setpoints, EV_spaw
 
 
 _HOUSEHOLD_PROFILE_CACHE: Dict[Tuple, pd.DataFrame] = {}
+_FALLBACK_HOUSEHOLD_DATA_CACHE: Dict[Tuple, np.ndarray] = {}
+_FALLBACK_PV_DATA_CACHE: Dict[Tuple, np.ndarray] = {}
+_EXTERNAL_FEATURES_CACHE: Dict[Tuple, pd.DataFrame] = {}
+_WEATHER_CACHE: Dict[Tuple, pd.DataFrame] = {}
 
 
 @lru_cache(maxsize=16)
@@ -56,6 +61,11 @@ def _read_household_csv(path: str) -> pd.DataFrame:
         parse_dates=["interval_start"],
         usecols=["interval_start", "demand", "solar"],
     )
+
+
+@lru_cache(maxsize=8)
+def _read_external_parquet(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path)
 
 
 def _ensure_filter_config_defaults(env) -> None:
@@ -190,85 +200,85 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
     in the simulation.
     '''
 
+    cached_env_arr = getattr(env, "_cached_inflexible_loads", None)
+    if cached_env_arr is not None:
+        return cached_env_arr
+
     # Load the data
     # --- Use NSW household profiles if provided ---
     household_df = _load_household_profiles(env)
     if household_df is not None:
         scale = env.config['inflexible_loads'].get('scale_mean', 1.0)
-        demand_series = household_df['demand'] * scale
-        new_data = pd.DataFrame()
-        for i in range(env.number_of_transformers):
-            new_data[f'tr_{i}'] = demand_series * env.tr_rng.uniform(0.9, 1.1)
-        arr = new_data.to_numpy().T
+        demand_series = household_df['demand'].to_numpy(dtype=np.float32, copy=False)
+        base = demand_series * scale
+        factors = env.tr_rng.uniform(0.9, 1.1, size=(env.number_of_transformers, 1))
+        arr = factors * base[np.newaxis, :]
         try:
             if not hasattr(env, '_dbg_inflex_once'):
                 env._dbg_inflex_once = True
                 src = env.config.get('inflexible_loads', {}).get('data_file') or env.config.get('inflexible_loads', {}).get('data_files')
-                print(f"[DBG inflex] source=household_file scale_mean={scale} transformers={env.number_of_transformers} len={arr.shape[1]} src_minmax=({float(demand_series.min()):.4f},{float(demand_series.max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f}) src={src}")
+                print(f"[DBG inflex] source=household_file scale_mean={scale} transformers={env.number_of_transformers} len={arr.shape[1]} src_minmax=({float(base.min()):.4f},{float(base.max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f}) src={src}")
                 if np.allclose(arr, 0.0):
                     print("[WARN inflex] Generated inflexible loads are all zeros from household path. Check scale_mean and input files/date filter.")
         except Exception:
             pass
+        env._cached_inflexible_loads = arr
         return arr
 
     # If no NSW data available, fall back to the default dataset
     data_path = get_resource_path('ev2gym.data', 'residential_loads.csv')
-    data = pd.read_csv(data_path, header=None)
+    cache_key = (
+        data_path,
+        env.timescale,
+        env.simulation_length,
+    )
+    base_matrix = _FALLBACK_HOUSEHOLD_DATA_CACHE.get(cache_key)
+    if base_matrix is None:
+        data = pd.read_csv(data_path, header=None)
 
-    desired_timescale = env.timescale
-    simulation_length = env.simulation_length
-    simulation_date = env.sim_starting_date.strftime('%Y-%m-%d %H:%M:%S')
+        desired_timescale = env.timescale
+        simulation_length = env.simulation_length
+        simulation_date = env.sim_starting_date.strftime('%Y-%m-%d %H:%M:%S')
+
+        dataset_timescale = 15
+        dataset_starting_date = '2022-01-01 00:00:00'
+
+        if desired_timescale > dataset_timescale:
+            data = data.groupby(
+                data.index // (desired_timescale/dataset_timescale)).max()
+        elif desired_timescale < dataset_timescale:
+            data = data.loc[data.index.repeat(
+                dataset_timescale/desired_timescale)].reset_index(drop=True)
+
+        data = pd.concat([data, data], ignore_index=True)
+        data['date'] = pd.date_range(
+            start=dataset_starting_date, periods=data.shape[0], freq=f'{desired_timescale}min')
+
+        year = int(dataset_starting_date.split('-')[0])
+        simulation_date = f'{year}-{simulation_date.split("-")[1]}-{simulation_date.split("-")[2]}'
+        simulation_index = data[data['date'] == simulation_date].index[0]
+        data = data[simulation_index:simulation_index+simulation_length]
+        data = data.drop(columns=['date'])
+        base_matrix = data.to_numpy(dtype=np.float32)
+        _FALLBACK_HOUSEHOLD_DATA_CACHE[cache_key] = base_matrix
+
     number_of_transformers = env.number_of_transformers
-
-    dataset_timescale = 15
-    dataset_starting_date = '2022-01-01 00:00:00'
-
-    if desired_timescale > dataset_timescale:
-        data = data.groupby(
-            data.index // (desired_timescale/dataset_timescale)).max()
-    elif desired_timescale < dataset_timescale:
-        # extend the dataset to data.shape[0] * (dataset_timescale/desired_timescale)
-        # by repeating the data every (dataset_timescale/desired_timescale) rows
-        data = data.loc[data.index.repeat(
-            dataset_timescale/desired_timescale)].reset_index(drop=True)
-
-    # duplicate the data to have two years of data
-    data = pd.concat([data, data], ignore_index=True)
-
-    # add a date column to the dataframe
-    data['date'] = pd.date_range(
-        start=dataset_starting_date, periods=data.shape[0], freq=f'{desired_timescale}min')
-
-    # find year of the data
-    year = int(dataset_starting_date.split('-')[0])
-    # replace the year of the simulation date with the year of the data
-    simulation_date = f'{year}-{simulation_date.split("-")[1]}-{simulation_date.split("-")[2]}'
-
-    simulation_index = data[data['date'] == simulation_date].index[0]
-
-    # select the data for the simulation date
-    data = data[simulation_index:simulation_index+simulation_length]
-
-    # drop the date column
-    data = data.drop(columns=['date'])
-    new_data = pd.DataFrame()
-
+    k = min(10, base_matrix.shape[1])
+    arr = np.empty((number_of_transformers, base_matrix.shape[0]), dtype=np.float32)
     for i in range(number_of_transformers):
-        # Guard against small column counts
-        k = min(10, data.shape[1])
-        new_data['tr_'+str(i)] = data.sample(k, axis=1,
-                                             random_state=env.tr_seed).sum(axis=1)
-
-    arr = new_data.to_numpy().T
+        idx = env.tr_rng.integers(base_matrix.shape[1], size=k)
+        arr[i] = base_matrix[:, idx].sum(axis=1)
     try:
         if not hasattr(env, '_dbg_inflex_once'):
             env._dbg_inflex_once = True
-            print(f"[DBG inflex] source=fallback_csv file={data_path} transformers={number_of_transformers} len={arr.shape[1]} csv_minmax=({float(data.min(numeric_only=True).min()):.4f},{float(data.max(numeric_only=True).max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f})")
+            csv_min = float(base_matrix.min()) if base_matrix.size else 0.0
+            csv_max = float(base_matrix.max()) if base_matrix.size else 0.0
+            print(f"[DBG inflex] source=fallback_csv file={data_path} transformers={number_of_transformers} len={arr.shape[1]} csv_minmax=({csv_min:.4f},{csv_max:.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f})")
             if np.allclose(arr, 0.0):
                 print("[WARN inflex] Generated inflexible loads are all zeros from fallback CSV. Check data file and scaling.")
     except Exception:
         pass
-    # return the "tr_" columns
+    env._cached_inflexible_loads = arr
     return arr
 
 
@@ -277,6 +287,10 @@ def generate_pv_generation(env) -> np.ndarray:
     This function loads the PV generation of each transformer by loading the data from a file
     and then adding minor variations to the data
     '''
+
+    cached_env_arr = getattr(env, "_cached_pv_generation", None)
+    if cached_env_arr is not None:
+        return cached_env_arr
 
     # --- Load PV from household file (Parquet or CSVs) when requested ---
     sp_cfg = env.config.get('solar_power', {})
@@ -288,79 +302,69 @@ def generate_pv_generation(env) -> np.ndarray:
 
         # Check if solar column exists
         if 'solar' not in household_df.columns:
-            # If no solar column, create a zero series of appropriate length
             household_df['solar'] = 0.0
-        solar_series = household_df['solar']
-            
-        new_data = pd.DataFrame()
-        for i in range(env.number_of_transformers):
-            new_data[f'tr_{i}'] = solar_series * env.tr_rng.uniform(0.9, 1.1)
-        return new_data.to_numpy().T
+        solar_series = household_df['solar'].to_numpy(dtype=np.float32, copy=False)
+        factors = env.tr_rng.uniform(0.9, 1.1, size=(env.number_of_transformers, 1))
+        arr = factors * solar_series[np.newaxis, :]
+        env._cached_pv_generation = arr
+        return arr
 
     # If no household solar data, check for external features with solar data
     external_df = _load_external_features(env)
     if external_df is not None and 'solar' in external_df.columns:
-        solar_series = external_df['solar']
-        new_data = pd.DataFrame()
-        for i in range(env.number_of_transformers):
-            new_data[f'tr_{i}'] = solar_series * env.tr_rng.uniform(0.9, 1.1)
-        return new_data.to_numpy().T
+        solar_series = external_df['solar'].to_numpy(dtype=np.float32, copy=False)
+        factors = env.tr_rng.uniform(0.9, 1.1, size=(env.number_of_transformers, 1))
+        arr = factors * solar_series[np.newaxis, :]
+        env._cached_pv_generation = arr
+        return arr
 
     # If no NSW data available, fall back to the default dataset
     data_path = get_resource_path('ev2gym.data', 'pv_netherlands.csv')
-    data = pd.read_csv(data_path, sep=',', header=0)
-    data.drop(['time', 'local_time'], inplace=True, axis=1)
+    cache_key = (
+        data_path,
+        env.timescale,
+        env.simulation_length,
+    )
+    base_series = _FALLBACK_PV_DATA_CACHE.get(cache_key)
+    if base_series is None:
+        data = pd.read_csv(data_path, sep=',', header=0)
+        data.drop(['time', 'local_time'], inplace=True, axis=1)
 
-    desired_timescale = env.timescale
-    simulation_length = env.simulation_length
-    simulation_date = env.sim_starting_date.strftime('%Y-%m-%d %H:%M:%S')
-    number_of_transformers = env.number_of_transformers
+        desired_timescale = env.timescale
+        simulation_length = env.simulation_length
+        simulation_date = env.sim_starting_date.strftime('%Y-%m-%d %H:%M:%S')
 
-    dataset_timescale = 60
-    dataset_starting_date = '2019-01-01 00:00:00'
+        dataset_timescale = 60
+        dataset_starting_date = '2019-01-01 00:00:00'
 
-    if desired_timescale > dataset_timescale:
-        data = data.groupby(
-            data.index // (desired_timescale/dataset_timescale)).max()
-    elif desired_timescale < dataset_timescale:
-        # extend the dataset to data.shape[0] * (dataset_timescale/desired_timescale)
-        # by repeating the data every (dataset_timescale/desired_timescale) rows
-        data = data.loc[data.index.repeat(
-            dataset_timescale/desired_timescale)].reset_index(drop=True)
-        # data = data/ (dataset_timescale/desired_timescale)
+        if desired_timescale > dataset_timescale:
+            data = data.groupby(
+                data.index // (desired_timescale/dataset_timescale)).max()
+        elif desired_timescale < dataset_timescale:
+            data = data.loc[data.index.repeat(
+                dataset_timescale/desired_timescale)].reset_index(drop=True)
 
-    # smooth data by taking the mean of every 5 rows
-    data['electricity'] = data['electricity'].rolling(
-        window=60//desired_timescale, min_periods=1).mean()
-    # use other type of smoothing
-    data['electricity'] = data['electricity'].ewm(
-        span=60//desired_timescale, adjust=True).mean()
+        window = max(1, 60//desired_timescale)
+        data['electricity'] = data['electricity'].rolling(
+            window=window, min_periods=1).mean()
+        data['electricity'] = data['electricity'].ewm(
+            span=window, adjust=True).mean()
 
-    # duplicate the data to have two years of data
-    data = pd.concat([data, data], ignore_index=True)
+        data = pd.concat([data, data], ignore_index=True)
+        data['date'] = pd.date_range(
+            start=dataset_starting_date, periods=data.shape[0], freq=f'{desired_timescale}min')
 
-    # add a date column to the dataframe
-    data['date'] = pd.date_range(
-        start=dataset_starting_date, periods=data.shape[0], freq=f'{desired_timescale}min')
+        year = int(dataset_starting_date.split('-')[0])
+        simulation_date = f'{year}-{simulation_date.split("-")[1]}-{simulation_date.split("-")[2]}'
+        simulation_index = data[data['date'] == simulation_date].index[0]
+        data = data[simulation_index:simulation_index+simulation_length]
+        base_series = data['electricity'].to_numpy(dtype=np.float32)
+        _FALLBACK_PV_DATA_CACHE[cache_key] = base_series
 
-    # find year of the data
-    year = int(dataset_starting_date.split('-')[0])
-    # replace the year of the simulation date with the year of the data
-    simulation_date = f'{year}-{simulation_date.split("-")[1]}-{simulation_date.split("-")[2]}'
-
-    simulation_index = data[data['date'] == simulation_date].index[0]
-
-    # select the data for the simulation date
-    data = data[simulation_index:simulation_index+simulation_length]
-
-    # drop the date column
-    data = data.drop(columns=['date'])
-    new_data = pd.DataFrame()
-
-    for i in range(number_of_transformers):
-        new_data['tr_'+str(i)] = data * env.tr_rng.uniform(0.9, 1.1)
-
-    return new_data.to_numpy().T
+    factors = env.tr_rng.uniform(0.9, 1.1, size=(env.number_of_transformers, 1))
+    arr = factors * base_series[np.newaxis, :]
+    env._cached_pv_generation = arr
+    return arr
 
 
 def load_transformers(env) -> List[Transformer]:
@@ -867,79 +871,98 @@ def _load_external_features(env):
     """
     Load external features dataset (weather, prices, etc.) and filter by date range.
     Returns a DataFrame with external features or None if the file doesn't exist.
-    
+
     Uses the environment's year, month, day, timescale, and simulation_length
     to filter and resample the data.
     """
-    # Check if external features file exists
     if 'data_path' not in env.config:
         return None
-        
-    import os
+
     external_file = env.config['data_path']
     if not os.path.exists(external_file):
-        # Try alternative path structure
-        external_file = os.path.join(env.config['data_path'], 'nsw_dataset', 'external_features', 'external_dataset.parquet')
-        if not os.path.exists(external_file):
+        fallback = os.path.join(env.config['data_path'], 'nsw_dataset', 'external_features', 'external_dataset.parquet')
+        if not os.path.exists(fallback):
             return None
-    
-    try:
-        # Load the parquet file
-        df = pd.read_parquet(external_file)
+        external_file = fallback
 
-        # Ensure we have a DatetimeIndex for filtering/resampling
+    resolved_path = Path(external_file).resolve()
+    try:
+        stat = resolved_path.stat()
+        file_sig = (str(resolved_path), stat.st_mtime_ns, stat.st_size)
+    except FileNotFoundError:
+        return None
+
+    cache_key = (
+        file_sig,
+        env.timescale,
+        env.simulation_length,
+        env.config.get('year', 2019),
+        env.config.get('month', 1),
+        env.config.get('day', 1),
+        env.config.get('hour', 0),
+        env.config.get('minute', 0),
+    )
+    cached = _EXTERNAL_FEATURES_CACHE.get(cache_key)
+    if cached is not None:
+        setattr(env, "_external_features_cache_key", cache_key)
+        return cached.copy(deep=True)
+
+    try:
+        df = _read_external_parquet(str(resolved_path))
+
         if not isinstance(df.index, pd.DatetimeIndex):
-            # Try common datetime column names
             datetime_candidates = [
-                'interval_start', 'timestamp', 'Datetime (UTC)', 'DatetimeUTC', 'datetime_utc', 'datetime'
+                'interval_start',
+                'timestamp',
+                'Datetime (UTC)',
+                'DatetimeUTC',
+                'datetime_utc',
+                'datetime',
             ]
             dt_col = None
-            for c in datetime_candidates:
-                if c in df.columns:
-                    dt_col = c
+            for candidate in datetime_candidates:
+                if candidate in df.columns:
+                    dt_col = candidate
                     break
             if dt_col is None:
                 raise ValueError("External features file must have a DatetimeIndex or a recognizable datetime column")
             df[dt_col] = pd.to_datetime(df[dt_col], errors='coerce', utc=True)
             df = df.set_index(dt_col)
 
-        # Normalize index to timezone-naive for consistency with env timestamps
         if df.index.tz is not None:
             df.index = df.index.tz_convert('UTC').tz_localize(None)
 
-        # Create start and end dates for filtering
-        start_date = pd.Timestamp(year=env.config.get('year', 2019),
-                                  month=env.config.get('month', 1),
-                                  day=env.config.get('day', 1),
-                                  hour=env.config.get('hour', 0),
-                                  minute=env.config.get('minute', 0))
-
-        # Calculate end date based on simulation_length and timescale
+        start_date = pd.Timestamp(
+            year=env.config.get('year', 2019),
+            month=env.config.get('month', 1),
+            day=env.config.get('day', 1),
+            hour=env.config.get('hour', 0),
+            minute=env.config.get('minute', 0),
+        )
         minutes_to_add = env.timescale * env.simulation_length
         end_date = start_date + pd.Timedelta(minutes=minutes_to_add)
 
-        # Filter by date range
         filtered_df = df[(df.index >= start_date) & (df.index <= end_date)]
-
-        # If filtered data is empty, use the original data with a warning
         if filtered_df.empty:
-            print(f"Warning: No data in external features for date range {start_date} to {end_date}. Using full dataset.")
+            print(
+                f"Warning: No data in external features for date range {start_date} to {end_date}. Using full dataset."
+            )
             filtered_df = df
 
-        # Resample to the simulation time-step and fill gaps by interpolation
         filtered_df = filtered_df.resample(f"{env.timescale}min").mean().interpolate(method='time')
 
-        # Ensure we have at least env.simulation_length rows
         if len(filtered_df) < env.simulation_length:
-            print(f"Warning: Not enough external data rows ({len(filtered_df)}) for simulation length ({env.simulation_length}). Repeating data.")
+            print(
+                f"Warning: Not enough external data rows ({len(filtered_df)}) for simulation length ({env.simulation_length}). Repeating data."
+            )
             reps = math.ceil(env.simulation_length / len(filtered_df)) + 1
             filtered_df = pd.concat([filtered_df] * reps).iloc[:env.simulation_length]
         else:
-            # If we have more than enough data, just take what we need
             filtered_df = filtered_df.iloc[:env.simulation_length]
 
-        # Keep DatetimeIndex for downstream alignment/forecasting
-        return filtered_df
+        _EXTERNAL_FEATURES_CACHE[cache_key] = filtered_df
+        setattr(env, "_external_features_cache_key", cache_key)
+        return filtered_df.copy(deep=True)
 
     except Exception as e:
         print(f"Error loading external features: {e}")
@@ -957,6 +980,10 @@ def load_weather_data(env) -> pd.DataFrame | None:
 
     Also stores the result on `env.weather_data` for convenience.
     """
+    existing_weather = getattr(env, "weather_data", None)
+    if isinstance(existing_weather, pd.DataFrame) and not existing_weather.empty:
+        return existing_weather
+
     external = _load_external_features(env)
     if external is None:
         env.weather_data = None
@@ -978,8 +1005,8 @@ def load_weather_data(env) -> pd.DataFrame | None:
     temp_col = pick_col(['temperature', 'temp', 't2m'])
     wind_col = pick_col(['wind_speed', 'windspeed', 'wind', 'ws'])
 
-    cols = []
-    rename = {}
+    cols: list[str] = []
+    rename: Dict[str, str] = {}
     if temp_col:
         cols.append(temp_col)
         rename[temp_col] = 'temperature'
@@ -992,6 +1019,23 @@ def load_weather_data(env) -> pd.DataFrame | None:
         env.weather_data = None
         return None
 
+    cache_key = getattr(env, "_external_features_cache_key", None)
+    weather_key = None
+    if cache_key is not None:
+        weather_key = (
+            cache_key,
+            env.timescale,
+            env.simulation_length,
+            tuple(cols),
+            tuple(sorted(rename.items())),
+        )
+        cached_weather = _WEATHER_CACHE.get(weather_key)
+        if cached_weather is not None:
+            env.weather_data = cached_weather
+            return cached_weather
+
     weather = external[cols].rename(columns=rename)
+    if weather_key is not None:
+        _WEATHER_CACHE[weather_key] = weather
     env.weather_data = weather
     return weather

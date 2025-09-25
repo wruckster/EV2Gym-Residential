@@ -1,7 +1,7 @@
 '''  This file contains various example state functions for the RL agent '''
 import math
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 def PublicPST(env, *args):
@@ -75,26 +75,48 @@ def PublicPST(env, *args):
 
 ## Ledger-based observation API
 
-def _ledger_column_plan(env, account_id: int) -> tuple[list[str], list[str]]:
-    """Return ordered column lists from global and account ledgers.
-    Conservative, stable selection for observations.
-    """
-    # Global: time features, 24h price forecast, and key totals
-    g_pref = [
-        "step_ratio", "dow", "hour", "minute",
-        *[f"price_fc_h{h:02d}" for h in range(1, 25)],
-        "power_setpoint_kw", "total_power_usage_kw", "ev_power_kw",
-        "inflexible_load_kw", "solar_production_kw", "evs_parked",
-    ]
-    gcols = [c for c in g_pref if getattr(env, "global_buffers", None) is not None and c in env.global_buffers.columns]
+def _ledger_column_plan(env, account_id: int) -> tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Return ordered column lists from global and account ledgers with caching."""
+    if getattr(env, "global_buffers", None) is None:
+        return tuple(), tuple()
 
-    # Account: charger-level and per-port core values, plus optional per-account forecasts
+    cache: Dict[int, Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], Tuple[str, ...], Tuple[str, ...]]] | None = getattr(env, "_ledger_plan_cache", None)  # type: ignore[assignment]
+    if cache is None:
+        cache = {}
+        setattr(env, "_ledger_plan_cache", cache)
+
+    global_cols_tuple = tuple(env.global_buffers.columns)
+
     abuf = env.account_buffers.get(account_id) if getattr(env, "account_buffers", None) else None
+    account_cols_tuple = tuple(abuf.columns) if abuf is not None else tuple()
+    signature = (global_cols_tuple, account_cols_tuple)
+
+    cached_entry = cache.get(account_id)
+    if cached_entry is not None and cached_entry[0] == signature:
+        return cached_entry[1], cached_entry[2]
+
+    global_col_set = set(global_cols_tuple)
+    g_pref = (
+        "step_ratio",
+        "dow",
+        "hour",
+        "minute",
+        *[f"price_fc_h{h:02d}" for h in range(1, 25)],
+        "power_setpoint_kw",
+        "total_power_usage_kw",
+        "ev_power_kw",
+        "inflexible_load_kw",
+        "solar_production_kw",
+        "evs_parked",
+    )
+    gcols = tuple(c for c in g_pref if c in global_col_set)
+
     if abuf is None:
-        return gcols, []
-    # Discover port indices present
+        cache[account_id] = (signature, gcols, tuple())
+        return gcols, tuple()
+
     port_indices: list[int] = []
-    for name in abuf.columns:
+    for name in account_cols_tuple:
         if name.startswith("port") and name.endswith("_soc"):
             try:
                 idx = int(name.split("port")[1].split("_")[0])
@@ -103,16 +125,18 @@ def _ledger_column_plan(env, account_id: int) -> tuple[list[str], list[str]]:
                 continue
     port_indices = sorted(set(port_indices))
 
-    a_pref = ["cs_power_kw", "cs_amps", "evs_connected"]
+    a_pref: list[str] = ["cs_power_kw", "cs_amps", "evs_connected"]
     for p in port_indices:
         a_pref.append(f"port{p}_soc")
         a_pref.append(f"port{p}_action_norm")
-    # Add per-account 24h forecasts if present
+
     load_fc_cols = [f"load_fc_h{h:02d}" for h in range(1, 25)]
     pv_fc_cols = [f"pv_fc_h{h:02d}" for h in range(1, 25)]
-    a_pref.extend([c for c in load_fc_cols if c in abuf.columns])
-    a_pref.extend([c for c in pv_fc_cols if c in abuf.columns])
-    acols = [c for c in a_pref if c in abuf.columns]
+    a_pref.extend([c for c in load_fc_cols if c in account_cols_tuple])
+    a_pref.extend([c for c in pv_fc_cols if c in account_cols_tuple])
+
+    acols = tuple(c for c in a_pref if c in account_cols_tuple)
+    cache[account_id] = (signature, gcols, acols)
     return gcols, acols
 
 

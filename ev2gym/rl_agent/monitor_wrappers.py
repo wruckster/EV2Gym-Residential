@@ -27,21 +27,27 @@ class ActionMonitor(gym.Wrapper):
         self._labels_built: bool = state_label_names is not None
         self._obs_warned: bool = False
         self._labels_printed: bool = False
+        self._record_action_stats: bool = bool(write_csv_path) or log_every_n_steps > 0
+        self._obs_buffer: Optional[np.ndarray] = None
 
         self.step_idx: int = 0
         self.episode_idx: int = 0
 
         # Time-series buffers
-        self.neg_frac_series: list[float] = []
-        self.act_mean_series: list[float] = []
-        self.act_min_series: list[float] = []
-        self.act_max_series: list[float] = []
+        self.neg_frac_series: list[float] = [] if self._record_action_stats else []
+        self.act_mean_series: list[float] = [] if self._record_action_stats else []
+        self.act_min_series: list[float] = [] if self._record_action_stats else []
+        self.act_max_series: list[float] = [] if self._record_action_stats else []
+        self._last_action_stats: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
         if self.write_csv_path:
             os.makedirs(os.path.dirname(self.write_csv_path), exist_ok=True)
-            with open(self.write_csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["episode", "step", "neg_frac", "act_mean", "act_min", "act_max"])
+            self._csv_file = open(self.write_csv_path, "w", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow(["episode", "step", "neg_frac", "act_mean", "act_min", "act_max"])
+        else:
+            self._csv_file = None
+            self._csv_writer = None
 
     def reset(self, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
         if self.step_idx > 0:
@@ -63,23 +69,42 @@ class ActionMonitor(gym.Wrapper):
         return obs, info
 
     def step(self, action: np.ndarray) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
-        # Handle both scalar and vector actions
-        a = np.array(action, dtype=float).ravel()
-        neg_frac = float((a < 0).mean()) if a.size > 0 else float(a < 0)
+        # Handle both scalar and vector actions with minimal allocation
+        a = np.asarray(action, dtype=np.float32)
+        if a.ndim == 0:
+            a = a.reshape(1)
 
-        self.neg_frac_series.append(neg_frac)
-        self.act_mean_series.append(float(a.mean()) if a.size > 0 else float(a))
-        self.act_min_series.append(float(a.min()) if a.size > 0 else float(a))
-        self.act_max_series.append(float(a.max()) if a.size > 0 else float(a))
+        size = a.size
+        if size > 0:
+            neg_frac = float(np.count_nonzero(a < 0.0) / size)
+            act_mean = float(a.mean())
+            act_min = float(a.min())
+            act_max = float(a.max())
+        else:
+            val = float(a)
+            neg_frac = float(val < 0.0)
+            act_mean = val
+            act_min = val
+            act_max = val
 
-        if self.write_csv_path:
-            with open(self.write_csv_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    self.episode_idx, self.step_idx,
-                    self.neg_frac_series[-1], self.act_mean_series[-1],
-                    self.act_min_series[-1], self.act_max_series[-1]
-                ])
+        self._last_action_stats = (neg_frac, act_mean, act_min, act_max)
+
+        if self._record_action_stats:
+            self.neg_frac_series.append(neg_frac)
+            self.act_mean_series.append(act_mean)
+            self.act_min_series.append(act_min)
+            self.act_max_series.append(act_max)
+
+        if self._csv_writer is not None:
+            self._csv_writer.writerow([
+                self.episode_idx,
+                self.step_idx,
+                neg_frac,
+                act_mean,
+                act_min,
+                act_max,
+            ])
+            self._csv_file.flush()
 
         # Increment step index before calling env so modulus aligns with printed timestep after transition
         self.step_idx += 1
@@ -101,10 +126,7 @@ class ActionMonitor(gym.Wrapper):
 
         # Attach per-step action stats for downstream logging/collector (optional)
         info = dict(info)
-        info["neg_action_frac"] = neg_frac
-        info["action_mean"] = self.act_mean_series[-1]
-        info["action_min"] = self.act_min_series[-1]
-        info["action_max"] = self.act_max_series[-1]
+        info["neg_action_frac"], info["action_mean"], info["action_min"], info["action_max"] = self._last_action_stats
 
         # Periodic detailed debug print of timestep, actions, and labelled state
         if self.is_verbose and self.step_idx % 10 == 0:
@@ -117,13 +139,14 @@ class ActionMonitor(gym.Wrapper):
             else:
                 state_lines = [f"    s[{i}]: {float(val):.4f}" for i, val in enumerate(obs_flat)]
 
+            _, mean_stat, min_stat, max_stat = self._last_action_stats
             print(
                 "\n".join(
                     [
                         f"[ActionMonitor] ep={self.episode_idx} step={self.step_idx}",
                         f"  actions: {a_str}",
-                        f"  neg_frac={neg_frac:.3f} mean={self.act_mean_series[-1]:.3f} "
-                        f"min={self.act_min_series[-1]:.3f} max={self.act_max_series[-1]:.3f}",
+                        f"  neg_frac={neg_frac:.3f} mean={mean_stat:.3f} "
+                        f"min={min_stat:.3f} max={max_stat:.3f}",
                         "  state:",
                         *state_lines,
                     ]
@@ -288,18 +311,29 @@ class ActionMonitor(gym.Wrapper):
             self._labels_built = False
 
     def _sanitize_obs(self, obs: Any) -> Any:
-        """Replace NaN/Inf in observation with finite values and clip extremes.
-        Works for numpy arrays and lists. Logs a one-time warning per episode.
-        """
+        """Replace NaN/Inf in observation with finite values and clip extremes."""
         try:
-            arr = np.asarray(obs, dtype=float)
-            if not np.isfinite(arr).all():
+            if isinstance(obs, np.ndarray):
+                arr = obs
+                if arr.dtype.kind not in {"f", "i"}:
+                    arr = arr.astype(np.float32, copy=False)
+                elif arr.dtype.kind == "i":
+                    arr = arr.astype(np.float32, copy=True)
+            else:
+                arr = np.asarray(obs, dtype=np.float32)
+
+            if self._obs_buffer is None or self._obs_buffer.shape != arr.shape:
+                self._obs_buffer = np.empty_like(arr, dtype=arr.dtype)
+
+            np.copyto(self._obs_buffer, arr, casting="unsafe")
+
+            if not np.isfinite(self._obs_buffer).all():
                 if not self._obs_warned:
                     logging.warning("[ActionMonitor] Non-finite observation detected; applying nan_to_num.")
                     self._obs_warned = True
-                arr = np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
-            # Optional: clip extreme magnitudes to keep policy stable
-            arr = np.clip(arr, -1e6, 1e6)
-            return arr
+                np.nan_to_num(self._obs_buffer, nan=0.0, posinf=1e6, neginf=-1e6, copy=False)
+
+            np.clip(self._obs_buffer, -1e6, 1e6, out=self._obs_buffer)
+            return self._obs_buffer
         except Exception:
             return obs
