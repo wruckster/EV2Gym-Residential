@@ -303,7 +303,9 @@ def spawn_single_EV(env,
             'max_discharge_power', 'min_discharge_power', 'ev_phases',
             'transition_soc', 'transition_soc_multiplier', 'charge_efficiency',
             'discharge_efficiency', 'timescale', 'metadata', 'location_state',
-            'commuting_consumption_kwh_km', 'desired_capacity'
+            'commuting_consumption_kwh_km', 'desired_capacity',
+            'user_satisfaction_tolerance_kwh', 'user_satisfaction_scale_source',
+            'user_satisfaction_penalize_overcharge'
         }
 
         # Filter the parameters from the config to only include valid EV constructor arguments
@@ -448,14 +450,16 @@ def spawn_single_EV_GF(env,
                       time_of_stay + step + 3),
                   ev_phases=3,
                   timescale=env.timescale,
+                  user_satisfaction_tolerance_kwh=env.config["ev"].get('user_satisfaction_tolerance_kwh', 0.0),
+                  user_satisfaction_scale_source=env.config["ev"].get('user_satisfaction_scale_source', 'desired_capacity'),
+                  user_satisfaction_penalize_overcharge=env.config["ev"].get('user_satisfaction_penalize_overcharge', True),
                   )
     else:
         return EV(id=port,
                   location=cs_id,
                   battery_capacity_at_arrival=initial_battery_capacity,
                   battery_capacity=battery_capacity,
-                  desired_capacity=env.config["ev"]['desired_capacity'] *
-                  battery_capacity,
+                  desired_capacity=env.config["ev"]['desired_capacity'] * battery_capacity,
                   max_ac_charge_power=env.config["ev"]['max_ac_charge_power'],
                   min_ac_charge_power=env.config["ev"]['min_ac_charge_power'],
                   max_dc_charge_power=env.config["ev"]['max_dc_charge_power'],
@@ -470,6 +474,9 @@ def spawn_single_EV_GF(env,
                   charge_efficiency=env.config["ev"]['charge_efficiency'],
                   discharge_efficiency=env.config["ev"]['discharge_efficiency'],
                   timescale=env.timescale,
+                  user_satisfaction_tolerance_kwh=env.config["ev"].get('user_satisfaction_tolerance_kwh', 0.0),
+                  user_satisfaction_scale_source=env.config["ev"].get('user_satisfaction_scale_source', 'desired_capacity'),
+                  user_satisfaction_penalize_overcharge=env.config["ev"].get('user_satisfaction_penalize_overcharge', True),
                   )
 
 

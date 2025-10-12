@@ -708,6 +708,7 @@ class EV2Gym(gym.Env):
         for cs, port_idx, ev in evs_to_disconnect:
             cs.evs_connected[port_idx] = None
             cs.n_evs_connected -= 1
+            self.current_ev_departed += 1  # Track departure
         
         # Reconnect EVs that have returned from commuting (location_state 0=home or 1=work)
         for ev in self.EVs:
@@ -737,6 +738,7 @@ class EV2Gym(gym.Env):
                                 target_cs.evs_connected[port_idx] = ev
                                 target_cs.n_evs_connected += 1
                                 ev.location = target_cs_id  # Update EV's current location
+                                self.current_ev_arrived += 1  # Track arrival
                                 break
 
         # Reset power usage for this timestep to zero before processing charging stations
@@ -832,8 +834,12 @@ class EV2Gym(gym.Env):
         except Exception:
             pass
 
-        # Track EVs parked count
-        self.current_evs_parked += self.current_ev_arrived - self.current_ev_departed
+        # Track EVs parked count - count all non-commuting connected EVs
+        self.current_evs_parked = 0
+        for cs in self.charging_stations:
+            for ev in cs.evs_connected:
+                if ev is not None and getattr(ev, 'location_state', -1) != 2:
+                    self.current_evs_parked += 1
 
         # Compute reward
         if self.simulate_grid:
@@ -2090,23 +2096,21 @@ class EV2Gym(gym.Env):
         # Always calculate cost for the current step (for visualization and analysis)
         timestep_hours = self.timescale / 60.0
         
-        # Positive power is grid draw, negative is grid injection (from solar/battery)
+        # grid_draw already includes inflexible_load + solar_power + ev_power
+        # Positive power is grid import (cost), negative is grid export (revenue)
         grid_energy_kwh = self.energy_flow_breakdown['grid_draw'][self.current_step] * timestep_hours
-        
-        # For cost calculation, split ev_power into charging (positive) and discharging (negative)
-        ev_power = self.energy_flow_breakdown['ev_power'][self.current_step]
-        charging_kwh = max(0, ev_power) * timestep_hours
-        discharging_kwh = max(0, -ev_power) * timestep_hours
         
         grid_price = np.mean([self.charge_prices[cs.id, self.current_step] for cs in self.charging_stations])
         discharge_price = np.mean([self.discharge_prices[cs.id, self.current_step] for cs in self.charging_stations])
         
-        # Calculate cost: pay for grid energy and charging, get credit for discharging
-        self.cost_history[self.current_step] = (
-            grid_energy_kwh * grid_price +
-            charging_kwh * grid_price -
-            discharging_kwh * discharge_price
-        )
+        # Calculate net cost:
+        # - Pay grid_price for imports (positive grid_energy_kwh)
+        # - Get discharge_price credit for exports (negative grid_energy_kwh)
+        if grid_energy_kwh >= 0:
+            self.cost_history[self.current_step] = grid_energy_kwh * grid_price
+        else:
+            # Exporting to grid (solar surplus or V2G discharge) - negative cost (revenue)
+            self.cost_history[self.current_step] = grid_energy_kwh * discharge_price
 
     def _step_date(self):
         '''Steps the simulation date by one timestep'''

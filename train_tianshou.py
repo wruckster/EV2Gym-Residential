@@ -149,6 +149,10 @@ def main(config_path: str):
     state_fn = get_component(state, rl_params.get('state_function'))
     reward_fn = get_component(reward, rl_params.get('reward_function'))
     cost_fn = get_component(cost, rl_params.get('cost_function'))
+    
+    logging.info(f"  State function: {state_fn.__name__ if state_fn else 'None'}")
+    logging.info(f"  Reward function: {reward_fn.__name__ if reward_fn else 'None'}")
+    logging.info(f"  Cost function: {cost_fn.__name__ if cost_fn else 'None'}")
     action_wrapper_cls = get_component(action_wrappers, env_params.get('action_wrapper'))
     noise_wrapper_cls = get_component(noise_wrappers, env_params.get('noise_wrapper'))
     verbosity = env_params['is_verbose']
@@ -194,7 +198,6 @@ def main(config_path: str):
                     batch = args[1]
                 elif "batch" in kwargs:
                     batch = kwargs["batch"]
-                logging.info("[PPO-Batch] (class) update() called. Has batch: %s", str(batch is not None))
                 if batch is not None:
                     _inspect_batch_tensors("batch", batch)
                 return PPOPolicy._orig_update(self, *args, **kwargs)  # type: ignore[attr-defined]
@@ -208,7 +211,6 @@ def main(config_path: str):
 
             def _class_wrapped_process(self, batch, buffer, indices):  # type: ignore[no-redef]
                 try:
-                    logging.info("[PPO-Batch] (class) process_fn() inspecting batch...")
                     _inspect_batch_tensors("batch", batch)
                 except Exception as e:
                     logging.warning(f"[PPO-Batch] (class) process_fn inspect failed: {e}")
@@ -258,14 +260,14 @@ def main(config_path: str):
             except Exception:
                 pass
 
-            # Attach ActionMonitor
-            if role == "train":
-                # Don’t write CSV for every worker; keep it lightweight
-                env = ActionMonitor(env, log_every_n_steps=0, write_csv_path=None)
-            else:
-                # Write a single CSV for eval to the run directory
-                eval_csv = os.path.join(run_dir, "eval_actions.csv")
-                env = ActionMonitor(env, log_every_n_steps=50, write_csv_path=eval_csv)
+            # # Attach ActionMonitor
+            # if role == "train":
+            #     # Don’t write CSV for every worker; keep it lightweight
+            #     env = ActionMonitor(env, log_every_n_steps=0, write_csv_path=None)
+            # else:
+            #     # Write a single CSV for eval to the run directory
+            #     eval_csv = os.path.join(run_dir, "eval_actions.csv")
+            #     env = ActionMonitor(env, log_every_n_steps=50, write_csv_path=eval_csv)
 
             env.reset(seed=exp_params.get('seed', 42) + seed_offset)
             return env
@@ -339,6 +341,10 @@ def main(config_path: str):
 
         def _log_stats(label: str, arr) -> None:
             try:
+                # Skip power_setpoint in account mode - it's intentionally NaN
+                if 'power_setpoint' in label:
+                    return
+                    
                 if isinstance(arr, np.ndarray):
                     a = arr
                 elif isinstance(arr, torch.Tensor):
@@ -386,9 +392,7 @@ def main(config_path: str):
                 batch = args[1]
             elif "batch" in kwargs:
                 batch = kwargs["batch"]
-            logging.info("[PPO-Batch] update() called. Has batch: %s", str(batch is not None))
             if batch is not None:
-                logging.info("[PPO-Batch] Inspecting batch before update...")
                 _inspect_batch_tensors("batch", batch)
             return _orig_update(*args, **kwargs)
 
@@ -402,7 +406,6 @@ def main(config_path: str):
 
         def _wrapped_process(batch, buffer, indices):  # type: ignore[override]
             try:
-                logging.info("[PPO-Batch] process_fn() inspecting batch...")
                 _inspect_batch_tensors("batch", batch)
             except Exception as e:
                 logging.warning(f"[PPO-Batch] process_fn inspect failed: {e}")

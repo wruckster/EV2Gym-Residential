@@ -1129,7 +1129,7 @@ def _plot_ev_details(ax, replay, time_steps):
         ev_power = np.array(replay.energy_flow_breakdown['ev_power'][:len(time_steps)])
         charging = np.where(ev_power > 0, ev_power, 0)
         discharging = np.where(ev_power < 0, ev_power, 0)
-        ax_power.bar(time_steps, charging, width=1.0, color='lightblue', label='EV Charging', alpha=0.6, align='edge')
+        ax_power.bar(time_steps, charging, width=1.0, color='red', label='EV Charging', alpha=0.6, align='edge')
         ax_power.bar(time_steps, discharging, width=1.0, color='green', label='V2G Discharge', alpha=0.6, align='edge')
     ax_power.set_ylabel("Power [kW]", color='darkgreen')
     ax_power.tick_params(axis='y', labelcolor='darkgreen')

@@ -66,6 +66,9 @@ class EV():
                  metadata=None,  # Added metadata parameter for storing location type and plug-in status
                  location_state=0,  # Default to home charging station
                  commuting_consumption_kwh_km=0.18, # Consumption per km
+                 user_satisfaction_tolerance_kwh: float = 0.0,
+                 user_satisfaction_scale_source: str = 'desired_capacity',
+                 user_satisfaction_penalize_overcharge: bool = True,
                  ):
 
         self.id = id
@@ -97,6 +100,9 @@ class EV():
         self.charge_efficiency = charge_efficiency
         self.discharge_efficiency = discharge_efficiency
         self.commuting_consumption_kwh_km = commuting_consumption_kwh_km
+        self.user_satisfaction_tolerance_kwh = max(0.0, float(user_satisfaction_tolerance_kwh))
+        self.user_satisfaction_scale_source = user_satisfaction_scale_source
+        self.user_satisfaction_penalize_overcharge = bool(user_satisfaction_penalize_overcharge)
 
         # Track location state (0=home, 1=work, 2=commuting)
         self.location_state = 0 if location_state == 0 else (1 if location_state == 1 else 2)
@@ -219,10 +225,27 @@ class EV():
             - Score: a value between 0 and 1
         '''
 
-        if self.current_capacity < self.desired_capacity - 0.001:
-            return self.current_capacity / self.desired_capacity
+        desired_capacity = max(0.0, float(self.desired_capacity))
+
+        if isinstance(self.user_satisfaction_scale_source, (int, float)):
+            scale = float(self.user_satisfaction_scale_source)
+        elif self.user_satisfaction_scale_source == 'battery_capacity':
+            scale = self.battery_capacity
         else:
-            return 1
+            scale = desired_capacity
+
+        if scale <= 1e-6:
+            scale = max(self.battery_capacity, 1.0)
+
+        delta = float(self.current_capacity) - desired_capacity
+        if self.user_satisfaction_penalize_overcharge:
+            deviation = abs(delta)
+        else:
+            deviation = max(0.0, -delta)
+
+        deviation = max(0.0, deviation - self.user_satisfaction_tolerance_kwh)
+        score = 1.0 - (deviation / scale)
+        return float(max(0.0, min(1.0, score)))
 
     def min_SoC_when_discharging_metric(self) -> float:
         """

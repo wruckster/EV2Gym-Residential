@@ -15,6 +15,8 @@ class Actor(nn.Module):
     def __init__(self, state_shape, action_shape):
         super().__init__()
         self.action_dim = np.prod(action_shape)
+        # Required by PPOPolicy for action scaling
+        self.max_action = 1.0
         self.model = nn.Sequential(
             nn.Linear(np.prod(state_shape), 128),
             nn.ReLU(inplace=True),

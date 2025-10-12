@@ -153,11 +153,13 @@ def run_heuristic_baseline(
     # 2) Direct EV2Gym env config: {"config_file": "/path/to/env.yaml"} or a string path to env.yaml
     exp_cfg = {}
     env_cfg = {}
+    rl_cfg = {}
     env_config_path: Optional[str] = None
 
     if isinstance(cfg, dict) and ("experiment" in cfg or "environment" in cfg):
         exp_cfg = cfg.get("experiment", {})
         env_cfg = cfg.get("environment", {})
+        rl_cfg = cfg.get("rl", {})
         env_config_path = env_cfg.get("config_file")
     elif isinstance(cfg, dict) and ("config_file" in cfg):
         env_config_path = cfg.get("config_file")
@@ -187,9 +189,46 @@ def run_heuristic_baseline(
     if env_config_path:
         logging.info(f"Config file: {os.path.abspath(env_config_path)}")
 
+    # Load reward and state functions if specified in RL config
+    from ev2gym.rl_agent import reward as reward_module, state as state_module
+    
+    reward_fn = None
+    state_fn = None
+    
+    if rl_cfg:
+        try:
+            reward_fn_name = rl_cfg.get('reward_function')
+            state_fn_name = rl_cfg.get('state_function')
+            if reward_fn_name:
+                reward_fn = getattr(reward_module, reward_fn_name, None)
+                if reward_fn:
+                    logging.info(f"Using reward function: {reward_fn_name}")
+                else:
+                    logging.warning(f"Reward function '{reward_fn_name}' not found")
+            if state_fn_name:
+                state_fn = getattr(state_module, state_fn_name, None)
+                if state_fn:
+                    logging.info(f"Using state function: {state_fn_name}")
+                else:
+                    logging.warning(f"State function '{state_fn_name}' not found")
+        except Exception as e:
+            logging.warning(f"Could not load RL functions from config: {e}")
+    
+    # Provide default state function if none specified
+    if state_fn is None:
+        state_fn = state_module.V2G_profit_max_enhanced
+        logging.info("Using default state function: V2G_profit_max_enhanced")
+    
+    # Provide default reward function if none specified
+    if reward_fn is None:
+        reward_fn = reward_module.solar_profit_reward_balanced
+        logging.info("Using default reward function: solar_profit_reward_balanced")
+
     # Create environment with replay saving enabled
     env = EV2Gym(
         config_file=env_config_path,
+        reward_function=reward_fn,
+        state_function=state_fn,
         save_replay=True,
         replay_save_path=replay_dir,
         verbose=True,  # Enable verbose mode to see debug output

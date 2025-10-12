@@ -217,7 +217,6 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
             if not hasattr(env, '_dbg_inflex_once'):
                 env._dbg_inflex_once = True
                 src = env.config.get('inflexible_loads', {}).get('data_file') or env.config.get('inflexible_loads', {}).get('data_files')
-                print(f"[DBG inflex] source=household_file scale_mean={scale} transformers={env.number_of_transformers} len={arr.shape[1]} src_minmax=({float(base.min()):.4f},{float(base.max()):.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f}) src={src}")
                 if np.allclose(arr, 0.0):
                     print("[WARN inflex] Generated inflexible loads are all zeros from household path. Check scale_mean and input files/date filter.")
         except Exception:
@@ -271,9 +270,6 @@ def generate_residential_inflexible_loads(env) -> np.ndarray:
     try:
         if not hasattr(env, '_dbg_inflex_once'):
             env._dbg_inflex_once = True
-            csv_min = float(base_matrix.min()) if base_matrix.size else 0.0
-            csv_max = float(base_matrix.max()) if base_matrix.size else 0.0
-            print(f"[DBG inflex] source=fallback_csv file={data_path} transformers={number_of_transformers} len={arr.shape[1]} csv_minmax=({csv_min:.4f},{csv_max:.4f}) out_minmax=({float(arr.min()):.4f},{float(arr.max()):.4f})")
             if np.allclose(arr, 0.0):
                 print("[WARN inflex] Generated inflexible loads are all zeros from fallback CSV. Check data file and scaling.")
     except Exception:

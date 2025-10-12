@@ -1,7 +1,7 @@
 
 # 1. Experiment-level settings
 experiment:
-  run_name: 'ppo_residential_v2g' # A descriptive name for this run
+  run_name: 'ppo_residential_profit_setpoint_tracking' # A descriptive name for this run
   results_dir: 'results'            # Root directory for all outputs
   seed: 42
   device: 'auto'                    # 'auto', 'cuda', or 'cpu'
@@ -22,36 +22,47 @@ environment:
 # 3. RL agent and algorithm settings
 rl:
   # --- Modular components to use ---
-  state_function: 'LedgersPublicState'      # From ev2gym.rl_agent.state
-  reward_function: 'profit_maximization' # From ev2gym.rl_agent.reward
+  state_function: 'V2G_profit_max_enhanced'      # From ev2gym.rl_agent.state
+  reward_function: 'solar_profit_reward_setpoint_tracking' # From ev2gym.rl_agent.reward
   cost_function: ''                     # Optional: from ev2gym.rl_agent.cost
 
   # --- Tianshou OnpolicyTrainer arguments ---
   # See Tianshou docs for OnpolicyTrainer for all available options
   trainer_args:
-    max_epoch: 2
-    step_per_epoch: 100
-    step_per_collect: 2048
+    max_epoch: 20  # Extended from 20 for more training
+    step_per_epoch: 2048
+    step_per_collect: 1024
     repeat_per_collect: 4
-    episode_per_test: 10
-    batch_size: 64
+    episode_per_test: 5
+    batch_size: 128
     show_progress: True
+    # Early stopping to prevent policy degradation
+    test_in_train: True
+    stop_fn: null  # Can add early stopping function here
 
   # --- Other RL settings ---
-  training_num: 2  # Number of parallel environments for training
+  training_num: 4  # Number of parallel environments for training
   test_num: 1      # Number of parallel environments for testing
-  buffer_size: 100_000
+  buffer_size: 50_000
 
   # --- PPO-specific arguments ---
   ppo:
     policy_args:
       # See Tianshou docs for PPOPolicy for all available options
-      discount_factor: 0.99
-      gae_lambda: 0.95
-      vf_coef: 0.5
-      ent_coef: 0.01
-      max_grad_norm: 0.5
-      reward_normalization: True
-      action_scaling: False # Set to False, as Rescale_RepairLayer handles scaling
-      action_bound_method: 'clip'
-    lr: 0.0003
+      discount_factor: 0.995  # Gamma: how much to value future rewards (0.995 = far-sighted)
+      gae_lambda: 0.97        # Generalized Advantage Estimation: balance bias/variance in advantage estimates
+      vf_coef: 0.25           # Value function loss coefficient: weight of critic loss in total loss
+      ent_coef: 0.05          # Entropy coefficient: encourages exploration (higher = more random actions, increased for smoother control)
+      max_grad_norm: 0.5      # Gradient clipping: prevents exploding gradients during training
+      eps_clip: 0.2           # PPO clipping parameter: limits policy update size (0.2 = 20% change max)
+      dual_clip: null         # Optional: additional clipping for large advantages (null = disabled)
+      value_clip: True        # Clip value function updates to prevent large changes
+      reward_normalization: False  # Don't normalize rewards (already normalized in reward function)
+      action_scaling: False   # Set to False, as Rescale_RepairLayer handles scaling
+      action_bound_method: 'clip'  # How to handle out-of-bound actions: clip to valid range
+    lr: 0.0001
+
+    # Learning rate schedule (optional but recommended)
+    lr_decay: True
+    lr_scheduler_type: 'cosine'       # Cosine annealing
+    lr_min: 0.00001                   # Minimum learning rate

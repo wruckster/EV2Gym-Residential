@@ -22,10 +22,8 @@ from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Sequence
 import numpy as np
-
-from ev2gym.models.ev.vehicle import EV
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -39,6 +37,84 @@ class PresenceBlock:
     energy_consumed: float  # kWh consumed while away before this block
     is_plugged_in: bool = True  # whether the EV is plugged in at this location
     location_type: str = "home"  # one of: "home", "work", "away"
+
+
+def _normalize_presence_blocks(
+    blocks: Sequence[PresenceBlock],
+    sim_len: int,
+) -> List[PresenceBlock]:
+    """Return ordered blocks with commute segments spanning uncovered time."""
+
+    if not blocks:
+        return []
+
+    ordered_blocks = sorted(blocks, key=lambda blk: (blk.start_step, blk.end_step))
+    normalized: List[PresenceBlock] = []
+
+    for raw in ordered_blocks:
+        start = max(0, min(sim_len, raw.start_step))
+        end = max(0, min(sim_len, raw.end_step))
+        if end <= start:
+            continue
+
+        if normalized:
+            last_block = normalized[-1]
+
+            if start > last_block.end_step:
+                commute_block = PresenceBlock(
+                    start_step=last_block.end_step,
+                    end_step=start,
+                    location=-1,
+                    energy_consumed=raw.energy_consumed,
+                    is_plugged_in=False,
+                    location_type="away",
+                )
+                normalized.append(commute_block)
+                last_block = commute_block
+
+            if start < last_block.end_step:
+                start = last_block.end_step
+
+            if (
+                start == last_block.end_step
+                and last_block.location_type != "away"
+                and raw.location_type != "away"
+                and (
+                    raw.location != last_block.location
+                    or raw.location_type != last_block.location_type
+                    or raw.is_plugged_in != last_block.is_plugged_in
+                )
+            ):
+                commute_end = min(sim_len, start + 1, end)
+                if commute_end > start:
+                    commute_block = PresenceBlock(
+                        start_step=start,
+                        end_step=commute_end,
+                        location=-1,
+                        energy_consumed=raw.energy_consumed,
+                        is_plugged_in=False,
+                        location_type="away",
+                    )
+                    normalized.append(commute_block)
+                    last_block = commute_block
+                    start = commute_end
+
+        if start >= end:
+            continue
+
+        block = PresenceBlock(
+            start_step=start,
+            end_step=end,
+            location=raw.location,
+            energy_consumed=raw.energy_consumed,
+            is_plugged_in=raw.is_plugged_in,
+            location_type=raw.location_type,
+        )
+        normalized.append(block)
+        if block.end_step >= sim_len:
+            break
+
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +136,8 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
     List[EV]
         List sorted by ``time_of_arrival`` as expected by downstream code.
     """
+    from ev2gym.models.ev.vehicle import EV  # Local import to avoid circular dependency during tests
+
     cfg = env.config.get("user_profiles")
     if cfg is None:
         # Fallback handled by caller.
@@ -70,7 +148,6 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
     sim_len = env.simulation_length
 
     start_datetime = env.sim_starting_date
-    print(f"DEBUG: Starting date: {start_datetime}, simulation length: {sim_len}, timestep: {timestep_minutes}min")
 
     all_ev_profiles: List[EV] = []
     ev_id_counter = 0
@@ -255,27 +332,17 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
         # for i, blk in enumerate(presence_blocks[:5]):
         #     print(f"DEBUG: Block {i}: location={blk.location}, is_plugged_in={blk.is_plugged_in}, location_type={blk.location_type}, start={blk.start_step}, end={blk.end_step}")
             
+        normalized_blocks = _normalize_presence_blocks(presence_blocks, sim_len)
+
         # Create one EV profile per vehicle count, each with its own schedule.
         for _ in range(v_count):
             ev_id_counter += 1
 
-            if not presence_blocks:
+            if not normalized_blocks:
                 continue # Skip if no blocks were generated for this profile
-                
-            # Check for and fix gaps in presence blocks
-            sorted_blocks = sorted(presence_blocks, key=lambda b: b.start_step)
-            for i in range(len(sorted_blocks) - 1):
-                current_block = sorted_blocks[i]
-                next_block = sorted_blocks[i + 1]
-                if current_block.end_step != next_block.start_step:
-                    print(f"Warning: Gap found in presence blocks between steps {current_block.end_step} and {next_block.start_step}")
-                    # If there's a gap, extend the current block to meet the next one
-                    if current_block.end_step < next_block.start_step:
-                        print(f"  Extending block {i} to fill gap")
-                        current_block.end_step = next_block.start_step
-
-            first_block = sorted_blocks[0]
-            last_block = sorted_blocks[-1]
+            
+            first_block = normalized_blocks[0]
+            last_block = normalized_blocks[-1]
 
             # If the first block starts before the simulation, set start time to 0.
             if first_block.start_step < 0:
@@ -311,14 +378,14 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
                 charge_efficiency=ev_spec["charge_efficiency"],
                 discharge_efficiency=ev_spec["discharge_efficiency"],
                 timescale=timestep_minutes,
-                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in sorted_blocks]},
+                metadata={"presence_blocks": [(b.start_step, b.end_step, b.location) for b in normalized_blocks]},
                 location_state=0 if first_block.location_type == "home" else 1,
             )
 
             # Build full transition list from the detailed presence_blocks.
             ev_profile.clear_schedule_transitions() # Clear any default transitions
-            for idx, blk in enumerate(sorted_blocks[:-1]):
-                next_blk = sorted_blocks[idx + 1]
+            for idx, blk in enumerate(normalized_blocks[:-1]):
+                next_blk = normalized_blocks[idx + 1]
                 # At the end of any block, a transition occurs.
                 # The new state is determined by the type of the *next* block.
                 if next_blk.location_type == "home":
@@ -334,7 +401,7 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             
             # Pre-compute location_state for every simulation step
             sim_locations = np.full(sim_len, -1, dtype=np.int8)  # -1 = not spawned yet
-            for blk in sorted_blocks:
+            for blk in normalized_blocks:
                 start = max(0, blk.start_step)
                 end = min(sim_len, blk.end_step)
                 if blk.location_type == "home":
@@ -351,11 +418,10 @@ def generate_ev_profiles(env) -> List[EV]:  # noqa: C901 – complexity okay for
             ev_profile.sim_locations = sim_locations
 
             # Extend overall availability so EV object exists until after final block
-            ev_profile.time_of_departure = presence_blocks[-1].end_step
+            ev_profile.time_of_departure = last_block.end_step
 
             all_ev_profiles.append(ev_profile)
 
     # Sort by arrival time as required by env logic.
     all_ev_profiles.sort(key=lambda ev: ev.time_of_arrival)
-    print(f"DEBUG: Total EV profiles created: {len(all_ev_profiles)}")
     return all_ev_profiles

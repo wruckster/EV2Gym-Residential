@@ -6,7 +6,7 @@ debug_setpoints: false
 # Simulation Parameters
 ##############################################################################
 timescale: 5  # minutes per step
-simulation_length: 1000  # 4 weeks (4*7 days * 24 hours * 60 minutes / 5 minutes) = 8064 steps
+simulation_length: 1000  # ~3.5 days (faster for testing, was 5000 = 4 weeks)
 
 # Path to external features
 data_path: ev2gym/data/nsw_dataset/external_features/external_dataset.parquet
@@ -35,6 +35,11 @@ simulation_days: both  # weekdays, weekends, or both
 ##############################################################################
 accounts:
   roaming: true
+
+reward:
+  preset: profit_first
+  weights:
+    solar_norm_kwh: 1.0
 
 # -----------------------------------------------------------------------------
 # Unified Setpoints Configuration (preferred)
@@ -223,7 +228,7 @@ ev:
   ev_phases: 1  # Single-phase for residential
   charge_efficiency: 0.95  # 95% efficiency
   discharge_efficiency: 0.90  # 90% efficiency (slightly lower for discharge)
-  transition_soc: 0.8  # 80% - start tapering charge near full
+  transition_soc: 0.75  # 75% - start tapering charge near full
   min_battery_capacity: 10.0  # in kWh (safety buffer)
   min_time_of_stay: 180  # in minutes (3 hours typical home charging)
   min_emergency_battery_capacity: 15  # in kWh (safety buffer)
